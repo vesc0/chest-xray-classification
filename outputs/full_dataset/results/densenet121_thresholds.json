@@ -1,0 +1,141 @@
+{
+  "threshold_metric": "f1",
+  "default_threshold": 0.5,
+  "thresholds": {
+    "Atelectasis": 0.54,
+    "Cardiomegaly": 0.5,
+    "Consolidation": 0.5,
+    "Edema": 0.52,
+    "Effusion": 0.49,
+    "Emphysema": 0.46,
+    "Fibrosis": 0.39,
+    "Hernia": 0.5,
+    "Infiltration": 0.54,
+    "Mass": 0.48,
+    "Nodule": 0.51,
+    "Pleural_Thickening": 0.44,
+    "Pneumonia": 0.44,
+    "Pneumothorax": 0.48,
+    "No Finding": 0.56
+  },
+  "tuning_summary": {
+    "Atelectasis": {
+      "threshold": 0.54,
+      "objective": 0.3866,
+      "precision": 0.3143,
+      "recall": 0.5021,
+      "support": 1175,
+      "status": "tuned"
+    },
+    "Cardiomegaly": {
+      "threshold": 0.5,
+      "objective": 0.3385,
+      "precision": 0.3693,
+      "recall": 0.3125,
+      "support": 208,
+      "status": "tuned"
+    },
+    "Consolidation": {
+      "threshold": 0.5,
+      "objective": 0.2528,
+      "precision": 0.1831,
+      "recall": 0.4081,
+      "support": 740,
+      "status": "tuned"
+    },
+    "Edema": {
+      "threshold": 0.52,
+      "objective": 0.2544,
+      "precision": 0.1975,
+      "recall": 0.3571,
+      "support": 406,
+      "status": "tuned"
+    },
+    "Effusion": {
+      "threshold": 0.49,
+      "objective": 0.526,
+      "precision": 0.4137,
+      "recall": 0.7223,
+      "support": 1804,
+      "status": "tuned"
+    },
+    "Emphysema": {
+      "threshold": 0.46,
+      "objective": 0.4336,
+      "precision": 0.4045,
+      "recall": 0.4672,
+      "support": 381,
+      "status": "tuned"
+    },
+    "Fibrosis": {
+      "threshold": 0.39,
+      "objective": 0.0904,
+      "precision": 0.0559,
+      "recall": 0.2357,
+      "support": 157,
+      "status": "tuned"
+    },
+    "Hernia": {
+      "threshold": 0.5,
+      "objective": null,
+      "support": 4,
+      "status": "default"
+    },
+    "Infiltration": {
+      "threshold": 0.54,
+      "objective": 0.514,
+      "precision": 0.3951,
+      "recall": 0.735,
+      "support": 2415,
+      "status": "tuned"
+    },
+    "Mass": {
+      "threshold": 0.48,
+      "objective": 0.3252,
+      "precision": 0.2987,
+      "recall": 0.3568,
+      "support": 653,
+      "status": "tuned"
+    },
+    "Nodule": {
+      "threshold": 0.51,
+      "objective": 0.2716,
+      "precision": 0.2113,
+      "recall": 0.38,
+      "support": 671,
+      "status": "tuned"
+    },
+    "Pleural_Thickening": {
+      "threshold": 0.44,
+      "objective": 0.1989,
+      "precision": 0.1341,
+      "recall": 0.385,
+      "support": 413,
+      "status": "tuned"
+    },
+    "Pneumonia": {
+      "threshold": 0.44,
+      "objective": 0.1005,
+      "precision": 0.0681,
+      "recall": 0.1914,
+      "support": 209,
+      "status": "tuned"
+    },
+    "Pneumothorax": {
+      "threshold": 0.48,
+      "objective": 0.3608,
+      "precision": 0.2926,
+      "recall": 0.4704,
+      "support": 693,
+      "status": "tuned"
+    },
+    "No Finding": {
+      "threshold": 0.56,
+      "objective": 0.5653,
+      "precision": 0.4504,
+      "recall": 0.759,
+      "support": 3013,
+      "status": "tuned"
+    }
+  }
+}
