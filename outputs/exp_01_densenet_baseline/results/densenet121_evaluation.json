@@ -1,0 +1,223 @@
+{
+  "per_class": {
+    "Atelectasis": {
+      "threshold": 0.53,
+      "auroc": 0.6689,
+      "auprc": 0.2382,
+      "precision": 0.2295,
+      "recall": 0.5,
+      "f1": 0.3146,
+      "brier": 0.2434,
+      "ece": 0.3617,
+      "support": 28,
+      "prevalence": 0.1386
+    },
+    "Cardiomegaly": {
+      "threshold": 0.5,
+      "auroc": 0.4129,
+      "auprc": 0.022,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "brier": 0.1265,
+      "ece": 0.3212,
+      "support": 4,
+      "prevalence": 0.0198
+    },
+    "Consolidation": {
+      "threshold": 0.05,
+      "auroc": 0.6043,
+      "auprc": 0.2355,
+      "precision": 0.0941,
+      "recall": 1.0,
+      "f1": 0.1719,
+      "brier": 0.1626,
+      "ece": 0.2795,
+      "support": 19,
+      "prevalence": 0.0941
+    },
+    "Edema": {
+      "threshold": 0.36,
+      "auroc": 0.7366,
+      "auprc": 0.1924,
+      "precision": 0.1519,
+      "recall": 0.75,
+      "f1": 0.2526,
+      "brier": 0.1358,
+      "ece": 0.2574,
+      "support": 16,
+      "prevalence": 0.0792
+    },
+    "Effusion": {
+      "threshold": 0.49,
+      "auroc": 0.5905,
+      "auprc": 0.1658,
+      "precision": 0.1429,
+      "recall": 0.4074,
+      "f1": 0.2115,
+      "brier": 0.2255,
+      "ece": 0.3324,
+      "support": 27,
+      "prevalence": 0.1337
+    },
+    "Emphysema": {
+      "threshold": 0.5,
+      "auroc": null,
+      "auprc": null,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "brier": 0.0999,
+      "ece": 0.3124,
+      "support": 0,
+      "prevalence": 0.0
+    },
+    "Fibrosis": {
+      "threshold": 0.5,
+      "auroc": 0.6825,
+      "auprc": 0.0225,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "brier": 0.108,
+      "ece": 0.3101,
+      "support": 2,
+      "prevalence": 0.0099
+    },
+    "Hernia": {
+      "threshold": 0.5,
+      "auroc": null,
+      "auprc": null,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "brier": 0.0657,
+      "ece": 0.2522,
+      "support": 0,
+      "prevalence": 0.0
+    },
+    "Infiltration": {
+      "threshold": 0.42,
+      "auroc": 0.6214,
+      "auprc": 0.479,
+      "precision": 0.35,
+      "recall": 0.9403,
+      "f1": 0.5101,
+      "brier": 0.2424,
+      "ece": 0.1822,
+      "support": 67,
+      "prevalence": 0.3317
+    },
+    "Mass": {
+      "threshold": 0.5,
+      "auroc": 0.521,
+      "auprc": 0.0716,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "brier": 0.1219,
+      "ece": 0.2765,
+      "support": 9,
+      "prevalence": 0.0446
+    },
+    "Nodule": {
+      "threshold": 0.32,
+      "auroc": 0.5787,
+      "auprc": 0.0674,
+      "precision": 0.0284,
+      "recall": 1.0,
+      "f1": 0.0552,
+      "brier": 0.1606,
+      "ece": 0.3659,
+      "support": 5,
+      "prevalence": 0.0248
+    },
+    "Pleural_Thickening": {
+      "threshold": 0.5,
+      "auroc": 0.4704,
+      "auprc": 0.0429,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "brier": 0.1331,
+      "ece": 0.3031,
+      "support": 8,
+      "prevalence": 0.0396
+    },
+    "Pneumonia": {
+      "threshold": 0.23,
+      "auroc": 0.5707,
+      "auprc": 0.1905,
+      "precision": 0.0559,
+      "recall": 0.7273,
+      "f1": 0.1039,
+      "brier": 0.0963,
+      "ece": 0.2101,
+      "support": 11,
+      "prevalence": 0.0545
+    },
+    "Pneumothorax": {
+      "threshold": 0.5,
+      "auroc": 0.5385,
+      "auprc": 0.064,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "brier": 0.146,
+      "ece": 0.3111,
+      "support": 10,
+      "prevalence": 0.0495
+    },
+    "No Finding": {
+      "threshold": 0.57,
+      "auroc": 0.6873,
+      "auprc": 0.686,
+      "precision": 0.4534,
+      "recall": 0.8795,
+      "f1": 0.5984,
+      "brier": 0.2747,
+      "ece": 0.252,
+      "support": 83,
+      "prevalence": 0.4109
+    }
+  },
+  "macro": {
+    "auroc": 0.591,
+    "auprc": 0.1906,
+    "precision": 0.1004,
+    "recall": 0.4136,
+    "f1": 0.1479,
+    "samples_f1": 0.2937,
+    "subset_accuracy": 0.0,
+    "sample_accuracy": 0.6832,
+    "all_negative_sample_accuracy_baseline": 0.9046,
+    "hamming_loss": 0.3168
+  },
+  "micro": {
+    "auprc": 0.3943,
+    "precision": 0.1896,
+    "recall": 0.7093,
+    "f1": 0.2993
+  },
+  "calibration": {
+    "macro_brier": 0.1562,
+    "macro_ece": 0.2885
+  },
+  "thresholds": {
+    "Atelectasis": 0.53,
+    "Cardiomegaly": 0.5,
+    "Consolidation": 0.05,
+    "Edema": 0.36,
+    "Effusion": 0.49,
+    "Emphysema": 0.5,
+    "Fibrosis": 0.5,
+    "Hernia": 0.5,
+    "Infiltration": 0.42,
+    "Mass": 0.5,
+    "Nodule": 0.32,
+    "Pleural_Thickening": 0.5,
+    "Pneumonia": 0.23,
+    "Pneumothorax": 0.5,
+    "No Finding": 0.57
+  }
+}

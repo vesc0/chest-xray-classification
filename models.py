@@ -2,7 +2,7 @@
 Model definitions
 
 Two architectures with ImageNet-pretrained backbones:
-  1. DenseNet-121 (CNN)  — the backbone used in the original CheXNet paper
+  1. DenseNet-121 (CNN) — the backbone used in the original CheXNet paper
   2. ViT-B/16 (Vision Transformer) — from torchvision
 
 Both output NUM_CLASSES logits (one per pathology) for multi-label classification.
@@ -30,6 +30,8 @@ class DenseNet121Classifier(nn.Module):
 
     def __init__(self, num_classes: int = config.NUM_CLASSES, pretrained: bool = True):
         super().__init__()
+
+        # Load pretrained DenseNet-121 backbone
         weights = models.DenseNet121_Weights.DEFAULT if pretrained else None
         self.backbone = models.densenet121(weights=weights)
 
@@ -41,11 +43,12 @@ class DenseNet121Classifier(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Forward pass through DenseNet backbone
         return self.backbone(x)
 
 
 # =============================================================================
-# 2. Vision Transformer (ViT-B/16)
+# 2. ViT-B/16 (ViT)
 # =============================================================================
 class ViTClassifier(nn.Module):
     """
@@ -58,10 +61,12 @@ class ViTClassifier(nn.Module):
 
     def __init__(self, num_classes: int = config.NUM_CLASSES, pretrained: bool = True):
         super().__init__()
+
+        # Load pretrained ViT-B/16 backbone
         weights = models.ViT_B_16_Weights.DEFAULT if pretrained else None
         self.backbone = models.vit_b_16(weights=weights)
 
-        # Replace the head
+        # Replace classification head
         in_features = self.backbone.heads.head.in_features  # 768
         self.backbone.heads.head = nn.Sequential(
             nn.Dropout(p=0.3),
@@ -69,11 +74,12 @@ class ViTClassifier(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Forward pass through ViT backbone
         return self.backbone(x)
 
 
 # =============================================================================
-# Factory
+# Model factory
 # =============================================================================
 def build_model(model_name: str, pretrained: bool = True) -> nn.Module:
     """

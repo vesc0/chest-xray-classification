@@ -13,9 +13,11 @@ import json
 from pathlib import Path
 
 import numpy as np
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
@@ -36,6 +38,9 @@ def _has_both_labels(labels: np.ndarray) -> bool:
     return 0 < positives < len(labels)
 
 
+# =============================================================================
+# Inference
+# =============================================================================
 @torch.no_grad()
 def collect_predictions(
     model: nn.Module,
@@ -54,6 +59,8 @@ def collect_predictions(
 
     for batch in loader:
         images = batch["image"].to(device, non_blocking=True)
+
+        # Labels are kept on CPU to avoid GPU overhead
         labels = batch["label"].cpu().numpy()
 
         with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
@@ -68,36 +75,14 @@ def collect_predictions(
     return labels_np, probs_np
 
 
+# =============================================================================
+# Thresholding
+# =============================================================================
 def apply_thresholds(probs: np.ndarray, thresholds: np.ndarray | float | None) -> np.ndarray:
     """Convert probabilities into binary predictions using per-class thresholds."""
     if thresholds is None:
         thresholds = config.DEFAULT_THRESHOLD
     return (probs >= thresholds).astype(np.int32)
-
-
-def _expected_calibration_error(
-    labels: np.ndarray,
-    probs: np.ndarray,
-    num_bins: int = config.ECE_BINS,
-) -> float:
-    """Compute binary expected calibration error for one class."""
-    bins = np.linspace(0.0, 1.0, num_bins + 1)
-    ece = 0.0
-
-    for start, end in zip(bins[:-1], bins[1:]):
-        if end == 1.0:
-            mask = (probs >= start) & (probs <= end)
-        else:
-            mask = (probs >= start) & (probs < end)
-
-        if not np.any(mask):
-            continue
-
-        confidence = probs[mask].mean()
-        accuracy = labels[mask].mean()
-        ece += np.abs(confidence - accuracy) * (mask.sum() / len(probs))
-
-    return float(ece)
 
 
 def _threshold_objective(
@@ -168,6 +153,8 @@ def tune_thresholds(
 
         for threshold in threshold_grid:
             score, precision, recall = _threshold_objective(y_true, y_prob, float(threshold))
+
+            # Small tie-break bias toward recall
             if (
                 score > best_score + 1e-8
                 or (
@@ -230,6 +217,34 @@ def calibrate_thresholds(
     return thresholds
 
 
+def _expected_calibration_error(
+    labels: np.ndarray,
+    probs: np.ndarray,
+    num_bins: int = config.ECE_BINS,
+) -> float:
+    """Compute binary expected calibration error for one class."""
+    bins = np.linspace(0.0, 1.0, num_bins + 1)
+    ece = 0.0
+
+    for start, end in zip(bins[:-1], bins[1:]):
+        if end == 1.0:
+            mask = (probs >= start) & (probs <= end)
+        else:
+            mask = (probs >= start) & (probs < end)
+
+        if not np.any(mask):
+            continue
+
+        confidence = probs[mask].mean()
+        accuracy = labels[mask].mean()
+        ece += np.abs(confidence - accuracy) * (mask.sum() / len(probs))
+
+    return float(ece)
+
+
+# =============================================================================
+# Metrics computation
+# =============================================================================
 def compute_metrics(
     labels: np.ndarray,
     probs: np.ndarray,
@@ -264,6 +279,7 @@ def compute_metrics(
     per_class_brier = []
     per_class_ece = []
 
+    # Per-class metrics
     for class_idx, class_name in enumerate(config.CLASS_NAMES):
         targets = labels[:, class_idx]
         scores = probs[:, class_idx]
@@ -295,6 +311,7 @@ def compute_metrics(
             "prevalence": round(float(targets.mean()), 4),
         }
 
+    # Macro metrics
     results["macro"]["auroc"] = round(float(np.mean(per_class_auroc)), 4) if per_class_auroc else None
     results["macro"]["auprc"] = round(float(np.mean(per_class_auprc)), 4) if per_class_auprc else None
     results["macro"]["precision"] = round(
@@ -324,6 +341,7 @@ def compute_metrics(
     )
     results["macro"]["hamming_loss"] = round(float(sk_hamming_loss(labels, preds)), 4)
 
+    # Micro metrics
     flat_labels = labels.ravel()
     flat_probs = probs.ravel()
     flat_preds = preds.ravel()
@@ -344,12 +362,16 @@ def compute_metrics(
         4,
     )
 
+    # Calibration metrics
     results["calibration"]["macro_brier"] = round(float(np.mean(per_class_brier)), 4)
     results["calibration"]["macro_ece"] = round(float(np.mean(per_class_ece)), 4)
 
     return results
 
 
+# =============================================================================
+# Output utilities
+# =============================================================================
 def print_results(results: dict, model_name: str) -> None:
     """Print a formatted summary table of evaluation results."""
     print(f"\n{'=' * 96}")
@@ -412,6 +434,9 @@ def save_results(results: dict, model_name: str) -> Path:
     return path
 
 
+# =============================================================================
+# Main evaluation pipeline
+# =============================================================================
 def evaluate_model(
     model: nn.Module,
     test_loader: DataLoader,

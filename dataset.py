@@ -13,16 +13,21 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
 from PIL import Image
 
 import torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+
 from sklearn.model_selection import GroupShuffleSplit, train_test_split
 
 import config
 
 
+# =============================================================================
+# Data indexing utilities
+# =============================================================================
 def _build_image_index() -> dict[str, Path]:
     """Scan all image directories and return {filename: full_path}."""
     index: dict[str, Path] = {}
@@ -42,12 +47,15 @@ def _stack_label_vectors(dataframe: pd.DataFrame) -> np.ndarray:
 
 
 def _get_group_column(dataframe: pd.DataFrame) -> str | None:
-    """Return the configured patient identifier column if it exists."""
+    """Return the configured patient identifier column if it exists (used for leakage prevention)."""
     if config.PATIENT_ID_COLUMN in dataframe.columns:
         return config.PATIENT_ID_COLUMN
     return None
 
 
+# =============================================================================
+# Metadata loading + label encoding
+# =============================================================================
 def load_metadata() -> pd.DataFrame:
     """
     Read Data_Entry_2017.csv and add:
@@ -62,11 +70,13 @@ def load_metadata() -> pd.DataFrame:
     image_index = _build_image_index()
     df["filepath"] = df["Image Index"].map(image_index)
 
+    # Remove missing files (dataset integrity check)
     missing = df["filepath"].isna().sum()
     if missing > 0:
         print(f"[dataset] Warning: {missing} images not found on disk - skipping them.")
         df = df.dropna(subset=["filepath"]).reset_index(drop=True)
 
+    # Multi-label parsing (string → list)
     df["labels"] = df["Finding Labels"].str.split("|")
     class_to_idx = {class_name: i for i, class_name in enumerate(config.CLASS_NAMES)}
 
@@ -87,6 +97,9 @@ def load_metadata() -> pd.DataFrame:
     return df
 
 
+# =============================================================================
+# Subset sampling (fast experiments)
+# =============================================================================
 def _sample_subset(
     dataframe: pd.DataFrame,
     target_size: int,
@@ -103,6 +116,7 @@ def _sample_subset(
     if target_size <= 0 or len(dataframe) <= target_size:
         return dataframe.reset_index(drop=True)
 
+    # If no grouping available use random sampling fallback
     if group_col is None or group_col not in dataframe.columns:
         return dataframe.sample(n=target_size, random_state=random_state).reset_index(drop=True)
 
@@ -110,6 +124,7 @@ def _sample_subset(
     groups = list(dataframe.groupby(group_col, sort=False))
     order = rng.permutation(len(groups))
 
+    # Greedy group accumulation until target size reached
     selected_groups: list[pd.DataFrame] = []
     selected_rows = 0
     for idx in order:
@@ -119,11 +134,15 @@ def _sample_subset(
         if selected_rows >= target_size:
             break
 
+    # Shuffle final subset
     subset = pd.concat(selected_groups, ignore_index=True)
     subset = subset.sample(frac=1.0, random_state=random_state).reset_index(drop=True)
     return subset
 
 
+# =============================================================================
+# Patient-aware train/val split
+# =============================================================================
 def _group_stratified_train_val_split(
     dataframe: pd.DataFrame,
     *,
@@ -137,6 +156,7 @@ def _group_stratified_train_val_split(
     This heuristic keeps every patient's studies together and greedily tries
     to match the validation label marginals to the full train_val set.
     """
+    # Fallback: standard split if grouping is not usable
     if group_col not in dataframe.columns or dataframe[group_col].nunique() < 2:
         train_df, val_df = train_test_split(
             dataframe,
@@ -149,6 +169,7 @@ def _group_stratified_train_val_split(
     target_val_size = max(1, int(round(len(dataframe) * test_size)))
     target_label_counts = label_matrix.sum(axis=0) * test_size
 
+    # Aggregate group-level label statistics
     group_records = []
     for group_id, group_df in dataframe.groupby(group_col, sort=False):
         group_labels = _stack_label_vectors(group_df).max(axis=0)
@@ -160,7 +181,7 @@ def _group_stratified_train_val_split(
             }
         )
 
-    # Harder, rarer groups first.
+    # Prioritize rare/important groups first
     group_records.sort(
         key=lambda record: (record["labels"].sum(), record["size"]),
         reverse=True,
@@ -175,6 +196,7 @@ def _group_stratified_train_val_split(
         size_error = abs(candidate_size - target_val_size) * 0.5
         return float(label_error + size_error)
 
+    # Greedy selection of validation groups
     for record in group_records:
         add_to_val = _score(val_label_counts + record["labels"], val_size + record["size"])
         keep_in_train = _score(val_label_counts, val_size)
@@ -184,7 +206,7 @@ def _group_stratified_train_val_split(
             val_label_counts += record["labels"]
             val_size += record["size"]
 
-    # Greedily top up the validation set if the first pass was too conservative.
+    # Ensure minimum coverage
     if val_size < target_val_size:
         for record in group_records:
             if record["group_id"] in val_group_ids:
@@ -195,6 +217,7 @@ def _group_stratified_train_val_split(
             if val_size >= target_val_size:
                 break
 
+    # Fallback to sklearn if heuristic fails
     if not val_group_ids or len(val_group_ids) == len(group_records):
         splitter = GroupShuffleSplit(
             n_splits=1,
@@ -211,9 +234,13 @@ def _group_stratified_train_val_split(
     val_mask = dataframe[group_col].isin(val_group_ids)
     val_df = dataframe[val_mask].reset_index(drop=True)
     train_df = dataframe[~val_mask].reset_index(drop=True)
+
     return train_df, val_df
 
 
+# =============================================================================
+# Dataset class
+# =============================================================================
 class ChestXrayDataset(Dataset):
     """
     PyTorch Dataset for the NIH Chest X-ray images.
@@ -235,6 +262,7 @@ class ChestXrayDataset(Dataset):
         return len(self.df)
 
     def __getitem__(self, idx: int) -> dict:
+        # Load image on-the-fly (memory efficient)
         with Image.open(self.filepaths[idx]) as image:
             image = image.convert("RGB")
             if self.transform is not None:
@@ -252,6 +280,9 @@ class ChestXrayDataset(Dataset):
         return self.label_matrix
 
 
+# =============================================================================
+# Transforms
+# =============================================================================
 def get_train_transforms() -> transforms.Compose:
     """Augmentation pipeline tuned for frontal radiographs."""
     return transforms.Compose(
@@ -283,6 +314,9 @@ def get_eval_transforms() -> transforms.Compose:
     )
 
 
+# =============================================================================
+# DataLoader builder
+# =============================================================================
 def get_dataloaders() -> tuple[DataLoader, DataLoader, DataLoader]:
     """
     Build train, validation, and test DataLoaders.
@@ -295,6 +329,7 @@ def get_dataloaders() -> tuple[DataLoader, DataLoader, DataLoader]:
     print("[dataset] Loading metadata ...")
     df = load_metadata()
 
+    # Official split files
     train_val_filenames = set(Path(config.TRAIN_VAL_LIST).read_text().strip().splitlines())
     test_filenames = set(Path(config.TEST_LIST).read_text().strip().splitlines())
 
@@ -303,6 +338,7 @@ def get_dataloaders() -> tuple[DataLoader, DataLoader, DataLoader]:
 
     group_col = _get_group_column(train_val_df)
 
+    # Optional subset mode for debugging/experiments
     if config.SUBSET_SIZE and config.SUBSET_SIZE > 0:
         n_train_val = min(config.SUBSET_SIZE, len(train_val_df))
         n_test = min(max(config.SUBSET_SIZE // 5, 50), len(test_df))
@@ -324,6 +360,7 @@ def get_dataloaders() -> tuple[DataLoader, DataLoader, DataLoader]:
             f"{len(test_df)} test images"
         )
 
+    # Patient-aware train/val split
     train_df, val_df = _group_stratified_train_val_split(
         train_val_df,
         test_size=config.VAL_SPLIT,
@@ -339,10 +376,12 @@ def get_dataloaders() -> tuple[DataLoader, DataLoader, DataLoader]:
         f"val: {len(val_df)}, test: {len(test_df)}"
     )
 
+    # Datasets
     train_ds = ChestXrayDataset(train_df, transform=get_train_transforms())
     val_ds = ChestXrayDataset(val_df, transform=get_eval_transforms())
     test_ds = ChestXrayDataset(test_df, transform=get_eval_transforms())
 
+    # Loader optimization
     use_pin_memory = torch.cuda.is_available()
     loader_kwargs = {
         "batch_size": config.BATCH_SIZE,

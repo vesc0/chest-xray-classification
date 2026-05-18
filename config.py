@@ -29,7 +29,6 @@ XAI_DIR = OUTPUT_DIR / "xai"
 # Experiment name — set at runtime via set_experiment(); keeps each run isolated
 EXPERIMENT_NAME = None
 
-
 def set_experiment(name: str) -> None:
     """Configure output dirs under outputs/<name>/ for this experiment."""
     global OUTPUT_DIR, CHECKPOINT_DIR, RESULTS_DIR, XAI_DIR, EXPERIMENT_NAME
@@ -75,7 +74,8 @@ SEED = 42
 # =============================================================================
 # Preprocessing & Augmentation
 # =============================================================================
-IMAGE_SIZE = 224          # Input resolution for both CNN and ViT
+# Input resolution for both CNN and ViT
+IMAGE_SIZE = 224
 # ImageNet normalization (pretrained models expect this)
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
@@ -84,14 +84,14 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 # Training
 # =============================================================================
 BATCH_SIZE = 32
-NUM_WORKERS = 4           # DataLoader workers
+NUM_WORKERS = 4 # DataLoader workers
 NUM_EPOCHS = 15
 LEARNING_RATE = 1e-4
 MIN_LEARNING_RATE = 1e-6
 WEIGHT_DECAY = 1e-5
 WARMUP_EPOCHS = 1
 EARLY_STOPPING_PATIENCE = 5
-CHECKPOINT_METRIC = "val_auprc"   # val_loss, val_auroc, val_auprc
+CHECKPOINT_METRIC = "val_auprc" # val_loss, val_auroc, val_auprc
 
 # Long-tail aware loss choices: "asymmetric", "weighted_bce", "bce"
 LOSS_NAME = "asymmetric"
@@ -100,8 +100,22 @@ ASL_GAMMA_NEG = 4.0
 ASL_GAMMA_POS = 1.0
 ASL_CLIP = 0.05
 
-# Model choices: "densenet121" (CNN) or "vit_b_16" (Vision Transformer)
+# Model choices: "densenet121" (CNN) or "vit_b_16" (ViT)
 SUPPORTED_MODELS = ["densenet121", "vit_b_16"]
+
+# Fine-tuning strategy:
+#   - "full": train all parameters for all epochs
+#   - "head_only": freeze backbone and train classifier head only
+#   - "partial": train head first, then unfreeze only top backbone params
+TUNING_MODE = "full"
+
+# Used when TUNING_MODE="partial"
+FREEZE_EPOCHS = 3
+PARTIAL_UNFREEZE_FRACTION = 0.3
+
+# Optional per-group learning-rate scaling
+BACKBONE_LR_MULTIPLIER = 0.1
+HEAD_LR_MULTIPLIER = 1.0
 
 # =============================================================================
 # Evaluation & Calibration
@@ -110,7 +124,7 @@ DEFAULT_THRESHOLD = 0.5
 THRESHOLD_MIN = 0.05
 THRESHOLD_MAX = 0.95
 THRESHOLD_STEPS = 91
-THRESHOLD_METRIC = "f1"   # f1, fbeta, youden
+THRESHOLD_METRIC = "f1" # f1, fbeta, youden
 THRESHOLD_BETA = 1.0
 THRESHOLD_MIN_SUPPORT = 5
 ECE_BINS = 15

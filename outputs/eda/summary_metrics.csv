@@ -1,7 +1,0 @@
-,value
-num_rows_after_filepath_filter,112120.0
-num_unique_images,112120.0
-num_unique_patients,30805.0
-avg_labels_per_image,1.2623706742775598
-median_labels_per_image,1.0
-pct_no_finding,53.83606849803782
