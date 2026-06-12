@@ -79,6 +79,33 @@ class ViTClassifier(nn.Module):
 
 
 # =============================================================================
+# 3. SwinV2-B (modern ViT)
+# =============================================================================
+class SwinV2Classifier(nn.Module):
+    """
+    Swin Transformer V2-B with custom classification head
+    """
+
+    def __init__(self, num_classes: int = config.NUM_CLASSES, pretrained: bool = True):
+        super().__init__()
+
+        # Load pretrained SwinV2-B backbone
+        weights = models.Swin_V2_B_Weights.DEFAULT if pretrained else None
+        self.backbone = models.swin_v2_b(weights=weights)
+
+        # Replace classification head
+        in_features = self.backbone.head.in_features
+        self.backbone.head = nn.Sequential(
+            nn.Dropout(p=0.3),
+            nn.Linear(in_features, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Forward pass through Swin ViT backbone
+        return self.backbone(x)
+
+
+# =============================================================================
 # Model factory
 # =============================================================================
 def build_model(model_name: str, pretrained: bool = True) -> nn.Module:
@@ -96,6 +123,8 @@ def build_model(model_name: str, pretrained: bool = True) -> nn.Module:
         return DenseNet121Classifier(pretrained=pretrained)
     elif model_name == "vit_b_16":
         return ViTClassifier(pretrained=pretrained)
+    elif model_name == "swin_v2_b":
+        return SwinV2Classifier(pretrained=pretrained)
     else:
         raise ValueError(
             f"Unknown model '{model_name}'. Supported: {config.SUPPORTED_MODELS}"

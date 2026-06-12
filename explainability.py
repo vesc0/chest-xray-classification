@@ -330,6 +330,9 @@ def generate_explanations(
     elif model_name == "vit_b_16":
         explainer = AttentionRollout(model)
         method_name = "Attention Rollout"
+    elif model_name == "swin_v2_b":
+        print("[xai] SwinV2 explainability not implemented.")
+        return
     else:
         print(f"[xai] No XAI method defined for '{model_name}' — skipping.")
         return

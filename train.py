@@ -228,6 +228,10 @@ def _split_backbone_head_params(model: nn.Module) -> tuple[list[nn.Parameter], l
     elif hasattr(backbone, "heads"):
         head_module = backbone.heads
 
+    # Swin / SwinV2
+    elif hasattr(backbone, "head"):
+        head_module = backbone.head
+
     if head_module is None:
         return list(model.parameters()), []
 

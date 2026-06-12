@@ -85,12 +85,12 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 # =============================================================================
 BATCH_SIZE = 32
 NUM_WORKERS = 4 # DataLoader workers
-NUM_EPOCHS = 15
+NUM_EPOCHS = 60
 LEARNING_RATE = 1e-4
 MIN_LEARNING_RATE = 1e-6
 WEIGHT_DECAY = 1e-5
 WARMUP_EPOCHS = 1
-EARLY_STOPPING_PATIENCE = 5
+EARLY_STOPPING_PATIENCE = 20
 CHECKPOINT_METRIC = "val_auprc" # val_loss, val_auroc, val_auprc
 
 # Long-tail aware loss choices: "asymmetric", "weighted_bce", "bce"
@@ -100,8 +100,8 @@ ASL_GAMMA_NEG = 4.0
 ASL_GAMMA_POS = 1.0
 ASL_CLIP = 0.05
 
-# Model choices: "densenet121" (CNN) or "vit_b_16" (ViT)
-SUPPORTED_MODELS = ["densenet121", "vit_b_16"]
+# Model choices: "densenet121" (CNN), "vit_b_16" (ViT), swin_v2_b (ViT)
+SUPPORTED_MODELS = ["densenet121", "vit_b_16", "swin_v2_b"]
 
 # Fine-tuning strategy:
 #   - "full": train all parameters for all epochs
