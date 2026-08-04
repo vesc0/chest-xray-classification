@@ -101,7 +101,7 @@ def main():
         "--model",
         type=str,
         default="both",
-        choices=["densenet121", "vit_b_16", "both", "swin_v2_b"],
+        choices=["densenet121", "vit_b_16", "both", "swin_v2_b", "efficientnet_b4"],
         help="Which model to train/evaluate (default: both)",
     )
 

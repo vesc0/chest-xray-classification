@@ -220,7 +220,7 @@ def _split_backbone_head_params(model: nn.Module) -> tuple[list[nn.Parameter], l
     backbone = model.backbone
     head_module = None
 
-    # DenseNet
+    # DenseNet / EfficientNet
     if hasattr(backbone, "classifier"):
         head_module = backbone.classifier
 

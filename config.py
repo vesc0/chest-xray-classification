@@ -100,8 +100,8 @@ ASL_GAMMA_NEG = 4.0
 ASL_GAMMA_POS = 1.0
 ASL_CLIP = 0.05
 
-# Model choices: "densenet121" (CNN), "vit_b_16" (ViT), swin_v2_b (ViT)
-SUPPORTED_MODELS = ["densenet121", "vit_b_16", "swin_v2_b"]
+# Model choices: "densenet121" (CNN), "vit_b_16" (ViT), "swin_v2_b" (ViT), "efficientnet_b4" (CNN)
+SUPPORTED_MODELS = ["densenet121", "vit_b_16", "swin_v2_b", "efficientnet_b4"]
 
 # Fine-tuning strategy:
 #   - "full": train all parameters for all epochs

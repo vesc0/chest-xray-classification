@@ -3,7 +3,7 @@ Explainability module
 
 Implements two XAI techniques appropriate for each architecture:
 
-  1. Grad-CAM — for DenseNet-121 (CNN)
+  1. Grad-CAM — for DenseNet-121 and EfficientNet-B4 (CNN)
      Visualizes which spatial regions influenced a prediction by weighting
      the last convolutional feature maps by the gradient of the target class.
 
@@ -33,17 +33,21 @@ import config
 
 
 # =============================================================================
-# 1. Grad-CAM for CNN (DenseNet-121)
+# 1. Grad-CAM for CNN (DenseNet-121 / EfficientNet-B4)
 # =============================================================================
 class GradCAM:
     """
-    Grad-CAM implementation for DenseNet-121.
+    Grad-CAM implementation for CNN models (DenseNet-121 and EfficientNet-B4).
 
-    Hooks into the last convolutional layer (features.denseblock4) to capture
-    activations and gradients, then produces a class-discriminative heatmap.
+    Hooks into the last convolutional layer to capture activations and
+    gradients, then produces a class-discriminative heatmap.
+
+    Target layers:
+      - DenseNet-121: features.denseblock4
+      - EfficientNet-B4: features[-1] (last MBConv block)
     """
 
-    def __init__(self, model: nn.Module):
+    def __init__(self, model: nn.Module, model_name: str = "densenet121"):
         self.model = model
         self.model.eval()
 
@@ -51,8 +55,12 @@ class GradCAM:
         self.activations: torch.Tensor | None = None
         self.gradients: torch.Tensor | None = None
 
-        # Hook last DenseNet block to capture forward/backward signals
-        target_layer = model.backbone.features.denseblock4
+        # Select target layer based on architecture
+        if model_name == "efficientnet_b4":
+            target_layer = model.backbone.features[-1]
+        else:
+            # DenseNet-121 default
+            target_layer = model.backbone.features.denseblock4
         target_layer.register_forward_hook(self._save_activation)
         target_layer.register_full_backward_hook(self._save_gradient)
 
@@ -325,7 +333,10 @@ def generate_explanations(
 
     # Initialize the appropriate explainer
     if model_name == "densenet121":
-        explainer = GradCAM(model)
+        explainer = GradCAM(model, model_name="densenet121")
+        method_name = "Grad-CAM"
+    elif model_name == "efficientnet_b4":
+        explainer = GradCAM(model, model_name="efficientnet_b4")
         method_name = "Grad-CAM"
     elif model_name == "vit_b_16":
         explainer = AttentionRollout(model)
@@ -376,7 +387,7 @@ def generate_explanations(
             gt_str = ", ".join(gt_classes) if gt_classes else "No Finding"
 
             # Generate heatmap
-            if model_name == "densenet121":
+            if model_name in ("densenet121", "efficientnet_b4"):
                 heatmap = explainer.generate(img, top_class_idx)
             else:
                 heatmap = explainer.generate(img)

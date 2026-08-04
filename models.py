@@ -1,11 +1,13 @@
 """
 Model definitions
 
-Two architectures with ImageNet-pretrained backbones:
+Architectures with ImageNet-pretrained backbones:
   1. DenseNet-121 (CNN) — the backbone used in the original CheXNet paper
-  2. ViT-B/16 (Vision Transformer) — from torchvision
+  2. EfficientNet-B4 (CNN) — compound-scaled CNN, strong on medical imaging
+  3. ViT-B/16 (Vision Transformer) — from torchvision
+  4. SwinV2-B (Shifted-window Transformer)
 
-Both output NUM_CLASSES logits (one per pathology) for multi-label classification.
+All output NUM_CLASSES logits (one per pathology) for multi-label classification.
 """
 
 import torch
@@ -48,7 +50,44 @@ class DenseNet121Classifier(nn.Module):
 
 
 # =============================================================================
-# 2. ViT-B/16 (ViT)
+# 2. EfficientNet-B4 (compound-scaled CNN)
+# =============================================================================
+class EfficientNetB4Classifier(nn.Module):
+    """
+    EfficientNet-B4 with a custom classification head.
+
+    Architecture:
+      - EfficientNet-B4 backbone (pretrained on ImageNet)
+      - Adaptive average pooling (built into EfficientNet)
+      - Dropout → Linear(1792, NUM_CLASSES)
+
+    EfficientNet-B4 is the best trade-off variant for medical imaging at
+    224×224: larger capacity than B0-B2 (which underfit on multi-label
+    pathology detection) without the diminishing returns and memory cost
+    of B5-B7.
+    """
+
+    def __init__(self, num_classes: int = config.NUM_CLASSES, pretrained: bool = True):
+        super().__init__()
+
+        # Load pretrained EfficientNet-B4 backbone
+        weights = models.EfficientNet_B4_Weights.DEFAULT if pretrained else None
+        self.backbone = models.efficientnet_b4(weights=weights)
+
+        # Replace the original classifier head
+        in_features = self.backbone.classifier[1].in_features  # 1792
+        self.backbone.classifier = nn.Sequential(
+            nn.Dropout(p=0.3),
+            nn.Linear(in_features, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Forward pass through EfficientNet backbone
+        return self.backbone(x)
+
+
+# =============================================================================
+# 3. ViT-B/16 (ViT)
 # =============================================================================
 class ViTClassifier(nn.Module):
     """
@@ -79,7 +118,7 @@ class ViTClassifier(nn.Module):
 
 
 # =============================================================================
-# 3. SwinV2-B (modern ViT)
+# 4. SwinV2-B (modern ViT)
 # =============================================================================
 class SwinV2Classifier(nn.Module):
     """
@@ -113,7 +152,7 @@ def build_model(model_name: str, pretrained: bool = True) -> nn.Module:
     Instantiate a model by name.
 
     Args:
-        model_name: One of config.SUPPORTED_MODELS ("densenet121", "vit_b_16").
+        model_name: One of config.SUPPORTED_MODELS.
         pretrained: Whether to load ImageNet-pretrained weights.
 
     Returns:
@@ -125,6 +164,8 @@ def build_model(model_name: str, pretrained: bool = True) -> nn.Module:
         return ViTClassifier(pretrained=pretrained)
     elif model_name == "swin_v2_b":
         return SwinV2Classifier(pretrained=pretrained)
+    elif model_name == "efficientnet_b4":
+        return EfficientNetB4Classifier(pretrained=pretrained)
     else:
         raise ValueError(
             f"Unknown model '{model_name}'. Supported: {config.SUPPORTED_MODELS}"
