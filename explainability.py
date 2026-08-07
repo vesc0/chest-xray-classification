@@ -150,8 +150,13 @@ class AttentionRollout:
                     _torch._assert(input.dim() == 3, f"Expected 3D got {input.shape}")
                     x = blk.ln_1(input)
 
-                    # Force need_weights=True so attn_weights are computed
-                    x, attn_weights = blk.self_attention(x, x, x, need_weights=True)
+                    # Force need_weights=True so attn_weights are computed.
+                    # average_attn_weights=False keeps the per-head matrices;
+                    # the default pre-averages them and drops the head axis,
+                    # which makes the rollout below average the wrong dimension.
+                    x, attn_weights = blk.self_attention(
+                        x, x, x, need_weights=True, average_attn_weights=False
+                    )
 
                     # Store the attention weights
                     self.attention_maps.append(attn_weights.detach())
@@ -208,6 +213,15 @@ class AttentionRollout:
         for attn in self.attention_maps:
             # attn: (1, num_heads, seq_len, seq_len) → average over heads
             attn_avg = attn.mean(dim=1).squeeze(0)  # (seq_len, seq_len)
+
+            # Guard against a collapsed head axis: a 1D result would silently
+            # broadcast against the identity below and produce a bogus map.
+            if attn_avg.dim() != 2 or attn_avg.size(0) != attn_avg.size(1):
+                raise RuntimeError(
+                    "Expected a square (seq_len, seq_len) attention matrix, got "
+                    f"{tuple(attn_avg.shape)}. The attention weights were captured "
+                    "with the head axis already averaged."
+                )
 
             # Add residual connection (identity matrix)
             attn_avg = 0.5 * attn_avg + 0.5 * torch.eye(attn_avg.size(0), device=attn_avg.device)

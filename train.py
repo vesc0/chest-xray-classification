@@ -89,7 +89,7 @@ class AsymmetricLoss(nn.Module):
         gamma_neg: float = 4.0,
         gamma_pos: float = 1.0,
         clip: float = 0.05,
-        eps: float = 1e-8,
+        eps: float = 1e-6,
     ):
         super().__init__()
         self.gamma_neg = gamma_neg
@@ -98,6 +98,11 @@ class AsymmetricLoss(nn.Module):
         self.eps = eps
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Always compute in fp32. Under CUDA autocast the logits arrive as fp16,
+        # where eps underflows to zero and the log terms below become -inf.
+        logits = logits.float()
+        targets = targets.float()
+
         probs = torch.sigmoid(logits)
         probs_pos = probs.clamp(min=self.eps, max=1.0 - self.eps)
         probs_neg = 1.0 - probs
@@ -306,6 +311,27 @@ def _count_trainable_params(model: nn.Module) -> int:
     return sum(param.numel() for param in model.parameters() if param.requires_grad)
 
 
+def _disable_frozen_norm_updates(model: nn.Module) -> int:
+    """
+    Put BatchNorm layers whose parameters are frozen into eval mode.
+
+    Freezing a backbone via requires_grad stops its weights from being updated
+    but not its BatchNorm running statistics: model.train() switches the whole
+    module tree, so a "frozen" CNN backbone would still drift onto radiograph
+    statistics. Must be called after model.train(). Idempotent.
+
+    Returns the number of BatchNorm layers switched off.
+    """
+    frozen = 0
+    for module in model.modules():
+        if isinstance(module, nn.modules.batchnorm._BatchNorm):
+            params = list(module.parameters(recurse=False))
+            if params and not any(param.requires_grad for param in params):
+                module.eval()
+                frozen += 1
+    return frozen
+
+
 # =============================================================================
 # Training and validation loops
 # =============================================================================
@@ -319,6 +345,9 @@ def train_one_epoch(
 ) -> dict[str, float]:
     """Run one training epoch and return loss plus threshold-free metrics."""
     model.train()
+    # Keep frozen BatchNorm layers from updating their running statistics
+    _disable_frozen_norm_updates(model)
+
     running_loss = 0.0
     all_labels, all_probs = [], []
 
@@ -457,9 +486,11 @@ def train_model(
         current_stage = _apply_tuning_mode(model, epoch, backbone_params, head_params)
         trainable_params = _count_trainable_params(model)
         if current_stage != last_stage:
+            frozen_norms = _disable_frozen_norm_updates(model)
             print(
                 f"  [train] Tuning stage -> {current_stage} "
-                f"(trainable params: {trainable_params:,})"
+                f"(trainable params: {trainable_params:,}, "
+                f"frozen BatchNorm layers: {frozen_norms})"
             )
             last_stage = current_stage
 

@@ -1,9 +1,0 @@
-{
-  "model": "densenet121",
-  "experiment": "exp_01_densenet_baseline",
-  "epochs_trained": 15,
-  "final_train_loss": 0.03156765109507296,
-  "final_val_loss": 0.05243542307504901,
-  "final_val_auroc": 0.5241535207712961,
-  "final_val_auprc": 0.1708633308779986
-}
