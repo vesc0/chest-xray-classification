@@ -10,8 +10,12 @@ from pathlib import Path
 # =============================================================================
 # Paths
 # =============================================================================
-# Root of the NIH Chest X-ray dataset on external SSD
-DATASET_ROOT = Path("/Volumes/pm961/archive-chest-xrays-nih")
+# Root of the NIH Chest X-ray dataset.
+# Defaults to the external SSD used for development; override for any other
+# machine with the XRAY_DATASET_ROOT environment variable:
+#   export XRAY_DATASET_ROOT=/path/to/archive-chest-xrays-nih
+DEFAULT_DATASET_ROOT = "/Volumes/PM961/archive-chest-xrays-nih"
+DATASET_ROOT = Path(os.environ.get("XRAY_DATASET_ROOT", DEFAULT_DATASET_ROOT))
 DATA_ENTRY_CSV = DATASET_ROOT / "Data_Entry_2017.csv"
 TRAIN_VAL_LIST = DATASET_ROOT / "train_val_list.txt"
 TEST_LIST = DATASET_ROOT / "test_list.txt"
@@ -61,8 +65,14 @@ CLASS_NAMES = [
 ]
 NUM_CLASSES = len(CLASS_NAMES)
 
-# Subset size for testing (set to 0 or None for full dataset)
-SUBSET_SIZE = 1000
+# Subset size for quick experiments; 0 or None means the full dataset.
+# Opt into a subset per-run with `--subset N` rather than changing this.
+SUBSET_SIZE = 0
+
+# Fraction of CSV rows that must resolve to a file on disk before the
+# dataset root is considered valid. Below this threshold, fail loudly
+# instead of training on only a small subset of images.
+MIN_IMAGE_MATCH_RATE = 0.5
 
 # Fraction of train_val set used for validation
 VAL_SPLIT = 0.1

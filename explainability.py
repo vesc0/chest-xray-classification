@@ -61,8 +61,27 @@ class GradCAM:
         else:
             # DenseNet-121 default
             target_layer = model.backbone.features.denseblock4
-        target_layer.register_forward_hook(self._save_activation)
-        target_layer.register_full_backward_hook(self._save_gradient)
+
+        # Keep the handles so the hooks can be detached again — a GradCAM left
+        # attached keeps every forward pass storing activations.
+        self.handles = [
+            target_layer.register_forward_hook(self._save_activation),
+            target_layer.register_full_backward_hook(self._save_gradient),
+        ]
+
+    def remove_hooks(self) -> None:
+        """Detach the forward/backward hooks. Safe to call more than once."""
+        for handle in self.handles:
+            handle.remove()
+        self.handles = []
+        self.activations = None
+        self.gradients = None
+
+    def __enter__(self) -> "GradCAM":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.remove_hooks()
 
     # Save forward activations
     def _save_activation(self, module, input, output):
@@ -366,55 +385,65 @@ def generate_explanations(
 
     # Iterate over test dataset
     count = 0
-    for batch in test_loader:
-        images = batch["image"]
-        labels = batch["label"]
-        filenames = batch["filename"]
+    try:
+        for batch in test_loader:
+            images = batch["image"]
+            labels = batch["label"]
+            filenames = batch["filename"]
 
-        for i in range(images.size(0)):
+            for i in range(images.size(0)):
+                if count >= num_samples:
+                    break
+
+                img = images[i].unsqueeze(0).to(device)
+                label_vec = labels[i].numpy()
+
+                # Find the predicted (or ground-truth) top class for visualization - Forward pass
+                with torch.no_grad():
+                    logits = model(img)
+                    probs = torch.sigmoid(logits).cpu().numpy().flatten()
+
+                # Select class using calibrated thresholds
+                positive_indices = np.where(probs >= thresholds)[0]
+                if positive_indices.size > 0:
+                    top_class_idx = int(positive_indices[probs[positive_indices].argmax()])
+                    selection_note = "Calibrated positive"
+                else:
+                    top_class_idx = int(probs.argmax())
+                    selection_note = "No calibrated positive; showing top score"
+
+                top_class_name = config.CLASS_NAMES[top_class_idx]
+                top_prob = probs[top_class_idx]
+                top_threshold = thresholds[top_class_idx]
+
+                # Ground truth labels
+                gt_classes = [config.CLASS_NAMES[j] for j, v in enumerate(label_vec) if v > 0.5]
+                gt_str = ", ".join(gt_classes) if gt_classes else "No Finding"
+
+                # Generate heatmap
+                if model_name in ("densenet121", "efficientnet_b4"):
+                    heatmap = explainer.generate(img, top_class_idx)
+                else:
+                    heatmap = explainer.generate(img)
+
+                # Save visualization
+                title = (
+                    f"{method_name} — {model_name}\n"
+                    f"{selection_note}: {top_class_name} ({top_prob:.2f}, thr={top_threshold:.2f})"
+                    f"  |  GT: {gt_str}"
+                )
+                save_path = str(
+                    xai_dir / f"sample_{count:03d}_{filenames[i].replace('.png', '')}.png"
+                )
+                overlay_heatmap(images[i], heatmap, title, save_path)
+
+                count += 1
+
             if count >= num_samples:
-                return
-
-            img = images[i].unsqueeze(0).to(device)
-            label_vec = labels[i].numpy()
-
-            # Find the predicted (or ground-truth) top class for visualization - Forward pass
-            with torch.no_grad():
-                logits = model(img)
-                probs = torch.sigmoid(logits).cpu().numpy().flatten()
-
-            # Select class using calibrated thresholds
-            positive_indices = np.where(probs >= thresholds)[0]
-            if positive_indices.size > 0:
-                top_class_idx = int(positive_indices[probs[positive_indices].argmax()])
-                selection_note = "Calibrated positive"
-            else:
-                top_class_idx = int(probs.argmax())
-                selection_note = "No calibrated positive; showing top score"
-
-            top_class_name = config.CLASS_NAMES[top_class_idx]
-            top_prob = probs[top_class_idx]
-            top_threshold = thresholds[top_class_idx]
-
-            # Ground truth labels
-            gt_classes = [config.CLASS_NAMES[j] for j, v in enumerate(label_vec) if v > 0.5]
-            gt_str = ", ".join(gt_classes) if gt_classes else "No Finding"
-
-            # Generate heatmap
-            if model_name in ("densenet121", "efficientnet_b4"):
-                heatmap = explainer.generate(img, top_class_idx)
-            else:
-                heatmap = explainer.generate(img)
-
-            # Save visualization
-            title = (
-                f"{method_name} — {model_name}\n"
-                f"{selection_note}: {top_class_name} ({top_prob:.2f}, thr={top_threshold:.2f})"
-                f"  |  GT: {gt_str}"
-            )
-            save_path = str(xai_dir / f"sample_{count:03d}_{filenames[i].replace('.png', '')}.png")
-            overlay_heatmap(images[i], heatmap, title, save_path)
-
-            count += 1
+                break
+    finally:
+        # Grad-CAM leaves hooks on the model; always take them off again
+        if isinstance(explainer, GradCAM):
+            explainer.remove_hooks()
 
     print(f"[xai] Saved {count} visualizations → {xai_dir}")

@@ -23,19 +23,44 @@ from torchvision import transforms
 from sklearn.model_selection import GroupShuffleSplit, train_test_split
 
 import config
+from utils import make_dataloader_generator, seed_worker
 
 
 # =============================================================================
 # Data indexing utilities
 # =============================================================================
 def _build_image_index() -> dict[str, Path]:
-    """Scan all image directories and return {filename: full_path}."""
+    """
+    Scan all image directories and return {filename: full_path}.
+
+    Raises if no image directory is readable — usually an unmounted drive or an
+    unset XRAY_DATASET_ROOT, which would otherwise surface much later as an
+    empty DataFrame.
+    """
     index: dict[str, Path] = {}
+    found_dirs = 0
+
     for img_dir in config.IMAGE_DIRS:
         if img_dir.exists():
+            found_dirs += 1
             for path in img_dir.iterdir():
                 if path.suffix == ".png":
                     index[path.name] = path
+
+    if not index:
+        raise FileNotFoundError(
+            f"No images found under {config.DATASET_ROOT} "
+            f"({found_dirs}/{len(config.IMAGE_DIRS)} image directories readable). "
+            "Check that the dataset drive is mounted, or point XRAY_DATASET_ROOT "
+            "at the dataset root."
+        )
+
+    if found_dirs < len(config.IMAGE_DIRS):
+        print(
+            f"[dataset] Warning: only {found_dirs}/{len(config.IMAGE_DIRS)} "
+            "image directories were found."
+        )
+
     return index
 
 
@@ -65,14 +90,30 @@ def load_metadata() -> pd.DataFrame:
 
     Returns a DataFrame ready for dataset construction.
     """
+    if not config.DATA_ENTRY_CSV.exists():
+        raise FileNotFoundError(
+            f"Metadata CSV not found at {config.DATA_ENTRY_CSV}. "
+            "Check that the dataset drive is mounted, or point XRAY_DATASET_ROOT "
+            "at the dataset root."
+        )
+
     df = pd.read_csv(config.DATA_ENTRY_CSV)
 
     image_index = _build_image_index()
     df["filepath"] = df["Image Index"].map(image_index)
 
-    # Remove missing files (dataset integrity check)
-    missing = df["filepath"].isna().sum()
+    # Dataset integrity check: a low match rate means the index and the CSV
+    # disagree, so fail rather than silently training on whatever is left.
+    missing = int(df["filepath"].isna().sum())
     if missing > 0:
+        match_rate = (len(df) - missing) / max(len(df), 1)
+        if match_rate < config.MIN_IMAGE_MATCH_RATE:
+            raise FileNotFoundError(
+                f"Only {len(df) - missing}/{len(df)} images listed in "
+                f"{config.DATA_ENTRY_CSV.name} were found under {config.DATASET_ROOT} "
+                f"({match_rate:.1%}, minimum {config.MIN_IMAGE_MATCH_RATE:.0%}). "
+                "The dataset looks incomplete or the root path is wrong."
+            )
         print(f"[dataset] Warning: {missing} images not found on disk - skipping them.")
         df = df.dropna(subset=["filepath"]).reset_index(drop=True)
 
@@ -387,13 +428,22 @@ def get_dataloaders() -> tuple[DataLoader, DataLoader, DataLoader]:
         "batch_size": config.BATCH_SIZE,
         "num_workers": config.NUM_WORKERS,
         "pin_memory": use_pin_memory,
+        # Reproducible shuffling and augmentation across runs
+        "worker_init_fn": seed_worker,
     }
     if config.NUM_WORKERS > 0:
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = 2
 
-    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
-    val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
-    test_loader = DataLoader(test_ds, shuffle=False, **loader_kwargs)
+    # A generator per loader, so one loader's draws cannot shift another's
+    train_loader = DataLoader(
+        train_ds, shuffle=True, generator=make_dataloader_generator(), **loader_kwargs
+    )
+    val_loader = DataLoader(
+        val_ds, shuffle=False, generator=make_dataloader_generator(), **loader_kwargs
+    )
+    test_loader = DataLoader(
+        test_ds, shuffle=False, generator=make_dataloader_generator(), **loader_kwargs
+    )
 
     return train_loader, val_loader, test_loader

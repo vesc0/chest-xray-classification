@@ -23,7 +23,13 @@ import config
 
 
 def seed_everything(seed: int = config.SEED) -> None:
-    """Set random seeds for full reproducibility."""
+    """
+    Seed the main-process RNGs and pin cuDNN to deterministic kernels.
+
+    This alone does not make augmentation reproducible: DataLoader workers are
+    separate processes with their own RNG state. get_dataloaders() pairs this
+    with seed_worker / make_dataloader_generator to cover them.
+    """
 
     # Python random seed
     random.seed(seed)
@@ -41,6 +47,26 @@ def seed_everything(seed: int = config.SEED) -> None:
     # Force deterministic CUDA operations
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def seed_worker(worker_id: int) -> None:
+    """
+    Seed one DataLoader worker process (used as worker_init_fn).
+
+    PyTorch gives each worker a distinct torch seed derived from the loader's
+    generator, but leaves Python's `random` and NumPy unseeded — and the
+    torchvision transforms used here draw from both.
+    """
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def make_dataloader_generator(seed: int = config.SEED) -> torch.Generator:
+    """Build the RNG that drives shuffling and per-worker seeding."""
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return generator
 
 
 def plot_training_curves(history: dict, model_name: str) -> Path:

@@ -4,9 +4,9 @@ Main entry point for the chest X-ray classification pipeline.
 Usage:
   python main.py --model densenet121
   python main.py --model vit_b_16
-  python main.py --model both
+  python main.py --model all
   python main.py --model densenet121 --eval-only
-  python main.py --model both --subset 5000 --experiment my_run
+  python main.py --model all --subset 5000 --experiment my_run
   python main.py --compare-all
 """
 
@@ -97,12 +97,15 @@ def main():
     )
 
     # Model selection
+    # No default: with the full dataset as the default, an implicit
+    # "train everything" would be a very expensive accident. Required unless
+    # --compare-all is given (enforced after parsing).
     parser.add_argument(
         "--model",
         type=str,
-        default="both",
-        choices=["densenet121", "vit_b_16", "both", "swin_v2_b", "efficientnet_b4"],
-        help="Which model to train/evaluate (default: both)",
+        default=None,
+        choices=[*config.SUPPORTED_MODELS, "all"],
+        help="Which model to train/evaluate, or 'all' for every supported architecture",
     )
 
     parser.add_argument(
@@ -216,6 +219,9 @@ def main():
         compare_experiments()
         return
 
+    if args.model is None:
+        parser.error("--model is required (or use --compare-all)")
+
     # Override config dynamically from CLI
     if args.subset is not None:
         config.SUBSET_SIZE = args.subset
@@ -275,8 +281,8 @@ def main():
     print(f"  Num workers:        {config.NUM_WORKERS}")
 
     # Model selection logic
-    if args.model == "both":
-        model_names = ["densenet121", "vit_b_16"]
+    if args.model == "all":
+        model_names = list(config.SUPPORTED_MODELS)
     else:
         model_names = [args.model]
 

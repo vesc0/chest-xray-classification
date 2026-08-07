@@ -14,3 +14,7 @@ Pillow>=10.0.0
 
 # Visualization
 matplotlib>=3.7.0
+seaborn>=0.13.0        # notebooks only
+
+# Notebooks (not needed for the main.py pipeline)
+ipykernel>=6.29.0
