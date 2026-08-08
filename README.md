@@ -129,6 +129,30 @@ Common overrides: `--epochs`, `--batch-size`, `--lr`, `--num-workers`,
 `--checkpoint-metric {val_loss,val_auroc,val_auprc}`,
 `--threshold-metric {f1,fbeta,youden}`. Run `python main.py --help` for the full list.
 
+## Timing
+
+Every run records wall-clock cost into the `timing` block of its results JSON,
+and `--compare-all` surfaces it alongside the accuracy metrics:
+
+- **Training** — total, epochs actually run, mean seconds/epoch, and time to the
+  best epoch. Compare on **mean seconds/epoch**: total is confounded by when
+  early stopping happened to fire.
+- **Inference** — measured on the test set, reported two ways. *End-to-end*
+  includes PNG decode and transforms, so it reflects deployment cost but is
+  dominated by the DataLoader for small models. *Model-only* isolates the
+  forward pass and is the fair architecture comparison. The first batch is
+  excluded from model-only time as warm-up.
+
+Timings are recorded together with the conditions that produced them (device,
+batch size, workers, AMP, parameter count) — they mean nothing without those.
+`train.synchronize()` is called around every timed region, because CUDA and MPS
+queue kernels asynchronously and a timer stopped without it measures dispatch
+rather than execution (understating GPU time by ~3× on MPS here).
+
+For timing to be comparable across models, run them on the same machine under
+the same load. On a laptop especially, a model trained third in an overnight
+sweep can look slower purely from thermal throttling.
+
 ## Outputs
 
 Each run writes to `outputs/<experiment>/`, where `<experiment>` is `--experiment` if

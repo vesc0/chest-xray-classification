@@ -298,6 +298,27 @@ def compare_experiments(output_root: Path = config.PROJECT_ROOT / "outputs") -> 
         print(row_str)
         csv_data.append(row_dict)
 
+    # Cost rows: mean epoch time is fairer than total, which early stopping skews
+    timing_keys = [
+        ("mean_epoch_seconds", ("training", "mean_epoch_seconds")),
+        ("epochs_run", ("training", "epochs_run")),
+        ("model_img_per_sec", ("inference", "model_images_per_second")),
+    ]
+    for label, (section, key) in timing_keys:
+        row_str = f"{label:<22}"
+        row_dict = {"Metric": label}
+        for display_name, result in experiments.items():
+            value = (result.get("timing", {}).get(section) or {}).get(key)
+            if value is None:
+                row_str += f"{'N/A':>{col_width}}"
+            elif isinstance(value, int):
+                row_str += f"{value:>{col_width},}"
+            else:
+                row_str += f"{value:>{col_width}.1f}"
+            row_dict[display_name] = value
+        print(row_str)
+        csv_data.append(row_dict)
+
     print(f"{'=' * (22 + col_width * len(experiments))}\n")
 
     # Save to CSV

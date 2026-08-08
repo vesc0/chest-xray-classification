@@ -35,6 +35,20 @@ def _get_device() -> torch.device:
     return torch.device("cpu")
 
 
+def synchronize(device: torch.device) -> None:
+    """
+    Block until queued accelerator work has finished.
+
+    CUDA and MPS dispatch kernels asynchronously, so a timer stopped without
+    this measures how long it took to *queue* the work, not to run it —
+    understating GPU time several-fold. Required around any timed region.
+    """
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elif device.type == "mps":
+        torch.mps.synchronize()
+
+
 def _has_both_labels(labels: np.ndarray) -> bool:
     """AUROC is defined only when both positive and negative labels exist."""
     positives = labels.sum()
@@ -446,11 +460,13 @@ def train_model(
     train_loader: DataLoader,
     val_loader: DataLoader,
     model_name: str,
-) -> dict:
+) -> tuple[dict, dict]:
     """
     Train a model end-to-end with early stopping.
 
-    Returns a history dict for plotting and experiment tracking.
+    Returns (history, timing): per-epoch curves for plotting, and a wall-clock
+    summary. Total time is confounded by when early stopping fired, so
+    mean_epoch_seconds is the fair number to compare across architectures.
     """
     device = _get_device()
     print(f"[train] Using device: {device}")
@@ -473,14 +489,17 @@ def train_model(
         "val_auroc": [],
         "val_auprc": [],
         "lr": [],
+        "epoch_seconds": [],
     }
 
     best_value = float("inf") if config.CHECKPOINT_METRIC == "val_loss" else float("-inf")
     patience_counter = 0
     last_stage = None
+    best_epoch = 0
+    train_start = time.perf_counter()
 
     for epoch in range(1, config.NUM_EPOCHS + 1):
-        t0 = time.time()
+        t0 = time.perf_counter()
 
         # Configure trainable layers
         current_stage = _apply_tuning_mode(model, epoch, backbone_params, head_params)
@@ -510,7 +529,8 @@ def train_model(
             scheduler.step()
 
         current_lr = optimizer.param_groups[-1]["lr"]
-        elapsed = time.time() - t0
+        synchronize(device)
+        elapsed = time.perf_counter() - t0
 
         print(
             f"  Epoch {epoch:02d}/{config.NUM_EPOCHS} "
@@ -531,6 +551,7 @@ def train_model(
         history["val_auroc"].append(val_metrics["auroc"])
         history["val_auprc"].append(val_metrics["auprc"])
         history["lr"].append(current_lr)
+        history["epoch_seconds"].append(elapsed)
 
         # Check improvement
         current_value, smaller_is_better = _get_monitored_metric(val_metrics)
@@ -540,6 +561,7 @@ def train_model(
 
         if is_improved:
             best_value = current_value
+            best_epoch = epoch
             patience_counter = 0
             torch.save(model.state_dict(), best_ckpt_path)
             print(
@@ -557,10 +579,26 @@ def train_model(
             )
             break
 
+    total_seconds = time.perf_counter() - train_start
+
     # Load best model weights
     model.load_state_dict(
         torch.load(best_ckpt_path, map_location=device, weights_only=True)
     )
     print(f"[train] Loaded best checkpoint ({config.CHECKPOINT_METRIC}={best_value:.4f})")
 
-    return history
+    epoch_seconds = history["epoch_seconds"]
+    timing = {
+        "total_seconds": round(total_seconds, 2),
+        "epochs_run": len(epoch_seconds),
+        "mean_epoch_seconds": round(float(np.mean(epoch_seconds)), 2) if epoch_seconds else None,
+        "best_epoch": best_epoch,
+        # Cost of reaching the weights that are actually used downstream
+        "seconds_to_best_epoch": round(float(np.sum(epoch_seconds[:best_epoch])), 2),
+    }
+    print(
+        f"[train] {timing['epochs_run']} epochs in {total_seconds / 60:.1f} min "
+        f"({timing['mean_epoch_seconds']:.1f}s/epoch, best at epoch {best_epoch})"
+    )
+
+    return history, timing

@@ -10,6 +10,7 @@ Computes and reports:
 """
 
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -30,6 +31,7 @@ from sklearn.metrics import (
 )
 
 import config
+from train import synchronize
 
 
 def _has_both_labels(labels: np.ndarray) -> bool:
@@ -46,33 +48,78 @@ def collect_predictions(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, dict]:
     """
     Run inference on an entire loader.
 
     Returns:
         labels: (N, NUM_CLASSES) ground-truth multi-hot
         probs:  (N, NUM_CLASSES) predicted probabilities
+        timing: wall-clock breakdown
+
+    Timing separates two figures that are easy to conflate. End-to-end includes
+    image decode and transforms, so it reflects what a deployment would feel but
+    is dominated by the DataLoader for small models; model-only isolates the
+    forward pass and is the fair architecture comparison. The first batch is
+    excluded from model-only time as warm-up, since it carries lazy allocation
+    and kernel selection.
     """
     model.eval()
     all_labels, all_probs = [], []
 
-    for batch in loader:
+    model_seconds = 0.0
+    warmup_images = 0
+    total_images = 0
+
+    synchronize(device)
+    start = time.perf_counter()
+
+    for batch_idx, batch in enumerate(loader):
         images = batch["image"].to(device, non_blocking=True)
 
         # Labels are kept on CPU to avoid GPU overhead
         labels = batch["label"].cpu().numpy()
 
+        synchronize(device)
+        forward_start = time.perf_counter()
         with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
             logits = model(images)
+        synchronize(device)
+        forward_seconds = time.perf_counter() - forward_start
+
+        if batch_idx == 0:
+            warmup_images = images.size(0)
+        else:
+            model_seconds += forward_seconds
+
+        total_images += images.size(0)
 
         probs = torch.sigmoid(logits).cpu().numpy()
         all_labels.append(labels)
         all_probs.append(probs)
 
+    synchronize(device)
+    total_seconds = time.perf_counter() - start
+
+    timed_images = max(total_images - warmup_images, 0)
+    timing = {
+        "num_images": total_images,
+        "total_seconds": round(total_seconds, 3),
+        "images_per_second": round(total_images / total_seconds, 1) if total_seconds > 0 else None,
+        "ms_per_image": round(1000.0 * total_seconds / total_images, 3) if total_images else None,
+        "model_seconds": round(model_seconds, 3),
+        "model_images": timed_images,
+        "model_images_per_second": (
+            round(timed_images / model_seconds, 1) if model_seconds > 0 else None
+        ),
+        "model_ms_per_image": (
+            round(1000.0 * model_seconds / timed_images, 3) if timed_images else None
+        ),
+    }
+
     labels_np = np.concatenate(all_labels)
     probs_np = np.concatenate(all_probs)
-    return labels_np, probs_np
+    return labels_np, probs_np, timing
 
 
 # =============================================================================
@@ -211,7 +258,7 @@ def calibrate_thresholds(
     """Tune per-class thresholds on the validation set and save them."""
     device = next(model.parameters()).device
     print(f"[evaluate] Calibrating thresholds on the validation set ({len(val_loader.dataset)} samples) ...")
-    labels, probs = collect_predictions(model, val_loader, device)
+    labels, probs, _ = collect_predictions(model, val_loader, device)
     thresholds, summary = tune_thresholds(labels, probs)
     save_thresholds(thresholds, summary, model_name)
     return thresholds
@@ -467,6 +514,34 @@ def print_results(results: dict, model_name: str) -> None:
             f"{_fmt(screening.get('noisy_or_auroc'))} (noisy-or)"
             f"   [abnormal prevalence {screening.get('prevalence', 0):.4f}]"
         )
+
+    timing = results.get("timing", {})
+    training = timing.get("training") or {}
+    inference = timing.get("inference") or {}
+    if training or inference:
+        print(f"{'-' * 96}")
+        print(
+            f"  Device: {timing.get('device')}  |  batch {timing.get('batch_size')}  |  "
+            f"workers {timing.get('num_workers')}  |  AMP {timing.get('amp')}  |  "
+            f"params {timing.get('total_params', 0):,}"
+        )
+    if training:
+        print(
+            f"  Training:  {training['total_seconds'] / 60:.1f} min over "
+            f"{training['epochs_run']} epochs "
+            f"({training['mean_epoch_seconds']:.1f}s/epoch, "
+            f"best at epoch {training['best_epoch']} "
+            f"after {training['seconds_to_best_epoch'] / 60:.1f} min)"
+        )
+    if inference:
+        print(
+            f"  Inference: {inference['total_seconds']:.1f}s for "
+            f"{inference['num_images']:,} images  |  "
+            f"end-to-end {inference['images_per_second']:.1f} img/s "
+            f"({inference['ms_per_image']:.2f} ms/img)  |  "
+            f"model-only {inference['model_images_per_second']:.1f} img/s "
+            f"({inference['model_ms_per_image']:.2f} ms/img)"
+        )
     print(f"{'=' * 96}\n")
 
 
@@ -488,6 +563,7 @@ def evaluate_model(
     test_loader: DataLoader,
     model_name: str,
     thresholds: np.ndarray | None = None,
+    training_timing: dict | None = None,
 ) -> dict:
     """
     Full evaluation pipeline: inference -> thresholding -> metrics -> save.
@@ -497,11 +573,22 @@ def evaluate_model(
     device = next(model.parameters()).device
 
     print(f"[evaluate] Running inference on the test set ({len(test_loader.dataset)} samples) ...")
-    labels, probs = collect_predictions(model, test_loader, device)
+    labels, probs, inference_timing = collect_predictions(model, test_loader, device)
     preds = apply_thresholds(probs, thresholds)
 
     print("[evaluate] Computing calibrated metrics ...")
     results = compute_metrics(labels, probs, preds, thresholds=thresholds)
+
+    # Timings are meaningless without the conditions they were measured under
+    results["timing"] = {
+        "device": device.type,
+        "batch_size": config.BATCH_SIZE,
+        "num_workers": config.NUM_WORKERS,
+        "amp": device.type == "cuda",
+        "total_params": sum(p.numel() for p in model.parameters()),
+        "training": training_timing,
+        "inference": inference_timing,
+    }
 
     print_results(results, model_name)
     save_results(results, model_name)

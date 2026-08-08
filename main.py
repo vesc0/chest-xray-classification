@@ -12,7 +12,6 @@ Usage:
 
 import argparse
 import sys
-import time
 
 import torch
 
@@ -56,6 +55,7 @@ def run_pipeline(
     print(f"  Trainable parameters: {trainable_params:,}")
 
     ckpt_path = config.CHECKPOINT_DIR / f"{model_name}_best.pt"
+    training_timing = None
 
     # Training or checkpoint loading
     if eval_only:
@@ -67,10 +67,7 @@ def run_pipeline(
         model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
     else:
         print(f"[main] Step 2/5 - Training {model_name} ...")
-        t0 = time.time()
-        history = train_model(model, train_loader, val_loader, model_name)
-        elapsed = time.time() - t0
-        print(f"[main] Training completed in {elapsed / 60:.1f} minutes")
+        history, training_timing = train_model(model, train_loader, val_loader, model_name)
         plot_training_curves(history, model_name)
 
     # Threshold calibration (important for multi-label classification)
@@ -79,7 +76,13 @@ def run_pipeline(
 
     # Final evaluation on held-out test set
     print(f"[main] Step 4/5 - Evaluating {model_name} on the test set ...")
-    results = evaluate_model(model, test_loader, model_name, thresholds=thresholds)
+    results = evaluate_model(
+        model,
+        test_loader,
+        model_name,
+        thresholds=thresholds,
+        training_timing=training_timing,
+    )
 
     # Explainability (XAI visual outputs)
     print(f"[main] Step 5/5 - Generating XAI visualizations ...")
