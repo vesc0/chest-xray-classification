@@ -69,14 +69,23 @@ The entire workflow is orchestrated natively via the `main.py` entry point.
 
 ## Supported Models
 
-| `--model`         | Architecture   | Type        | XAI method        |
-| ----------------- | -------------- | ----------- | ----------------- |
-| `densenet121`     | DenseNet-121   | CNN         | Grad-CAM          |
-| `efficientnet_b4` | EfficientNet-B4| CNN         | Grad-CAM          |
-| `vit_b_16`        | ViT-B/16       | Transformer | Attention Rollout |
-| `swin_v2_b`       | SwinV2-B       | Transformer | not implemented   |
+| `--model`         | Architecture   | Type        | Grad-CAM target layer     | Extra XAI         |
+| ----------------- | -------------- | ----------- | ------------------------- | ----------------- |
+| `densenet121`     | DenseNet-121   | CNN         | `features.denseblock4`    | —                 |
+| `efficientnet_b4` | EfficientNet-B4| CNN         | `features[-1]`            | —                 |
+| `vit_b_16`        | ViT-B/16       | Transformer | `encoder.layers[-1].ln_1` | Attention Rollout |
+| `swin_v2_b`       | SwinV2-B       | Transformer | `norm`                    | —                 |
 
 `--model all` runs every architecture in the table.
+
+**Grad-CAM runs for all four models** so heatmaps are comparable across
+architectures — comparing localization is meaningless if the CNNs and the
+transformers are explained by different methods. Transformers do not emit NCHW
+feature maps, so each architecture registers a reshape transform in
+`explainability.GRADCAM_TARGETS` (Swin is NHWC; ViT is a token sequence that is
+folded back into a 14×14 grid). ViT additionally gets Attention Rollout as a
+native second view; note it is *class-agnostic*, showing where the model
+attends rather than what supported a specific pathology.
 
 ## Notebooks
 
@@ -128,6 +137,6 @@ given, otherwise `subset_<N>` or `full_dataset`:
 ```
 outputs/<experiment>/
 ├── checkpoints/   # best model weights per architecture
-├── results/       # metrics JSON, tuned thresholds, training curves
-└── xai/           # Grad-CAM / Attention Rollout visualizations
+├── results/       # metrics JSON, tuned thresholds, training curves, split summary
+└── xai/<model>/<method>/   # gradcam/ for every model, plus rollout/ for ViT
 ```

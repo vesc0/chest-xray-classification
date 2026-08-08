@@ -1,15 +1,25 @@
 """
 Explainability module
 
-Implements two XAI techniques appropriate for each architecture:
+  1. Grad-CAM — for all four architectures
+     Weights the last spatial feature map by the gradient of the target class.
+     Applied to every model so that explanations are comparable across
+     architectures: a "which model localizes better" claim is meaningless if
+     the CNNs and the transformers are explained by different methods.
 
-  1. Grad-CAM — for DenseNet-121 and EfficientNet-B4 (CNN)
-     Visualizes which spatial regions influenced a prediction by weighting
-     the last convolutional feature maps by the gradient of the target class.
+     Transformers do not emit NCHW feature maps, so each architecture pairs a
+     target layer with a reshape transform that normalizes its output:
 
-  2. Attention Rollout — for ViT-B/16 (ViT)
+       DenseNet-121     features.denseblock4          NCHW already
+       EfficientNet-B4  features[-1]                  NCHW already
+       SwinV2-B         norm                          NHWC -> NCHW
+       ViT-B/16         encoder.layers[-1].ln_1       tokens -> 14x14 grid
+
+  2. Attention Rollout — ViT-B/16 only, as an architecture-native second view
      Recursively multiplies attention matrices across all transformer layers
-     to produce a single spatial attention map from the [CLS] token.
+     to produce a single spatial attention map from the [CLS] token. Unlike
+     Grad-CAM this is class-agnostic: it shows where the model looks, not what
+     evidence supported a particular pathology.
 
 Both methods overlay a heatmap on the original X-ray and save the result.
 """
@@ -33,18 +43,65 @@ import config
 
 
 # =============================================================================
-# 1. Grad-CAM for CNN (DenseNet-121 / EfficientNet-B4)
+# 1. Grad-CAM (all architectures)
 # =============================================================================
+def _identity_transform(tensor: torch.Tensor) -> torch.Tensor:
+    """CNN feature maps are already (B, C, H, W)."""
+    return tensor
+
+
+def _nhwc_to_nchw(tensor: torch.Tensor) -> torch.Tensor:
+    """Swin emits (B, H, W, C); move the channel axis where the CAM expects it."""
+    return tensor.permute(0, 3, 1, 2).contiguous()
+
+
+def _tokens_to_grid(tensor: torch.Tensor) -> torch.Tensor:
+    """Reshape ViT tokens (B, 1 + N, C) into a (B, C, sqrt(N), sqrt(N)) map."""
+    tokens = tensor[:, 1:, :]  # drop the [CLS] token, which has no location
+    batch, num_tokens, channels = tokens.shape
+
+    grid_size = int(round(num_tokens ** 0.5))
+    if grid_size * grid_size != num_tokens:
+        raise ValueError(
+            f"Expected a square patch grid, got {num_tokens} tokens."
+        )
+
+    return tokens.reshape(batch, grid_size, grid_size, channels).permute(0, 3, 1, 2).contiguous()
+
+
+# Target layer + layout transform per architecture. Getting the layer wrong is
+# quiet rather than loud: a transformer layout fed straight into the CNN maths
+# produces a plausible-looking but meaningless heatmap.
+GRADCAM_TARGETS: dict = {
+    "densenet121": (
+        lambda model: model.backbone.features.denseblock4,
+        _identity_transform,
+    ),
+    "efficientnet_b4": (
+        lambda model: model.backbone.features[-1],
+        _identity_transform,
+    ),
+    "swin_v2_b": (
+        lambda model: model.backbone.norm,
+        _nhwc_to_nchw,
+    ),
+    # NOT encoder.ln: the head reads only token 0, so gradients w.r.t. every
+    # patch token at that final norm are exactly zero and the CAM comes out
+    # blank. ln_1 of the last block still routes through attention to all tokens.
+    "vit_b_16": (
+        lambda model: model.backbone.encoder.layers[-1].ln_1,
+        _tokens_to_grid,
+    ),
+}
+
+
 class GradCAM:
     """
-    Grad-CAM implementation for CNN models (DenseNet-121 and EfficientNet-B4).
+    Grad-CAM for any of the supported architectures.
 
-    Hooks into the last convolutional layer to capture activations and
-    gradients, then produces a class-discriminative heatmap.
-
-    Target layers:
-      - DenseNet-121: features.denseblock4
-      - EfficientNet-B4: features[-1] (last MBConv block)
+    Hooks the architecture's last spatial layer to capture activations and
+    gradients, normalizes their layout to NCHW via the registered reshape
+    transform, then produces a class-discriminative heatmap.
     """
 
     def __init__(self, model: nn.Module, model_name: str = "densenet121"):
@@ -55,12 +112,14 @@ class GradCAM:
         self.activations: torch.Tensor | None = None
         self.gradients: torch.Tensor | None = None
 
-        # Select target layer based on architecture
-        if model_name == "efficientnet_b4":
-            target_layer = model.backbone.features[-1]
-        else:
-            # DenseNet-121 default
-            target_layer = model.backbone.features.denseblock4
+        if model_name not in GRADCAM_TARGETS:
+            raise ValueError(
+                f"No Grad-CAM target layer registered for '{model_name}'. "
+                f"Known: {sorted(GRADCAM_TARGETS)}"
+            )
+
+        resolve_layer, self.reshape_transform = GRADCAM_TARGETS[model_name]
+        target_layer = resolve_layer(model)
 
         # Keep the handles so the hooks can be detached again — a GradCAM left
         # attached keeps every forward pass storing activations.
@@ -83,15 +142,15 @@ class GradCAM:
     def __exit__(self, *exc_info) -> None:
         self.remove_hooks()
 
-    # Save forward activations
+    # Save forward activations, normalized to NCHW
     def _save_activation(self, module, input, output):
-        self.activations = output.detach()
+        self.activations = self.reshape_transform(output.detach())
 
-    # Save backward gradients
+    # Save backward gradients; same shape as the output, so same transform
     def _save_gradient(self, module, grad_input, grad_output):
-        self.gradients = grad_output[0].detach()
+        self.gradients = self.reshape_transform(grad_output[0].detach())
 
-    def generate(self, image: torch.Tensor, class_idx: int) -> np.ndarray:
+    def generate(self, image: torch.Tensor, class_idx: int | None = None) -> np.ndarray:
         """
         Generate a Grad-CAM heatmap for a given class.
 
@@ -203,12 +262,15 @@ class AttentionRollout:
         self._patched = False
 
     @torch.no_grad()
-    def generate(self, image: torch.Tensor) -> np.ndarray:
+    def generate(self, image: torch.Tensor, class_idx: int | None = None) -> np.ndarray:
         """
         Generate an attention rollout heatmap.
 
         Args:
             image: (1, 3, H, W) tensor on the model's device.
+            class_idx: Accepted for a uniform explainer interface but unused —
+                rollout is class-agnostic, showing where the model attends
+                rather than what supported a particular pathology.
 
         Returns:
             heatmap: (H, W) numpy array in [0, 1].
@@ -341,13 +403,15 @@ def generate_explanations(
     """
     Generate and save XAI visualizations for a trained model.
 
-    For DenseNet-121: uses Grad-CAM.
-    For ViT-B/16: uses Attention Rollout.
+    Grad-CAM runs for every architecture, so heatmaps are comparable across
+    models. ViT-B/16 additionally gets Attention Rollout as a native second
+    view. Output goes to xai/<model>/<method>/, which makes it easy to line up
+    one method across all four models.
 
     Args:
         model: Trained model (already on the right device, in eval mode).
         test_loader: Test DataLoader.
-        model_name: "densenet121" or "vit_b_16".
+        model_name: One of config.SUPPORTED_MODELS.
         thresholds: Per-class calibrated decision thresholds.
         num_samples: Number of sample images to visualize.
     """
@@ -362,26 +426,24 @@ def generate_explanations(
 
     # Output directory
     xai_dir = config.XAI_DIR / model_name
-    xai_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize the appropriate explainer
-    if model_name == "densenet121":
-        explainer = GradCAM(model, model_name="densenet121")
-        method_name = "Grad-CAM"
-    elif model_name == "efficientnet_b4":
-        explainer = GradCAM(model, model_name="efficientnet_b4")
-        method_name = "Grad-CAM"
-    elif model_name == "vit_b_16":
-        explainer = AttentionRollout(model)
-        method_name = "Attention Rollout"
-    elif model_name == "swin_v2_b":
-        print("[xai] SwinV2 explainability not implemented.")
-        return
-    else:
+    # Grad-CAM everywhere for cross-architecture comparability, plus rollout
+    # as a ViT-native extra view
+    explainers: list[tuple[str, str, object]] = []
+    if model_name in GRADCAM_TARGETS:
+        explainers.append(("gradcam", "Grad-CAM", GradCAM(model, model_name=model_name)))
+    if model_name == "vit_b_16":
+        explainers.append(("rollout", "Attention Rollout", AttentionRollout(model)))
+
+    if not explainers:
         print(f"[xai] No XAI method defined for '{model_name}' — skipping.")
         return
 
-    print(f"[xai] Generating {method_name} visualizations for {model_name} …")
+    for method_key, _, _ in explainers:
+        (xai_dir / method_key).mkdir(parents=True, exist_ok=True)
+
+    method_list = ", ".join(label for _, label, _ in explainers)
+    print(f"[xai] Generating {method_list} visualizations for {model_name} …")
 
     # Iterate over test dataset
     count = 0
@@ -420,22 +482,25 @@ def generate_explanations(
                 gt_classes = [config.CLASS_NAMES[j] for j, v in enumerate(label_vec) if v > 0.5]
                 gt_str = ", ".join(gt_classes) if gt_classes else "No Finding"
 
-                # Generate heatmap
-                if model_name in ("densenet121", "efficientnet_b4"):
+                # Same image and same target class through every explainer
+                stem = filenames[i].replace(".png", "")
+                for method_key, method_label, explainer in explainers:
                     heatmap = explainer.generate(img, top_class_idx)
-                else:
-                    heatmap = explainer.generate(img)
 
-                # Save visualization
-                title = (
-                    f"{method_name} — {model_name}\n"
-                    f"{selection_note}: {top_class_name} ({top_prob:.2f}, thr={top_threshold:.2f})"
-                    f"  |  GT: {gt_str}"
-                )
-                save_path = str(
-                    xai_dir / f"sample_{count:03d}_{filenames[i].replace('.png', '')}.png"
-                )
-                overlay_heatmap(images[i], heatmap, title, save_path)
+                    note = selection_note
+                    if method_key == "rollout":
+                        note = f"{selection_note} (rollout is class-agnostic)"
+
+                    title = (
+                        f"{method_label} — {model_name}\n"
+                        f"{note}: {top_class_name} "
+                        f"({top_prob:.2f}, thr={top_threshold:.2f})"
+                        f"  |  GT: {gt_str}"
+                    )
+                    save_path = str(
+                        xai_dir / method_key / f"sample_{count:03d}_{stem}.png"
+                    )
+                    overlay_heatmap(images[i], heatmap, title, save_path)
 
                 count += 1
 
@@ -443,7 +508,10 @@ def generate_explanations(
                 break
     finally:
         # Grad-CAM leaves hooks on the model; always take them off again
-        if isinstance(explainer, GradCAM):
-            explainer.remove_hooks()
+        for _, _, explainer in explainers:
+            if isinstance(explainer, GradCAM):
+                explainer.remove_hooks()
 
-    print(f"[xai] Saved {count} visualizations → {xai_dir}")
+    print(
+        f"[xai] Saved {count} samples x {len(explainers)} method(s) → {xai_dir}"
+    )
