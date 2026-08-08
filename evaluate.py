@@ -516,14 +516,24 @@ def print_results(results: dict, model_name: str) -> None:
         )
 
     timing = results.get("timing", {})
+    run = results.get("run", {})
     training = timing.get("training") or {}
     inference = timing.get("inference") or {}
-    if training or inference:
+    if run or training or inference:
         print(f"{'-' * 96}")
+        trainable = run.get("trainable_params")
+        trainable_str = (
+            f"{trainable:,} trainable ({run.get('trainable_fraction', 0):.2%})"
+            if trainable else "trainable unknown"
+        )
         print(
-            f"  Device: {timing.get('device')}  |  batch {timing.get('batch_size')}  |  "
-            f"workers {timing.get('num_workers')}  |  AMP {timing.get('amp')}  |  "
-            f"params {timing.get('total_params', 0):,}"
+            f"  Device: {run.get('device')}  |  batch {run.get('batch_size')}  |  "
+            f"workers {run.get('num_workers')}  |  AMP {run.get('amp')}"
+        )
+        print(
+            f"  Model:  {run.get('total_params', 0):,} params, {trainable_str}  |  "
+            f"tuning {run.get('tuning_mode')}  |  loss {run.get('loss')}  |  "
+            f"lr {run.get('learning_rate')}"
         )
     if training:
         origin = " [from the original training run]" if timing.get(
@@ -548,25 +558,23 @@ def print_results(results: dict, model_name: str) -> None:
     print(f"{'=' * 96}\n")
 
 
-def _load_previous_training_timing(model_name: str) -> dict | None:
+def _load_previous_results(model_name: str) -> dict:
     """
-    Recover the training timing recorded by an earlier run of this experiment.
+    Read this experiment's existing results file, if any.
 
-    --eval-only does not train, so without this a re-run would overwrite a
-    populated training block with null and silently discard the measurement for
-    the very checkpoint it is evaluating.
+    --eval-only does not train, so figures that only a training run can know
+    (training timing, how many parameters were actually unfrozen) would
+    otherwise be nulled out on every re-run.
     """
     path = config.RESULTS_DIR / f"{model_name}_results.json"
     if not path.exists():
-        return None
+        return {}
 
     try:
         with open(path, encoding="utf-8") as handle:
-            previous = json.load(handle)
+            return json.load(handle)
     except (OSError, json.JSONDecodeError):
-        return None
-
-    return (previous.get("timing") or {}).get("training")
+        return {}
 
 
 def save_results(results: dict, model_name: str) -> Path:
@@ -588,6 +596,7 @@ def evaluate_model(
     model_name: str,
     thresholds: np.ndarray | None = None,
     training_timing: dict | None = None,
+    trainable_params: int | None = None,
 ) -> dict:
     """
     Full evaluation pipeline: inference -> thresholding -> metrics -> save.
@@ -597,13 +606,17 @@ def evaluate_model(
     device = next(model.parameters()).device
 
     # Not training this time (--eval-only): keep whatever the run that produced
-    # this checkpoint measured, rather than nulling it out
+    # this checkpoint measured, rather than nulling it out. requires_grad is
+    # meaningless here — nothing applied a tuning mode to this fresh model.
+    previous = _load_previous_results(model_name)
     carried_over = False
     if training_timing is None:
-        training_timing = _load_previous_training_timing(model_name)
+        training_timing = (previous.get("timing") or {}).get("training")
         carried_over = training_timing is not None
         if carried_over:
             print("[evaluate] Reusing training timing from the existing results file")
+    if trainable_params is None:
+        trainable_params = (previous.get("run") or {}).get("trainable_params")
 
     print(f"[evaluate] Running inference on the test set ({len(test_loader.dataset)} samples) ...")
     labels, probs, inference_timing = collect_predictions(model, test_loader, device)
@@ -612,13 +625,30 @@ def evaluate_model(
     print("[evaluate] Computing calibrated metrics ...")
     results = compute_metrics(labels, probs, preds, thresholds=thresholds)
 
-    # Timings are meaningless without the conditions they were measured under
-    results["timing"] = {
-        "device": device.type,
+    # Conditions the numbers above were produced under. total_params alone is
+    # misleading: a head_only probe trains 25k of EfficientNet-B4's 17.6M.
+    total_params = sum(p.numel() for p in model.parameters())
+    results["run"] = {
+        "tuning_mode": config.TUNING_MODE,
+        "loss": config.LOSS_NAME,
+        "learning_rate": config.LEARNING_RATE,
         "batch_size": config.BATCH_SIZE,
         "num_workers": config.NUM_WORKERS,
+        "epochs_configured": config.NUM_EPOCHS,
+        "subset_size": config.SUBSET_SIZE or 0,
+        "checkpoint_metric": config.CHECKPOINT_METRIC,
+        "threshold_metric": config.THRESHOLD_METRIC,
+        "seed": config.SEED,
+        "device": device.type,
         "amp": device.type == "cuda",
-        "total_params": sum(p.numel() for p in model.parameters()),
+        "total_params": total_params,
+        "trainable_params": trainable_params,
+        "trainable_fraction": (
+            round(trainable_params / total_params, 6) if trainable_params else None
+        ),
+    }
+
+    results["timing"] = {
         "training": training_timing,
         # True when the training block came from an earlier run, not this one
         "training_timing_carried_over": carried_over,

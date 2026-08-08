@@ -7,8 +7,11 @@ Includes:
   - Comparison table generation
 """
 
+import atexit
 import json
 import random
+import sys
+from datetime import datetime
 from pathlib import Path
 
 import matplotlib
@@ -20,6 +23,61 @@ import torch
 matplotlib.use("Agg")
 
 import config
+
+
+class _Tee:
+    """Write to the terminal and a log file at once."""
+
+    def __init__(self, stream, handle):
+        self._stream = stream
+        self._handle = handle
+
+    def write(self, data: str) -> int:
+        self._stream.write(data)
+        self._handle.write(data)
+        # Flush per write: a run that crashes should still leave a full log
+        self._handle.flush()
+        return len(data)
+
+    def flush(self) -> None:
+        self._stream.flush()
+        self._handle.flush()
+
+    # Passthroughs so the replacement still looks like a real stream
+    def isatty(self) -> bool:
+        return self._stream.isatty()
+
+    def fileno(self) -> int:
+        return self._stream.fileno()
+
+
+def start_run_log(tag: str = "run") -> Path:
+    """
+    Mirror stdout and stderr into outputs/<experiment>/logs/.
+
+    Captures stderr too, so a traceback ends up in the log rather than only on
+    a terminal that may since have been closed. Each run gets its own
+    timestamped file, so an --eval-only re-run never overwrites the training log.
+    """
+    log_dir = config.OUTPUT_DIR / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    path = log_dir / f"{datetime.now():%Y%m%d_%H%M%S}_{tag}.log"
+
+    handle = open(path, "w", encoding="utf-8")
+    handle.write(f"# {datetime.now():%Y-%m-%d %H:%M:%S}\n")
+    handle.write(f"# command: {' '.join(sys.argv)}\n\n")
+    handle.flush()
+
+    sys.stdout = _Tee(sys.stdout, handle)
+    sys.stderr = _Tee(sys.stderr, handle)
+
+    def _close():
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
+        handle.close()
+
+    atexit.register(_close)
+    return path
 
 
 def seed_everything(seed: int = config.SEED) -> None:

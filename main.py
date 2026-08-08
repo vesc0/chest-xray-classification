@@ -21,7 +21,13 @@ from evaluate import calibrate_thresholds, evaluate_model
 from explainability import generate_explanations
 from models import build_model
 from train import _get_device, train_model
-from utils import compare_experiments, compare_models, plot_training_curves, seed_everything
+from utils import (
+    compare_experiments,
+    compare_models,
+    plot_training_curves,
+    seed_everything,
+    start_run_log,
+)
 
 
 # =============================================================================
@@ -49,13 +55,14 @@ def run_pipeline(
     device = _get_device()
     model = build_model(model_name, pretrained=True).to(device)
 
+    # Trainable count is only meaningful once the tuning mode has been applied,
+    # which happens inside train_model — so report it after training, not here.
     total_params = sum(param.numel() for param in model.parameters())
-    trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
     print(f"  Total parameters:     {total_params:,}")
-    print(f"  Trainable parameters: {trainable_params:,}")
 
     ckpt_path = config.CHECKPOINT_DIR / f"{model_name}_best.pt"
     training_timing = None
+    trainable_params = None
 
     # Training or checkpoint loading
     if eval_only:
@@ -68,6 +75,8 @@ def run_pipeline(
     else:
         print(f"[main] Step 2/5 - Training {model_name} ...")
         history, training_timing = train_model(model, train_loader, val_loader, model_name)
+        # Read after training, when requires_grad reflects the tuning mode
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         plot_training_curves(history, model_name)
 
     # Threshold calibration (important for multi-label classification)
@@ -82,6 +91,7 @@ def run_pipeline(
         model_name,
         thresholds=thresholds,
         training_timing=training_timing,
+        trainable_params=trainable_params,
     )
 
     # Explainability (XAI visual outputs)
@@ -266,8 +276,12 @@ def main():
 
     seed_everything()
 
+    # Mirror everything below into outputs/<experiment>/logs/
+    log_path = start_run_log("eval" if args.eval_only else "train")
+
     # Print run configuration (reproducibility snapshot)
     print("[main] Configuration:")
+    print(f"  Log file:           {log_path}")
     print(f"  Experiment:         {config.EXPERIMENT_NAME}")
     print(f"  Output dir:         {config.OUTPUT_DIR}")
     print(f"  Dataset root:       {config.DATASET_ROOT}")
