@@ -179,9 +179,53 @@ def compare_models(results_dir: Path | None = None) -> None:
     print(f"{'=' * 70}\n")
 
 
+def _check_comparable(experiments: dict) -> None:
+    """
+    Warn when runs are not directly comparable.
+
+    Macro metrics average over whatever classes were scored, so runs with
+    different class sets or different evaluation splits cannot be read off the
+    same table.
+    """
+    class_sets = {
+        name: tuple(result.get("class_names") or ())
+        for name, result in experiments.items()
+    }
+    distinct = {value for value in class_sets.values() if value}
+
+    if len(distinct) > 1:
+        print(
+            "[compare] WARNING: these runs scored different class sets, so their "
+            "macro/micro columns are not directly comparable:"
+        )
+        for name, classes in class_sets.items():
+            print(f"    {name}: {len(classes)} classes")
+
+    if any(not value for value in class_sets.values()):
+        print(
+            "[compare] WARNING: some results predate class-set recording; "
+            "verify they used the same classes before comparing."
+        )
+
+
+def _read_train_sizes(output_root: Path) -> dict[str, int]:
+    """Load per-experiment training-set sizes from the split summaries."""
+    sizes: dict[str, int] = {}
+    for summary_file in output_root.glob("*/results/dataset_summary.json"):
+        try:
+            with open(summary_file, encoding="utf-8") as handle:
+                summary = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        size = summary.get("sizes", {}).get("train")
+        if size is not None:
+            sizes[summary_file.parent.parent.name] = int(size)
+    return sizes
+
+
 def compare_experiments(output_root: Path = config.PROJECT_ROOT / "outputs") -> None:
     """
-    Compare results across all experiments (subset sizes).
+    Compare results across all experiments (training-set sizes).
     """
 
     # Find all experiment result files
@@ -192,6 +236,8 @@ def compare_experiments(output_root: Path = config.PROJECT_ROOT / "outputs") -> 
 
     # Load all experiment results
     experiments = {}
+    train_sizes = _read_train_sizes(output_root)
+    experiment_train_size = {}
     for result_file in result_files:
         # Example: outputs/full_dataset/results/resnet_results.json
         exp_name = result_file.parent.parent.name
@@ -200,6 +246,9 @@ def compare_experiments(output_root: Path = config.PROJECT_ROOT / "outputs") -> 
         display_name = f"{exp_name}/{model_name}"
         with open(result_file, encoding="utf-8") as handle:
             experiments[display_name] = json.load(handle)
+        experiment_train_size[display_name] = train_sizes.get(exp_name)
+
+    _check_comparable(experiments)
 
     # Metrics to compare
     metric_keys = [
@@ -227,6 +276,16 @@ def compare_experiments(output_root: Path = config.PROJECT_ROOT / "outputs") -> 
 
     import pandas as pd
     csv_data = []
+
+    # Training-set size gives the metric rows their x-axis
+    size_row_str = f"{'train_images':<22}"
+    size_row_dict = {"Metric": "train_images"}
+    for display_name in experiments:
+        size = experiment_train_size.get(display_name)
+        size_row_str += f"{size:>{col_width},}" if size is not None else f"{'N/A':>{col_width}}"
+        size_row_dict[display_name] = size
+    print(size_row_str)
+    csv_data.append(size_row_dict)
 
     # Print metric rows
     for key in metric_keys:

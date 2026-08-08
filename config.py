@@ -45,7 +45,13 @@ def set_experiment(name: str) -> None:
 # =============================================================================
 # Dataset
 # =============================================================================
-# All 15 classes in the NIH dataset (14 pathologies + No Finding)
+# The 14 ChestX-ray14 pathologies. "No Finding" is deliberately NOT a class:
+# it is exactly the absence of all 14 (no study carries both), so training it
+# would add a 54%-prevalence target to a long-tail loss without adding any
+# information, and averaging it into macro/micro metrics would inflate them and
+# break comparability with the Wang et al. / CheXNet benchmarks.
+# Normal studies are simply an all-zero label vector; normal-vs-abnormal is
+# reported as a derived metric in evaluate.py.
 CLASS_NAMES = [
     "Atelectasis",
     "Cardiomegaly",
@@ -61,13 +67,18 @@ CLASS_NAMES = [
     "Pleural_Thickening",
     "Pneumonia",
     "Pneumothorax",
-    "No Finding",
 ]
 NUM_CLASSES = len(CLASS_NAMES)
 
-# Subset size for quick experiments; 0 or None means the full dataset.
-# Opt into a subset per-run with `--subset N` rather than changing this.
+# Number of TRAINING images for quick experiments; 0 or None uses the whole
+# training pool. Validation and test are never subset (see dataset.py), so
+# results stay comparable across sizes. Opt in per-run with `--subset N`.
 SUBSET_SIZE = 0
+
+# Granularity of the nested subset ordering. The training pool is split into
+# this many label-matched shards, so any prefix is stratified and smaller
+# subsets are strict subsets of larger ones (5k subset of 15k subset of 30k).
+SUBSET_SHARDS = 100
 
 # Fraction of CSV rows that must resolve to a file on disk before the
 # dataset root is considered valid. Below this threshold, fail loudly

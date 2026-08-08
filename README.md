@@ -20,10 +20,35 @@ Without this variable the default in `config.py` is used. If the dataset cannot 
 found, or too few of the images listed in the CSV resolve on disk, the run fails
 immediately rather than training on a partial dataset.
 
+## Experimental protocol
+
+The pipeline predicts the **14 ChestX-ray14 pathologies**. "No Finding" is not a
+class — it is exactly the absence of all 14, so normal studies are an all-zero
+label vector. Training it would add a 54%-prevalence target to a long-tail loss
+without adding information, and averaging it into macro/micro metrics would
+inflate them and break comparability with the Wang et al. / CheXNet results.
+Normal-vs-abnormal is still reported, derived from the 14 outputs.
+
+Evaluation data is held fixed across every run so that experiments at different
+training sizes remain comparable:
+
+| Split | Size | Behaviour |
+| ----- | ---- | --------- |
+| Test  | 25,596 | Full official split. Never subset. |
+| Val   | 8,652 | Carved once from the full train_val pool, before any subsetting. |
+| Train | up to 77,872 | The only split `--subset` scales. |
+
+Both splits are patient-disjoint and label-stratified via grouped iterative
+stratification. Training subsets are **nested** (5k ⊂ 15k ⊂ 30k), so a scaling
+curve reflects data volume rather than which patients each draw happened to
+catch. Each run writes `results/dataset_summary.json` recording the class list
+and per-split support, and `--compare-all` warns if two runs scored different
+class sets.
+
 ## Dataflow
 
 1. **Data Indexing & Loading**: Images and metadata are parsed from the NIH dataset (`dataset.py`).
-2. **Model Initialization**: Pre-trained backbones (CNN or ViT) are loaded and their classification heads are adapted for 15 classes (`models.py`).
+2. **Model Initialization**: Pre-trained backbones (CNN or ViT) are loaded and their classification heads are adapted for the 14 pathology classes (`models.py`).
 3. **Training**: The model is trained using an Asymmetric Loss function to handle class imbalance, with performance tracked via AUPRC/AUROC metrics (`train.py`).
 4. **Calibration**: Probabilistic thresholds are calibrated on a validation set to optimize metrics (`evaluate.py`).
 5. **Evaluation**: Calibrated models are evaluated on the held-out test set to produce detailed final metrics (`evaluate.py`).
@@ -65,8 +90,8 @@ The `notebooks/` directory contains Jupyter notebooks showcasing different phase
 
 ## Usage
 
-`--model` is required. By default a run trains on the **full dataset**; use `--subset`
-for quick local experiments.
+`--model` is required. By default a run trains on the **full training pool**;
+`--subset N` scales the training set only (validation and test stay fixed).
 
 ```bash
 # Train DenseNet-121
@@ -78,8 +103,10 @@ python main.py --model vit_b_16
 # Run every supported architecture
 python main.py --model all
 
-# Quick experiment on a 5000-image subset, under a named output folder
-python main.py --model densenet121 --subset 5000 --experiment quick_test
+# Scaling curve: nested training subsets, identical val/test throughout
+python main.py --model densenet121 --subset 5000  --experiment scale_05k
+python main.py --model densenet121 --subset 15000 --experiment scale_15k
+python main.py --model densenet121 --subset 30000 --experiment scale_30k
 
 # Skip training: load the best checkpoint, then calibrate / evaluate / explain
 python main.py --model densenet121 --eval-only

@@ -126,7 +126,10 @@ def main():
         "--subset",
         type=int,
         default=None,
-        help="Override config.SUBSET_SIZE (0 = full dataset)",
+        help=(
+            "Number of TRAINING images to use (0 = full training pool). "
+            "Validation and test are always held fixed"
+        ),
     )
     parser.add_argument(
         "--epochs",
@@ -265,7 +268,8 @@ def main():
     print(f"  Experiment:         {config.EXPERIMENT_NAME}")
     print(f"  Output dir:         {config.OUTPUT_DIR}")
     print(f"  Dataset root:       {config.DATASET_ROOT}")
-    print(f"  Subset size:        {config.SUBSET_SIZE or 'FULL DATASET'}")
+    print(f"  Train subset:       {config.SUBSET_SIZE or 'FULL TRAINING POOL'}")
+    print(f"  Classes:            {config.NUM_CLASSES} pathologies (No Finding = all-zero)")
     print(f"  Image size:         {config.IMAGE_SIZE}")
     print(f"  Batch size:         {config.BATCH_SIZE}")
     print(f"  Epochs:             {config.NUM_EPOCHS}")

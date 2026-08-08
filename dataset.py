@@ -9,6 +9,7 @@ Handles:
   - Radiograph-appropriate augmentation and preprocessing transforms
 """
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -20,7 +21,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
-from sklearn.model_selection import GroupShuffleSplit, train_test_split
+from sklearn.model_selection import train_test_split
 
 import config
 from utils import make_dataloader_generator, seed_worker
@@ -139,63 +140,200 @@ def load_metadata() -> pd.DataFrame:
 
 
 # =============================================================================
+# Grouped iterative stratification
+# =============================================================================
+def _aggregate_groups(
+    dataframe: pd.DataFrame,
+    group_col: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Collapse rows into per-patient label counts and sizes."""
+    labels = _stack_label_vectors(dataframe)
+    codes, uniques = pd.factorize(dataframe[group_col], sort=False)
+    n_groups = len(uniques)
+
+    group_labels = np.zeros((n_groups, config.NUM_CLASSES), dtype=np.float64)
+    np.add.at(group_labels, codes, labels)
+    group_sizes = np.bincount(codes, minlength=n_groups).astype(np.float64)
+
+    return codes, group_labels, group_sizes
+
+
+def _iterative_stratified_group_folds(
+    dataframe: pd.DataFrame,
+    proportions: list[float],
+    group_col: str,
+    seed: int,
+) -> list[np.ndarray]:
+    """
+    Partition patients into folds with matched multi-label marginals.
+
+    Grouped variant of iterative stratification (Sechidis et al., 2011). Labels
+    are placed rarest-first, so scarce pathologies (Hernia at 0.16%) decide the
+    assignment while there is still freedom to balance them, and every patient's
+    studies stay together. Studies carrying no positive label — about 58% of the
+    dataset once "No Finding" stops being a class — are distributed last purely
+    on size, so the normal majority cannot skew any fold's label distribution.
+
+    Returns one array of row positions per fold, in the order given.
+    """
+    rng = np.random.default_rng(seed)
+    codes, group_labels, group_sizes = _aggregate_groups(dataframe, group_col)
+    n_groups = len(group_sizes)
+    n_folds = len(proportions)
+
+    proportions_arr = np.asarray(proportions, dtype=np.float64)
+    desired_labels = np.outer(proportions_arr, group_labels.sum(axis=0))
+    desired_sizes = proportions_arr * group_sizes.sum()
+
+    fold_labels = np.zeros_like(desired_labels)
+    fold_sizes = np.zeros_like(desired_sizes)
+    assignment = np.full(n_groups, -1, dtype=np.int64)
+    unassigned = np.ones(n_groups, dtype=bool)
+
+    def _assign(group_idx: int, fold_idx: int) -> None:
+        assignment[group_idx] = fold_idx
+        fold_labels[fold_idx] += group_labels[group_idx]
+        fold_sizes[fold_idx] += group_sizes[group_idx]
+        unassigned[group_idx] = False
+
+    def _ordered_candidates(mask: np.ndarray) -> np.ndarray:
+        """Largest patients first — they constrain the balance most."""
+        candidates = np.flatnonzero(mask)
+        rng.shuffle(candidates)  # random tie-break between equal-sized patients
+        return candidates[np.argsort(-group_sizes[candidates], kind="stable")]
+
+    def _pick(tied_folds: np.ndarray) -> int:
+        """
+        Choose among equally-deficient folds at random.
+
+        Always taking the lowest index systematically front-loads rare labels
+        into the early folds, which biases the nested subset prefixes: a class
+        with fewer patients than folds would land entirely in the first ones.
+        """
+        return int(tied_folds[rng.integers(len(tied_folds))])
+
+    # Phase 1: one pass per label, rarest remaining label first
+    for _ in range(config.NUM_CLASSES):
+        remaining = group_labels[unassigned].sum(axis=0)
+        positive = np.flatnonzero(remaining > 0)
+        if positive.size == 0:
+            break
+        label = int(positive[np.argmin(remaining[positive])])
+
+        for group_idx in _ordered_candidates(unassigned & (group_labels[:, label] > 0)):
+            deficit = desired_labels[:, label] - fold_labels[:, label]
+            best = np.flatnonzero(deficit == deficit.max())
+            if best.size > 1:
+                # Tie on this label: fall back to whichever fold is emptiest
+                size_deficit = desired_sizes[best] - fold_sizes[best]
+                best = best[np.flatnonzero(size_deficit == size_deficit.max())]
+            _assign(int(group_idx), _pick(best))
+
+    # Phase 2: patients with no positive label, balanced on size alone
+    for group_idx in _ordered_candidates(unassigned):
+        size_deficit = desired_sizes - fold_sizes
+        _assign(int(group_idx), _pick(np.flatnonzero(size_deficit == size_deficit.max())))
+
+    row_folds = assignment[codes]
+    return [np.flatnonzero(row_folds == fold) for fold in range(n_folds)]
+
+
+# =============================================================================
 # Subset sampling (fast experiments)
 # =============================================================================
-def _sample_subset(
+def _order_shards_for_prefixes(
+    dataframe: pd.DataFrame,
+    shards: list[np.ndarray],
+    seed: int,
+) -> np.ndarray:
+    """
+    Order shards so that every prefix tracks the pool's label distribution.
+
+    Stratifying the shards only balances them against each other; a subset takes
+    a *prefix* of the sequence, so the order is what a 5k or 15k run actually
+    sees. Greedily append whichever shard keeps the running prevalence closest
+    to the pool's, scored in relative terms so a rare class (Hernia at 0.16%)
+    weighs as much as a common one instead of being drowned out.
+    """
+    labels = _stack_label_vectors(dataframe)
+    target = labels.mean(axis=0)
+    target_safe = np.maximum(target, 1e-12)
+
+    shard_counts = np.stack([labels[shard].sum(axis=0) for shard in shards])
+    shard_sizes = np.array([len(shard) for shard in shards], dtype=np.float64)
+
+    rng = np.random.default_rng(seed)
+    remaining = list(rng.permutation(len(shards)))
+
+    order: list[int] = []
+    cumulative_counts = np.zeros(config.NUM_CLASSES, dtype=np.float64)
+    cumulative_size = 0.0
+
+    while remaining:
+        candidate_counts = cumulative_counts + shard_counts[remaining]
+        candidate_sizes = cumulative_size + shard_sizes[remaining]
+        deviation = np.abs(
+            candidate_counts / candidate_sizes[:, None] - target
+        ) / target_safe
+        chosen = int(np.argmin(deviation.sum(axis=1)))
+
+        shard_idx = remaining.pop(chosen)
+        order.append(shard_idx)
+        cumulative_counts += shard_counts[shard_idx]
+        cumulative_size += shard_sizes[shard_idx]
+
+    return np.concatenate([shards[idx] for idx in order])
+
+
+def _stratified_subset(
     dataframe: pd.DataFrame,
     target_size: int,
     *,
     group_col: str | None,
-    random_state: int,
+    seed: int,
 ) -> pd.DataFrame:
     """
-    Sample a subset, preserving patient groups when possible.
+    Take a nested, label-stratified prefix of the training pool.
 
-    Preserving groups avoids splitting the same patient across quick-turn
-    experiments and keeps the train/val leakage fix intact even in subset mode.
+    Patients are partitioned into equal shards with matched label marginals and
+    the shards are concatenated, so any prefix approximates the full pool's
+    distribution and smaller subsets are strict subsets of larger ones. That
+    nesting is what makes a 5k/15k/30k scaling curve measure data volume rather
+    than which patients each draw happened to catch.
     """
     if target_size <= 0 or len(dataframe) <= target_size:
         return dataframe.reset_index(drop=True)
 
     # If no grouping available use random sampling fallback
     if group_col is None or group_col not in dataframe.columns:
-        return dataframe.sample(n=target_size, random_state=random_state).reset_index(drop=True)
+        return dataframe.sample(n=target_size, random_state=seed).reset_index(drop=True)
 
-    rng = np.random.default_rng(random_state)
-    groups = list(dataframe.groupby(group_col, sort=False))
-    order = rng.permutation(len(groups))
-
-    # Greedy group accumulation until target size reached
-    selected_groups: list[pd.DataFrame] = []
-    selected_rows = 0
-    for idx in order:
-        _, group_df = groups[idx]
-        selected_groups.append(group_df)
-        selected_rows += len(group_df)
-        if selected_rows >= target_size:
-            break
-
-    # Shuffle final subset
-    subset = pd.concat(selected_groups, ignore_index=True)
-    subset = subset.sample(frac=1.0, random_state=random_state).reset_index(drop=True)
-    return subset
+    n_shards = max(2, int(config.SUBSET_SHARDS))
+    shards = _iterative_stratified_group_folds(
+        dataframe,
+        [1.0 / n_shards] * n_shards,
+        group_col,
+        seed,
+    )
+    order = _order_shards_for_prefixes(dataframe, shards, seed)
+    return dataframe.iloc[order[:target_size]].reset_index(drop=True)
 
 
 # =============================================================================
 # Patient-aware train/val split
 # =============================================================================
-def _group_stratified_train_val_split(
+def _grouped_train_val_split(
     dataframe: pd.DataFrame,
     *,
     test_size: float,
     group_col: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Build a patient-aware validation split with a greedy multilabel heuristic.
+    Carve a patient-disjoint, label-stratified validation set.
 
-    Exact grouped iterative stratification would require an extra dependency.
-    This heuristic keeps every patient's studies together and greedily tries
-    to match the validation label marginals to the full train_val set.
+    Always applied to the full train_val pool before any subsetting, so the
+    validation set — and therefore threshold calibration — is identical across
+    every experiment.
     """
     # Fallback: standard split if grouping is not usable
     if group_col not in dataframe.columns or dataframe[group_col].nunique() < 2:
@@ -206,77 +344,63 @@ def _group_stratified_train_val_split(
         )
         return train_df.reset_index(drop=True), val_df.reset_index(drop=True)
 
-    label_matrix = _stack_label_vectors(dataframe)
-    target_val_size = max(1, int(round(len(dataframe) * test_size)))
-    target_label_counts = label_matrix.sum(axis=0) * test_size
-
-    # Aggregate group-level label statistics
-    group_records = []
-    for group_id, group_df in dataframe.groupby(group_col, sort=False):
-        group_labels = _stack_label_vectors(group_df).max(axis=0)
-        group_records.append(
-            {
-                "group_id": group_id,
-                "size": len(group_df),
-                "labels": group_labels,
-            }
-        )
-
-    # Prioritize rare/important groups first
-    group_records.sort(
-        key=lambda record: (record["labels"].sum(), record["size"]),
-        reverse=True,
+    train_idx, val_idx = _iterative_stratified_group_folds(
+        dataframe,
+        [1.0 - test_size, test_size],
+        group_col,
+        config.SEED,
+    )
+    return (
+        dataframe.iloc[train_idx].reset_index(drop=True),
+        dataframe.iloc[val_idx].reset_index(drop=True),
     )
 
-    val_group_ids: set[str] = set()
-    val_label_counts = np.zeros(config.NUM_CLASSES, dtype=np.float32)
-    val_size = 0
 
-    def _score(candidate_counts: np.ndarray, candidate_size: int) -> float:
-        label_error = np.abs(candidate_counts - target_label_counts).sum()
-        size_error = abs(candidate_size - target_val_size) * 0.5
-        return float(label_error + size_error)
+# =============================================================================
+# Split reporting
+# =============================================================================
+def _save_split_summary(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+) -> Path:
+    """
+    Record the class set and per-split support alongside the results.
 
-    # Greedy selection of validation groups
-    for record in group_records:
-        add_to_val = _score(val_label_counts + record["labels"], val_size + record["size"])
-        keep_in_train = _score(val_label_counts, val_size)
+    Makes cross-experiment comparisons auditable: any run whose class list or
+    evaluation split differs from another's is not directly comparable.
+    """
 
-        if val_size < target_val_size and add_to_val <= keep_in_train:
-            val_group_ids.add(record["group_id"])
-            val_label_counts += record["labels"]
-            val_size += record["size"]
+    def _support(dataframe: pd.DataFrame) -> dict[str, int]:
+        matrix = _stack_label_vectors(dataframe)
+        return {
+            class_name: int(matrix[:, idx].sum())
+            for idx, class_name in enumerate(config.CLASS_NAMES)
+        }
 
-    # Ensure minimum coverage
-    if val_size < target_val_size:
-        for record in group_records:
-            if record["group_id"] in val_group_ids:
-                continue
-            val_group_ids.add(record["group_id"])
-            val_label_counts += record["labels"]
-            val_size += record["size"]
-            if val_size >= target_val_size:
-                break
+    payload = {
+        "class_names": list(config.CLASS_NAMES),
+        "num_classes": config.NUM_CLASSES,
+        "subset_size": config.SUBSET_SIZE or 0,
+        "seed": config.SEED,
+        "sizes": {"train": len(train_df), "val": len(val_df), "test": len(test_df)},
+        "normal_fraction": {
+            split_name: round(float((_stack_label_vectors(d).sum(axis=1) == 0).mean()), 4)
+            for split_name, d in (("train", train_df), ("val", val_df), ("test", test_df))
+        },
+        "support": {
+            "train": _support(train_df),
+            "val": _support(val_df),
+            "test": _support(test_df),
+        },
+    }
 
-    # Fallback to sklearn if heuristic fails
-    if not val_group_ids or len(val_group_ids) == len(group_records):
-        splitter = GroupShuffleSplit(
-            n_splits=1,
-            test_size=test_size,
-            random_state=config.SEED,
-        )
-        train_idx, val_idx = next(
-            splitter.split(dataframe, groups=dataframe[group_col].to_numpy())
-        )
-        train_df = dataframe.iloc[train_idx].reset_index(drop=True)
-        val_df = dataframe.iloc[val_idx].reset_index(drop=True)
-        return train_df, val_df
-
-    val_mask = dataframe[group_col].isin(val_group_ids)
-    val_df = dataframe[val_mask].reset_index(drop=True)
-    train_df = dataframe[~val_mask].reset_index(drop=True)
-
-    return train_df, val_df
+    config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    path = config.RESULTS_DIR / "dataset_summary.json"
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    print(f"[dataset] Split summary saved -> {path}")
+    return path
 
 
 # =============================================================================
@@ -363,9 +487,12 @@ def get_dataloaders() -> tuple[DataLoader, DataLoader, DataLoader]:
     Build train, validation, and test DataLoaders.
 
     Uses the official NIH train_val_list.txt / test_list.txt split.
-    Validation is carved from the train_val pool with patient-aware grouping.
-    If config.SUBSET_SIZE > 0, group-preserving subsets are sampled for quick
-    local experiments.
+
+    The evaluation data is held fixed across every experiment: the test set is
+    always the full official split, and validation is carved from the full
+    train_val pool before any subsetting. config.SUBSET_SIZE scales the training
+    set only, so a 5k/15k/30k curve measures training data volume rather than a
+    shrinking, noisier evaluation set.
     """
     print("[dataset] Loading metadata ...")
     df = load_metadata()
@@ -375,38 +502,34 @@ def get_dataloaders() -> tuple[DataLoader, DataLoader, DataLoader]:
     test_filenames = set(Path(config.TEST_LIST).read_text().strip().splitlines())
 
     train_val_df = df[df["Image Index"].isin(train_val_filenames)].reset_index(drop=True)
+
+    # Test is the full official split, always — never subset
     test_df = df[df["Image Index"].isin(test_filenames)].reset_index(drop=True)
 
     group_col = _get_group_column(train_val_df)
 
-    # Optional subset mode for debugging/experiments
-    if config.SUBSET_SIZE and config.SUBSET_SIZE > 0:
-        n_train_val = min(config.SUBSET_SIZE, len(train_val_df))
-        n_test = min(max(config.SUBSET_SIZE // 5, 50), len(test_df))
-
-        train_val_df = _sample_subset(
-            train_val_df,
-            n_train_val,
-            group_col=group_col,
-            random_state=config.SEED,
-        )
-        test_df = _sample_subset(
-            test_df,
-            n_test,
-            group_col=_get_group_column(test_df),
-            random_state=config.SEED,
-        )
-        print(
-            f"[dataset] Subset mode: {len(train_val_df)} train+val, "
-            f"{len(test_df)} test images"
-        )
-
-    # Patient-aware train/val split
-    train_df, val_df = _group_stratified_train_val_split(
+    # Validation is carved from the FULL pool, before subsetting, so threshold
+    # calibration sees identical data in every run
+    train_pool_df, val_df = _grouped_train_val_split(
         train_val_df,
         test_size=config.VAL_SPLIT,
         group_col=group_col or "",
     )
+
+    # Optional subset mode: training data only
+    if config.SUBSET_SIZE and config.SUBSET_SIZE > 0:
+        train_df = _stratified_subset(
+            train_pool_df,
+            min(config.SUBSET_SIZE, len(train_pool_df)),
+            group_col=group_col,
+            seed=config.SEED,
+        )
+        print(
+            f"[dataset] Subset mode: {len(train_df)} training images "
+            f"(pool of {len(train_pool_df)}); val and test held fixed"
+        )
+    else:
+        train_df = train_pool_df
 
     if group_col is not None:
         patient_overlap = set(train_df[group_col]).intersection(set(val_df[group_col]))
@@ -416,6 +539,7 @@ def get_dataloaders() -> tuple[DataLoader, DataLoader, DataLoader]:
         f"[dataset] Split sizes - train: {len(train_df)}, "
         f"val: {len(val_df)}, test: {len(test_df)}"
     )
+    _save_split_summary(train_df, val_df, test_df)
 
     # Datasets
     train_ds = ChestXrayDataset(train_df, transform=get_train_transforms())

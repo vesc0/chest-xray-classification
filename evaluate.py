@@ -242,6 +242,35 @@ def _expected_calibration_error(
     return float(ece)
 
 
+def _normal_vs_abnormal_metrics(labels: np.ndarray, probs: np.ndarray) -> dict:
+    """
+    Screening metric derived from the 14 pathology outputs.
+
+    "No Finding" is not a trained class, so normality is read off the pathology
+    predictions: a study is abnormal when any of the 14 is present. Two standard
+    aggregations are reported — the strongest single finding (max) and the
+    probabilistic OR under an independence assumption (noisy-or). This keeps the
+    clinically useful normal/abnormal signal without letting a 54%-prevalence
+    class into the macro and micro averages.
+    """
+    y_true = (labels.sum(axis=1) > 0).astype(np.int32)
+    scores = {
+        "max": probs.max(axis=1),
+        "noisy_or": 1.0 - np.prod(1.0 - probs, axis=1),
+    }
+
+    results = {"prevalence": round(float(y_true.mean()), 4)}
+    for name, score in scores.items():
+        if _has_both_labels(y_true):
+            results[f"{name}_auroc"] = round(float(roc_auc_score(y_true, score)), 4)
+            results[f"{name}_auprc"] = round(float(average_precision_score(y_true, score)), 4)
+        else:
+            results[f"{name}_auroc"] = None
+            results[f"{name}_auprc"] = None
+
+    return results
+
+
 # =============================================================================
 # Metrics computation
 # =============================================================================
@@ -264,9 +293,13 @@ def compute_metrics(
         thresholds = np.asarray(thresholds, dtype=np.float32)
 
     results: dict = {
+        # Recorded so a comparison across runs can verify the class sets match
+        "class_names": list(config.CLASS_NAMES),
+        "num_classes": config.NUM_CLASSES,
         "per_class": {},
         "macro": {},
         "micro": {},
+        "normal_vs_abnormal": _normal_vs_abnormal_metrics(labels, probs),
         "calibration": {},
         "thresholds": {
             class_name: round(float(thresholds[idx]), 4)
@@ -421,6 +454,19 @@ def print_results(results: dict, model_name: str) -> None:
     print(f"  Hamming loss:                    {macro['hamming_loss']:.4f}")
     print(f"  Macro Brier score:               {calibration['macro_brier']:.4f}")
     print(f"  Macro ECE:                       {calibration['macro_ece']:.4f}")
+
+    # Derived screening metric — not part of the 14-class averages above
+    screening = results.get("normal_vs_abnormal", {})
+    if screening:
+        def _fmt(value):
+            return f"{value:.4f}" if value is not None else "N/A"
+
+        print(
+            f"  Normal vs abnormal AUROC:        "
+            f"{_fmt(screening.get('max_auroc'))} (max) / "
+            f"{_fmt(screening.get('noisy_or_auroc'))} (noisy-or)"
+            f"   [abnormal prevalence {screening.get('prevalence', 0):.4f}]"
+        )
     print(f"{'=' * 96}\n")
 
 
