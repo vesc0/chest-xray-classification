@@ -163,6 +163,14 @@ class GradCAM:
         """
         self.model.zero_grad()
 
+        # The target layer only enters the autograd graph if something upstream
+        # of it requires grad. With a frozen backbone (head_only, or the warmup
+        # phase of partial) nothing does: the backward hook never fires and
+        # self.gradients stays None. Making a private copy of the input require
+        # grad restores the graph without unfreezing the model or allocating
+        # parameter gradients.
+        image = image.detach().clone().requires_grad_(True)
+
         # Forward pass
         logits = self.model(image)
 

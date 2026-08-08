@@ -526,12 +526,15 @@ def print_results(results: dict, model_name: str) -> None:
             f"params {timing.get('total_params', 0):,}"
         )
     if training:
+        origin = " [from the original training run]" if timing.get(
+            "training_timing_carried_over"
+        ) else ""
         print(
             f"  Training:  {training['total_seconds'] / 60:.1f} min over "
             f"{training['epochs_run']} epochs "
             f"({training['mean_epoch_seconds']:.1f}s/epoch, "
             f"best at epoch {training['best_epoch']} "
-            f"after {training['seconds_to_best_epoch'] / 60:.1f} min)"
+            f"after {training['seconds_to_best_epoch'] / 60:.1f} min){origin}"
         )
     if inference:
         print(
@@ -543,6 +546,27 @@ def print_results(results: dict, model_name: str) -> None:
             f"({inference['model_ms_per_image']:.2f} ms/img)"
         )
     print(f"{'=' * 96}\n")
+
+
+def _load_previous_training_timing(model_name: str) -> dict | None:
+    """
+    Recover the training timing recorded by an earlier run of this experiment.
+
+    --eval-only does not train, so without this a re-run would overwrite a
+    populated training block with null and silently discard the measurement for
+    the very checkpoint it is evaluating.
+    """
+    path = config.RESULTS_DIR / f"{model_name}_results.json"
+    if not path.exists():
+        return None
+
+    try:
+        with open(path, encoding="utf-8") as handle:
+            previous = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    return (previous.get("timing") or {}).get("training")
 
 
 def save_results(results: dict, model_name: str) -> Path:
@@ -572,6 +596,15 @@ def evaluate_model(
     """
     device = next(model.parameters()).device
 
+    # Not training this time (--eval-only): keep whatever the run that produced
+    # this checkpoint measured, rather than nulling it out
+    carried_over = False
+    if training_timing is None:
+        training_timing = _load_previous_training_timing(model_name)
+        carried_over = training_timing is not None
+        if carried_over:
+            print("[evaluate] Reusing training timing from the existing results file")
+
     print(f"[evaluate] Running inference on the test set ({len(test_loader.dataset)} samples) ...")
     labels, probs, inference_timing = collect_predictions(model, test_loader, device)
     preds = apply_thresholds(probs, thresholds)
@@ -587,6 +620,8 @@ def evaluate_model(
         "amp": device.type == "cuda",
         "total_params": sum(p.numel() for p in model.parameters()),
         "training": training_timing,
+        # True when the training block came from an earlier run, not this one
+        "training_timing_carried_over": carried_over,
         "inference": inference_timing,
     }
 
