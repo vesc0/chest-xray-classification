@@ -1,11 +1,17 @@
 """
 Weakly-supervised localization evaluation
 
-Scores Grad-CAM heatmaps against the 984 hand-drawn boxes shipped with
-ChestX-ray14 (BBox_List_2017.csv), following Wang et al. (2017) so the numbers
-are comparable to the paper. The model is never trained on boxes — this asks
-whether a classifier trained on image-level labels happens to look in the right
-place.
+Scores XAI heatmaps against the 984 hand-drawn boxes shipped with ChestX-ray14
+(BBox_List_2017.csv), following Wang et al. (2017) so the numbers are comparable
+to the paper. The model is never trained on boxes — this asks whether a
+classifier trained on image-level labels happens to look in the right place.
+
+Every explainer the architecture supports is scored on identical instances with
+identical metrics: Grad-CAM for all four models, plus Attention Rollout for ViT.
+Rollout is class-agnostic, so it produces one map per image regardless of the
+annotated class — the per-class rows remain well defined but measure where the
+model attends overall rather than evidence for that class. That flag is recorded
+in the output so the two methods are never read as equivalent.
 
 Reported per class:
 
@@ -44,7 +50,7 @@ import matplotlib.pyplot as plt
 
 import config
 from dataset import get_eval_transforms, load_metadata
-from explainability import GRADCAM_TARGETS, GradCAM, _denormalize
+from explainability import _denormalize, build_explainers, release_explainers
 
 
 # =============================================================================
@@ -325,14 +331,17 @@ def _summarize(records: list[dict]) -> dict:
     return summary
 
 
-def _print_summary(summary: dict, model_name: str) -> None:
+def _print_summary(summary: dict, model_name: str, method_label: str) -> None:
     thresholds = config.LOCALIZATION_THRESHOLDS
     header = (
         f"{'Class':<20}{'N':>5}{'Point':>8}{'Rand':>8}{'Energy':>8}{'IoU':>7}{'IoBB':>7}"
         + "".join(f"{'IoBB@' + f'{t:g}':>10}" for t in thresholds)
     )
     print(f"\n{'=' * len(header)}")
-    print(f"  Weakly-supervised localization - {model_name}  ({summary['num_instances']} annotated instances)")
+    print(
+        f"  Weakly-supervised localization - {model_name} / {method_label}"
+        f"  ({summary['num_instances']} annotated instances)"
+    )
     print(f"{'=' * len(header)}")
     print(header)
     print("-" * len(header))
@@ -359,120 +368,101 @@ def _print_summary(summary: dict, model_name: str) -> None:
         "  'Point' vs 'Rand': pointing-game accuracy against a uniform-heatmap "
         "baseline (the box's share of the image)."
     )
+    if summary.get("settings", {}).get("class_agnostic"):
+        print(
+            "  NOTE: this method is class-agnostic - one map per image, reused for "
+            "every annotated class.\n"
+            "  Per-class rows therefore measure where the model attends overall, "
+            "not evidence for that class."
+        )
     print(f"{'=' * len(header)}\n")
 
 
 # =============================================================================
 # Entry point
 # =============================================================================
-def evaluate_localization(
+def _score_method(
     model: torch.nn.Module,
     model_name: str,
-    thresholds: np.ndarray | None = None,
-) -> dict | None:
-    """
-    Score Grad-CAM against the ground-truth boxes and save metrics plus figures.
-
-    Returns the summary dict, or None if the model has no Grad-CAM target or the
-    box file is absent.
-    """
-    if model_name not in GRADCAM_TARGETS:
-        print(f"[localization] No Grad-CAM target for '{model_name}' - skipping.")
-        return None
-    if not Path(config.BBOX_CSV).exists():
-        print(f"[localization] {config.BBOX_CSV} not found - skipping.")
-        return None
-
-    device = next(model.parameters()).device
-    model.eval()
-
-    if thresholds is None:
-        thresholds = np.full(config.NUM_CLASSES, config.DEFAULT_THRESHOLD, dtype=np.float32)
-    else:
-        thresholds = np.asarray(thresholds, dtype=np.float32)
-
-    pairs = _build_pairs(load_boxes())
-    if not pairs:
-        print("[localization] No annotated images available - skipping.")
-        return None
-
+    method_key: str,
+    method_label: str,
+    explainer,
+    pairs: list[dict],
+    loader: DataLoader,
+    thresholds: np.ndarray,
+    device: torch.device,
+) -> dict:
+    """Score one explainer over every annotated instance."""
     print(
         f"[localization] Scoring {len(pairs)} annotated (image, class) instances "
-        f"for {model_name} ..."
+        f"for {model_name} / {method_label} ..."
     )
 
-    loader = DataLoader(
-        _AnnotatedPairs(pairs, get_eval_transforms()),
-        batch_size=config.BATCH_SIZE,
-        shuffle=False,
-        num_workers=config.NUM_WORKERS,
-    )
-
-    explainer = GradCAM(model, model_name=model_name)
     records: list[dict] = []
     figure_cache: dict[int, tuple] = {}
 
-    try:
-        for batch in loader:
-            images = batch["image"].to(device, non_blocking=True)
-            class_indices = batch["class_idx"]
+    for batch in loader:
+        images = batch["image"].to(device, non_blocking=True)
+        class_indices = batch["class_idx"]
 
-            # Grad-CAM for the ANNOTATED class, not the top prediction: the
-            # whole point is to test the heatmap for the finding that is there.
-            heatmaps = explainer.generate_batch(images, class_indices)
+        # Heatmap for the ANNOTATED class, not the top prediction: the whole
+        # point is to test the explanation for the finding that is there.
+        # Class-agnostic methods ignore the index and return one map per image.
+        heatmaps = explainer.generate_batch(images, class_indices)
 
-            with torch.no_grad():
-                probs = torch.sigmoid(model(images)).cpu().numpy()
+        with torch.no_grad():
+            probs = torch.sigmoid(model(images)).cpu().numpy()
 
-            for position in range(images.size(0)):
-                index = int(batch["index"][position])
-                record = pairs[index]
-                class_idx = int(class_indices[position])
+        for position in range(images.size(0)):
+            index = int(batch["index"][position])
+            record = pairs[index]
+            class_idx = int(class_indices[position])
 
-                boxes = _scale_boxes(
-                    record["boxes"],
-                    int(batch["width"][position]),
-                    int(batch["height"][position]),
-                )
-                truth_mask = _box_mask(boxes, config.IMAGE_SIZE)
-                heatmap = heatmaps[position]
+            boxes = _scale_boxes(
+                record["boxes"],
+                int(batch["width"][position]),
+                int(batch["height"][position]),
+            )
+            truth_mask = _box_mask(boxes, config.IMAGE_SIZE)
+            heatmap = heatmaps[position]
 
-                peak = np.unravel_index(int(np.argmax(heatmap)), heatmap.shape)
-                total = float(heatmap.sum())
-                predicted = _predicted_box(heatmap)
-                iou, iobb = _overlap_scores(predicted, truth_mask)
+            peak = np.unravel_index(int(np.argmax(heatmap)), heatmap.shape)
+            total = float(heatmap.sum())
+            predicted = _predicted_box(heatmap)
+            iou, iobb = _overlap_scores(predicted, truth_mask)
 
-                # A class the image does not have, ranked highest - used to pick
-                # illustrative false positives
-                absent = probs[position].copy()
-                absent[record["labels"] > 0.5] = -1.0
-                top_absent = int(np.argmax(absent))
+            # A class the image does not have, ranked highest - used to pick
+            # illustrative false positives
+            absent = probs[position].copy()
+            absent[record["labels"] > 0.5] = -1.0
+            top_absent = int(np.argmax(absent))
 
-                records.append(
-                    {
-                        "image": record["image"],
-                        "class_name": record["class_name"],
-                        "class_idx": class_idx,
-                        "hit": bool(truth_mask[peak]),
-                        "energy_fraction": float(heatmap[truth_mask].sum() / total) if total > 0 else 0.0,
-                        "box_area_fraction": float(truth_mask.mean()),
-                        "iou": float(iou),
-                        "iobb": float(iobb),
-                        "has_detection": predicted is not None,
-                        "probability": float(probs[position, class_idx]),
-                        "predicted_positive": bool(probs[position, class_idx] >= thresholds[class_idx]),
-                        "top_absent_class": config.CLASS_NAMES[top_absent],
-                        "top_absent_prob": float(max(absent[top_absent], 0.0)),
-                    }
-                )
-                figure_cache[len(records) - 1] = (
-                    images[position].detach().cpu(), heatmap, boxes, predicted,
-                )
-    finally:
-        explainer.remove_hooks()
+            records.append(
+                {
+                    "image": record["image"],
+                    "class_name": record["class_name"],
+                    "class_idx": class_idx,
+                    "hit": bool(truth_mask[peak]),
+                    "energy_fraction": float(heatmap[truth_mask].sum() / total) if total > 0 else 0.0,
+                    "box_area_fraction": float(truth_mask.mean()),
+                    "iou": float(iou),
+                    "iobb": float(iobb),
+                    "has_detection": predicted is not None,
+                    "probability": float(probs[position, class_idx]),
+                    "predicted_positive": bool(probs[position, class_idx] >= thresholds[class_idx]),
+                    "top_absent_class": config.CLASS_NAMES[top_absent],
+                    "top_absent_prob": float(max(absent[top_absent], 0.0)),
+                }
+            )
+            figure_cache[len(records) - 1] = (
+                images[position].detach().cpu(), heatmap, boxes, predicted,
+            )
 
     summary = _summarize(records)
     summary["settings"] = {
+        "method": method_key,
+        "method_label": method_label,
+        "class_agnostic": bool(getattr(explainer, "class_agnostic", False)),
         "cam_threshold": config.LOCALIZATION_CAM_THRESHOLD,
         "overlap_thresholds": list(config.LOCALIZATION_THRESHOLDS),
         "iobb_definition": "intersection / predicted box area (Wang et al., 2017)",
@@ -486,10 +476,10 @@ def evaluate_localization(
         _summarize(correct) if correct else {"num_instances": 0}
     )
 
-    _print_summary(summary, model_name)
+    _print_summary(summary, model_name, method_label)
 
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    path = config.RESULTS_DIR / f"{model_name}_localization.json"
+    path = config.RESULTS_DIR / f"{model_name}_localization_{method_key}.json"
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
     print(f"[localization] Metrics saved -> {path}")
@@ -497,7 +487,7 @@ def evaluate_localization(
     # Qualitative figures: a few per category, not 880 overlays
     for index, record in enumerate(records):
         record["_index"] = index
-    figure_dir = config.XAI_DIR / model_name / "localization"
+    figure_dir = config.XAI_DIR / model_name / "localization" / method_key
     figure_dir.mkdir(parents=True, exist_ok=True)
 
     saved = 0
@@ -505,7 +495,7 @@ def evaluate_localization(
         for rank, record in enumerate(chosen):
             image_tensor, heatmap, boxes, predicted = figure_cache[record["_index"]]
             title = (
-                f"{category.replace('_', ' ')} - {model_name}\n"
+                f"{category.replace('_', ' ')} - {model_name} / {method_label}\n"
                 f"{record['class_name']}: p={record['probability']:.2f} "
                 f"(thr={thresholds[record['class_idx']]:.2f})  |  "
                 f"hit={record['hit']}  energy={record['energy_fraction']:.2f}  "
@@ -519,3 +509,59 @@ def evaluate_localization(
 
     print(f"[localization] Saved {saved} qualitative figures -> {figure_dir}")
     return summary
+
+
+def evaluate_localization(
+    model: torch.nn.Module,
+    model_name: str,
+    thresholds: np.ndarray | None = None,
+) -> dict:
+    """
+    Score every available explainer against the ground-truth boxes.
+
+    Grad-CAM is scored for all architectures; ViT is additionally scored with
+    Attention Rollout, which makes the two methods comparable on identical data
+    and identical metrics.
+
+    Returns {method_key: summary}; empty if nothing could be scored.
+    """
+    if not Path(config.BBOX_CSV).exists():
+        print(f"[localization] {config.BBOX_CSV} not found - skipping.")
+        return {}
+
+    explainers = build_explainers(model, model_name)
+    if not explainers:
+        print(f"[localization] No explainer available for '{model_name}' - skipping.")
+        return {}
+
+    device = next(model.parameters()).device
+    model.eval()
+
+    if thresholds is None:
+        thresholds = np.full(config.NUM_CLASSES, config.DEFAULT_THRESHOLD, dtype=np.float32)
+    else:
+        thresholds = np.asarray(thresholds, dtype=np.float32)
+
+    pairs = _build_pairs(load_boxes())
+    if not pairs:
+        print("[localization] No annotated images available - skipping.")
+        return {}
+
+    loader = DataLoader(
+        _AnnotatedPairs(pairs, get_eval_transforms()),
+        batch_size=config.BATCH_SIZE,
+        shuffle=False,
+        num_workers=config.NUM_WORKERS,
+    )
+
+    summaries: dict[str, dict] = {}
+    try:
+        for method_key, method_label, explainer in explainers:
+            summaries[method_key] = _score_method(
+                model, model_name, method_key, method_label,
+                explainer, pairs, loader, thresholds, device,
+            )
+    finally:
+        release_explainers(explainers)
+
+    return summaries

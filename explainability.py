@@ -31,8 +31,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from PIL import Image
-
 import matplotlib.pyplot as plt
 import matplotlib
 
@@ -103,6 +101,9 @@ class GradCAM:
     gradients, normalizes their layout to NCHW via the registered reshape
     transform, then produces a class-discriminative heatmap.
     """
+
+    # Heatmap depends on the target class
+    class_agnostic = False
 
     def __init__(self, model: nn.Module, model_name: str = "densenet121"):
         self.model = model
@@ -236,6 +237,11 @@ class AttentionRollout:
     [CLS] token to every image patch.
     """
 
+    # One map per image, whatever the class: metrics computed per class still
+    # work, but they measure where the model attends overall rather than what
+    # supported a specific pathology.
+    class_agnostic = True
+
     def __init__(self, model: nn.Module):
         self.model = model
         self.model.eval()
@@ -269,8 +275,15 @@ class AttentionRollout:
                         x, x, x, need_weights=True, average_attn_weights=False
                     )
 
-                    # Store the attention weights
-                    self.attention_maps.append(attn_weights.detach())
+                    # Verify the head axis survived before collapsing it. Doing
+                    # the head-mean here rather than in generate_batch keeps
+                    # 12x less attention in memory: a batch of 32 would
+                    # otherwise hold 12 layers x (32, 12, 197, 197).
+                    _torch._assert(
+                        attn_weights.dim() == 4,
+                        f"Expected (B, heads, S, S) attention, got {attn_weights.shape}",
+                    )
+                    self.attention_maps.append(attn_weights.detach().mean(dim=1))
                     x = blk.dropout(x)
                     x = x + input
                     y = blk.ln_2(x)
@@ -295,79 +308,93 @@ class AttentionRollout:
         self._patched = False
 
     @torch.no_grad()
-    def generate(self, image: torch.Tensor, class_idx: int | None = None) -> np.ndarray:
+    def generate_batch(
+        self,
+        images: torch.Tensor,
+        class_indices: torch.Tensor | list[int] | None = None,
+    ) -> np.ndarray:
         """
-        Generate an attention rollout heatmap.
+        Generate attention rollout heatmaps for a batch.
 
         Args:
-            image: (1, 3, H, W) tensor on the model's device.
-            class_idx: Accepted for a uniform explainer interface but unused —
-                rollout is class-agnostic, showing where the model attends
-                rather than what supported a particular pathology.
+            images: (B, 3, H, W) tensor on the model's device.
+            class_indices: Accepted for a uniform explainer interface but
+                ignored — rollout is class-agnostic, so every class of a given
+                image receives the same map.
 
         Returns:
-            heatmap: (H, W) numpy array in [0, 1].
+            heatmaps: (B, H, W) numpy array, each normalized to [0, 1].
         """
         self.attention_maps.clear()
 
         # Temporarily patch to capture attention weights
         self._patch_encoder_blocks()
         try:
-            _ = self.model(image)
+            _ = self.model(images)
         finally:
             self._unpatch_encoder_blocks()
 
+        batch, _, height, width = images.shape
+
         # Fallback if no attention captured
         if not self.attention_maps:
-            h = image.shape[2]
-            return np.ones((h, h), dtype=np.float32) * 0.5
+            return np.full((batch, height, width), 0.5, dtype=np.float32)
 
         # Average attention across heads, then rollout across layers
         result = None
-        for attn in self.attention_maps:
-            # attn: (1, num_heads, seq_len, seq_len) → average over heads
-            attn_avg = attn.mean(dim=1).squeeze(0)  # (seq_len, seq_len)
-
-            # Guard against a collapsed head axis: a 1D result would silently
-            # broadcast against the identity below and produce a bogus map.
-            if attn_avg.dim() != 2 or attn_avg.size(0) != attn_avg.size(1):
+        for attn_avg in self.attention_maps:
+            # Already head-averaged at capture time: (B, seq_len, seq_len).
+            # A lower-rank tensor here would silently broadcast against the
+            # identity below and yield a bogus map rather than failing.
+            if attn_avg.dim() != 3 or attn_avg.size(-1) != attn_avg.size(-2):
                 raise RuntimeError(
-                    "Expected a square (seq_len, seq_len) attention matrix, got "
-                    f"{tuple(attn_avg.shape)}. The attention weights were captured "
-                    "with the head axis already averaged."
+                    "Expected batched square (B, seq_len, seq_len) attention, got "
+                    f"{tuple(attn_avg.shape)}."
                 )
 
             # Add residual connection (identity matrix)
-            attn_avg = 0.5 * attn_avg + 0.5 * torch.eye(attn_avg.size(0), device=attn_avg.device)
+            identity = torch.eye(attn_avg.size(-1), device=attn_avg.device).unsqueeze(0)
+            attn_avg = 0.5 * attn_avg + 0.5 * identity
 
             # Re-normalize rows
             attn_avg = attn_avg / attn_avg.sum(dim=-1, keepdim=True)
 
             # Multiply across layers (rollout)
-            if result is None:
-                result = attn_avg
-            else:
-                result = attn_avg @ result
+            result = attn_avg if result is None else attn_avg @ result
 
-        # Extract [CLS] token attention to all patches (skip [CLS] itself)
-        cls_attention = result[0, 1:]  # (num_patches,)
+        # [CLS] token attention to all patches (skip [CLS] itself)
+        cls_attention = result[:, 0, 1:]  # (B, num_patches)
 
-        # Reshape to 2D grid
-        num_patches = cls_attention.shape[0]
-        grid_size = int(num_patches ** 0.5)
-        cls_attention = cls_attention.reshape(grid_size, grid_size).cpu().numpy()
+        num_patches = cls_attention.size(1)
+        grid_size = int(round(num_patches ** 0.5))
+        if grid_size * grid_size != num_patches:
+            raise ValueError(f"Expected a square patch grid, got {num_patches} tokens.")
 
-        # Upsample to input resolution
-        heatmap = np.array(
-            Image.fromarray(cls_attention).resize(
-                (image.shape[3], image.shape[2]), resample=Image.BILINEAR
-            )
-        )
+        grid = cls_attention.reshape(batch, 1, grid_size, grid_size)
+        heatmaps = F.interpolate(
+            grid, size=(height, width), mode="bilinear", align_corners=False
+        ).squeeze(1)
 
-        # Normalize to [0, 1]
-        heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+        # Normalize each sample independently
+        flat = heatmaps.flatten(1)
+        minimum = flat.min(dim=1).values.view(-1, 1, 1)
+        maximum = flat.max(dim=1).values.view(-1, 1, 1)
+        heatmaps = (heatmaps - minimum) / (maximum - minimum + 1e-8)
 
-        return heatmap
+        return heatmaps.cpu().numpy()
+
+    def generate(self, image: torch.Tensor, class_idx: int | None = None) -> np.ndarray:
+        """
+        Generate an attention rollout heatmap for a single image.
+
+        Args:
+            image: (1, 3, H, W) tensor on the model's device.
+            class_idx: Ignored; rollout is class-agnostic.
+
+        Returns:
+            heatmap: (H, W) numpy array in [0, 1].
+        """
+        return self.generate_batch(image)[0]
 
 
 # =============================================================================
@@ -424,6 +451,35 @@ def overlay_heatmap(
 
 
 # =============================================================================
+# Explainer selection
+# =============================================================================
+def build_explainers(model: nn.Module, model_name: str) -> list[tuple[str, str, object]]:
+    """
+    Explainers available for an architecture, as (key, label, instance).
+
+    Grad-CAM for every model so results are comparable across architectures;
+    Attention Rollout additionally for ViT as a native second view. Shared by
+    the qualitative sampler and the localization scorer so the two can never
+    disagree about which methods exist.
+
+    Grad-CAM instances attach hooks — call remove_hooks() when finished.
+    """
+    explainers: list[tuple[str, str, object]] = []
+    if model_name in GRADCAM_TARGETS:
+        explainers.append(("gradcam", "Grad-CAM", GradCAM(model, model_name=model_name)))
+    if model_name == "vit_b_16":
+        explainers.append(("rollout", "Attention Rollout", AttentionRollout(model)))
+    return explainers
+
+
+def release_explainers(explainers: list[tuple[str, str, object]]) -> None:
+    """Detach any hooks the explainers installed."""
+    for _, _, explainer in explainers:
+        if isinstance(explainer, GradCAM):
+            explainer.remove_hooks()
+
+
+# =============================================================================
 # End-to-end XAI generation
 # =============================================================================
 def generate_explanations(
@@ -460,13 +516,7 @@ def generate_explanations(
     # Output directory
     xai_dir = config.XAI_DIR / model_name
 
-    # Grad-CAM everywhere for cross-architecture comparability, plus rollout
-    # as a ViT-native extra view
-    explainers: list[tuple[str, str, object]] = []
-    if model_name in GRADCAM_TARGETS:
-        explainers.append(("gradcam", "Grad-CAM", GradCAM(model, model_name=model_name)))
-    if model_name == "vit_b_16":
-        explainers.append(("rollout", "Attention Rollout", AttentionRollout(model)))
+    explainers = build_explainers(model, model_name)
 
     if not explainers:
         print(f"[xai] No XAI method defined for '{model_name}' — skipping.")
@@ -541,9 +591,7 @@ def generate_explanations(
                 break
     finally:
         # Grad-CAM leaves hooks on the model; always take them off again
-        for _, _, explainer in explainers:
-            if isinstance(explainer, GradCAM):
-                explainer.remove_hooks()
+        release_explainers(explainers)
 
     print(
         f"[xai] Saved {count} samples x {len(explainers)} method(s) → {xai_dir}"
