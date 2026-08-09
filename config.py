@@ -155,3 +155,23 @@ ECE_BINS = 15
 # =============================================================================
 # Number of sample images to generate XAI visualizations for
 XAI_NUM_SAMPLES = 10
+
+# =============================================================================
+# Weakly-supervised localization (Wang et al., 2017)
+# =============================================================================
+# 984 hand-drawn boxes over 880 images, all inside the official test split,
+# covering 8 of the 14 pathologies.
+BBOX_CSV = DATASET_ROOT / "BBox_List_2017.csv"
+
+# The box CSV abbreviates one class name
+BBOX_LABEL_ALIASES = {"Infiltrate": "Infiltration"}
+
+# Heatmap is binarized at this fraction of its own maximum, then the largest
+# connected component becomes the predicted box.
+LOCALIZATION_CAM_THRESHOLD = 0.5
+
+# Overlap thresholds T(IoU) / T(IoBB) reported, following Wang et al.
+LOCALIZATION_THRESHOLDS = [0.1, 0.25, 0.5, 0.75, 0.9]
+
+# Qualitative figures saved per category (TP / FN / FP / best / worst)
+LOCALIZATION_NUM_FIGURES = 3

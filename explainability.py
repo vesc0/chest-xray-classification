@@ -150,16 +150,24 @@ class GradCAM:
     def _save_gradient(self, module, grad_input, grad_output):
         self.gradients = self.reshape_transform(grad_output[0].detach())
 
-    def generate(self, image: torch.Tensor, class_idx: int | None = None) -> np.ndarray:
+    def generate_batch(
+        self,
+        images: torch.Tensor,
+        class_indices: torch.Tensor | list[int],
+    ) -> np.ndarray:
         """
-        Generate a Grad-CAM heatmap for a given class.
+        Generate Grad-CAM heatmaps for a batch, one target class per image.
+
+        Samples in a batch are independent, so backpropagating the *sum* of the
+        selected logits yields the same per-sample gradients as looping — at a
+        fraction of the cost.
 
         Args:
-            image: (1, 3, H, W) tensor on the model's device.
-            class_idx: Index of the target class.
+            images: (B, 3, H, W) tensor on the model's device.
+            class_indices: length-B target class per image.
 
         Returns:
-            heatmap: (H, W) numpy array in [0, 1].
+            heatmaps: (B, H, W) numpy array, each normalized to [0, 1].
         """
         self.model.zero_grad()
 
@@ -169,30 +177,47 @@ class GradCAM:
         # self.gradients stays None. Making a private copy of the input require
         # grad restores the graph without unfreezing the model or allocating
         # parameter gradients.
-        image = image.detach().clone().requires_grad_(True)
+        images = images.detach().clone().requires_grad_(True)
 
-        # Forward pass
-        logits = self.model(image)
+        logits = self.model(images)
 
-        # Select target class score
-        target = logits[0, class_idx]
-        target.backward()
+        if not isinstance(class_indices, torch.Tensor):
+            class_indices = torch.tensor(class_indices, device=logits.device)
+        class_indices = class_indices.to(logits.device).long()
+
+        rows = torch.arange(logits.size(0), device=logits.device)
+        logits[rows, class_indices].sum().backward()
 
         # Channel importance via global average pooling of gradients
-        weights = self.gradients.mean(dim=(2, 3), keepdim=True)  # (1, C, 1, 1)
+        weights = self.gradients.mean(dim=(2, 3), keepdim=True)  # (B, C, 1, 1)
 
-        # Weighted sum of feature maps
-        cam = (weights * self.activations).sum(dim=1, keepdim=True)  # (1, 1, h, w)
+        # Weighted sum of feature maps, positive contributions only
+        cam = F.relu((weights * self.activations).sum(dim=1, keepdim=True))
 
-        # Keep only positive contributions
-        cam = F.relu(cam)
+        # Upsample to input resolution
+        cam = F.interpolate(cam, size=images.shape[2:], mode="bilinear", align_corners=False)
+        cam = cam.squeeze(1)
 
-        # Upsample to input resolution and normalize
-        cam = F.interpolate(cam, size=image.shape[2:], mode="bilinear", align_corners=False)
-        cam = cam.squeeze().cpu().numpy()
-        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+        # Normalize each sample independently
+        flat = cam.flatten(1)
+        minimum = flat.min(dim=1).values.view(-1, 1, 1)
+        maximum = flat.max(dim=1).values.view(-1, 1, 1)
+        cam = (cam - minimum) / (maximum - minimum + 1e-8)
 
-        return cam
+        return cam.detach().cpu().numpy()
+
+    def generate(self, image: torch.Tensor, class_idx: int | None = None) -> np.ndarray:
+        """
+        Generate a Grad-CAM heatmap for a single image.
+
+        Args:
+            image: (1, 3, H, W) tensor on the model's device.
+            class_idx: Index of the target class.
+
+        Returns:
+            heatmap: (H, W) numpy array in [0, 1].
+        """
+        return self.generate_batch(image, [int(class_idx or 0)])[0]
 
 
 # =============================================================================
