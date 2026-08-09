@@ -153,8 +153,14 @@ ECE_BINS = 15
 # =============================================================================
 # Explainability
 # =============================================================================
-# Number of sample images to generate XAI visualizations for
-XAI_NUM_SAMPLES = 10
+# Number of unselected test images to render heatmaps for. 0 disables the step.
+# Off by default: the localization stage below produces better figures — chosen
+# diagnostically (hit / miss / FN / FP) and drawn against ground-truth boxes.
+# Raise this only to inspect the 6 classes that have no boxes and therefore no
+# localization figures: Consolidation, Edema, Emphysema, Fibrosis, Hernia,
+# Pleural_Thickening. Note the samples are the first N of the unshuffled test
+# set, so they are not a representative draw.
+XAI_NUM_SAMPLES = 0
 
 # =============================================================================
 # Weakly-supervised localization (Wang et al., 2017)

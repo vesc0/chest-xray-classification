@@ -161,6 +161,18 @@ given, otherwise `subset_<N>` or `full_dataset`:
 ```
 outputs/<experiment>/
 ├── checkpoints/   # best model weights per architecture
-├── results/       # metrics JSON, tuned thresholds, training curves, split summary
-└── xai/<model>/<method>/   # gradcam/ for every model, plus rollout/ for ViT
+├── results/       # metrics JSON, tuned thresholds, training curves, split summary,
+│                  # and <model>_localization_<method>.json
+├── logs/          # full console output per run, timestamped
+└── xai/<model>/localization/<method>/   # figures with ground-truth boxes drawn
 ```
+
+Localization figures are selected diagnostically — true positives that localized
+well, true positives that looked in the wrong place, false negatives, false
+positives, and the best/worst cases by heatmap energy inside the box.
+
+`--xai-samples N` additionally renders heatmaps for N unselected test images
+under `xai/<model>/<method>/`. It is off by default: those images are simply the
+first N of the unshuffled test set, so the localization figures above are a
+better choice. Its one real use is inspecting the six classes with no ground-truth
+boxes — Consolidation, Edema, Emphysema, Fibrosis, Hernia, Pleural_Thickening.

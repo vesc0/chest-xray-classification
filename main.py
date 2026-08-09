@@ -52,7 +52,7 @@ def run_pipeline(
     print(f"{'#' * 70}\n")
 
     # Model initialization
-    print(f"[main] Step 1/6 - Building model: {model_name} ...")
+    print(f"[main] Step 1/5 - Building model: {model_name} ...")
     device = _get_device()
     model = build_model(model_name, pretrained=True).to(device)
 
@@ -71,21 +71,21 @@ def run_pipeline(
             print(f"[main] ERROR: Checkpoint not found at {ckpt_path}")
             print("       Run training first (without --eval-only).")
             sys.exit(1)
-        print(f"[main] Step 2/6 - Loading checkpoint: {ckpt_path}")
+        print(f"[main] Step 2/5 - Loading checkpoint: {ckpt_path}")
         model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
     else:
-        print(f"[main] Step 2/6 - Training {model_name} ...")
+        print(f"[main] Step 2/5 - Training {model_name} ...")
         history, training_timing = train_model(model, train_loader, val_loader, model_name)
         # Read after training, when requires_grad reflects the tuning mode
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         plot_training_curves(history, model_name)
 
     # Threshold calibration (important for multi-label classification)
-    print(f"[main] Step 3/6 - Calibrating thresholds for {model_name} ...")
+    print(f"[main] Step 3/5 - Calibrating thresholds for {model_name} ...")
     thresholds = calibrate_thresholds(model, val_loader, model_name)
 
     # Final evaluation on held-out test set
-    print(f"[main] Step 4/6 - Evaluating {model_name} on the test set ...")
+    print(f"[main] Step 4/5 - Evaluating {model_name} on the test set ...")
     results = evaluate_model(
         model,
         test_loader,
@@ -95,12 +95,13 @@ def run_pipeline(
         trainable_params=trainable_params,
     )
 
-    # Explainability (XAI visual outputs)
-    print(f"[main] Step 5/6 - Generating XAI visualizations ...")
-    generate_explanations(model, test_loader, model_name, thresholds=thresholds)
+    # Optional unselected heatmap samples; off unless config.XAI_NUM_SAMPLES > 0
+    if config.XAI_NUM_SAMPLES > 0:
+        print(f"[main] Generating {config.XAI_NUM_SAMPLES} qualitative XAI samples ...")
+        generate_explanations(model, test_loader, model_name, thresholds=thresholds)
 
     # Weakly-supervised localization against the ground-truth boxes
-    print(f"[main] Step 6/6 - Scoring localization against ground-truth boxes ...")
+    print(f"[main] Step 5/5 - Scoring localization against ground-truth boxes ...")
     evaluate_localization(model, model_name, thresholds=thresholds)
 
     return results
@@ -220,6 +221,17 @@ def main():
         help="Beta for fbeta threshold tuning",
     )
 
+    parser.add_argument(
+        "--xai-samples",
+        type=int,
+        default=None,
+        help=(
+            "Render heatmaps for N unselected test images (default 0). "
+            "Localization figures are usually the better option; use this to "
+            "inspect the 6 classes that have no ground-truth boxes"
+        ),
+    )
+
     # Experiment tracking/comparison
     parser.add_argument(
         "--experiment",
@@ -266,6 +278,8 @@ def main():
         config.THRESHOLD_METRIC = args.threshold_metric
     if args.threshold_beta is not None:
         config.THRESHOLD_BETA = args.threshold_beta
+    if args.xai_samples is not None:
+        config.XAI_NUM_SAMPLES = args.xai_samples
 
     # Experiment naming/tracking
     if args.experiment:
