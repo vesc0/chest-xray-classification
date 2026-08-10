@@ -105,6 +105,9 @@ class GradCAM:
     # Heatmap depends on the target class
     class_agnostic = False
 
+    # Logits from the most recent generate_batch forward pass
+    last_logits: torch.Tensor | None = None
+
     def __init__(self, model: nn.Module, model_name: str = "densenet121"):
         self.model = model
         self.model.eval()
@@ -122,20 +125,22 @@ class GradCAM:
         resolve_layer, self.reshape_transform = GRADCAM_TARGETS[model_name]
         target_layer = resolve_layer(model)
 
-        # Keep the handles so the hooks can be detached again — a GradCAM left
+        # Raw (untransformed) target-layer output, kept between the forward pass
+        # and the gradient call
+        self._captured: torch.Tensor | None = None
+
+        # Keep the handle so the hook can be detached again — a GradCAM left
         # attached keeps every forward pass storing activations.
-        self.handles = [
-            target_layer.register_forward_hook(self._save_activation),
-            target_layer.register_full_backward_hook(self._save_gradient),
-        ]
+        self.handles = [target_layer.register_forward_hook(self._save_activation)]
 
     def remove_hooks(self) -> None:
-        """Detach the forward/backward hooks. Safe to call more than once."""
+        """Detach the forward hook. Safe to call more than once."""
         for handle in self.handles:
             handle.remove()
         self.handles = []
         self.activations = None
         self.gradients = None
+        self._captured = None
 
     def __enter__(self) -> "GradCAM":
         return self
@@ -143,13 +148,27 @@ class GradCAM:
     def __exit__(self, *exc_info) -> None:
         self.remove_hooks()
 
-    # Save forward activations, normalized to NCHW
     def _save_activation(self, module, input, output):
-        self.activations = self.reshape_transform(output.detach())
+        """
+        Capture the target layer's output and make it the root of the graph.
 
-    # Save backward gradients; same shape as the output, so same transform
-    def _save_gradient(self, module, grad_input, grad_output):
-        self.gradients = self.reshape_transform(grad_output[0].detach())
+        Grad-CAM only needs the gradient of the class score with respect to
+        *this* tensor, so the graph is started here rather than at the network
+        input. Two reasons that matters:
+
+          - With a frozen backbone (head_only, or the warmup phase of partial)
+            nothing upstream requires grad, so without this the layer never
+            enters the graph at all and no gradient is available.
+          - Rooting the graph at the input instead would retain activations for
+            the entire network. On MPS that falls off a memory cliff: measured
+            0.89s per batch at 32 but 277s at 64, which reads as a hung run.
+
+        requires_grad_ is only valid on a leaf; when the backbone *is* trainable
+        the output already carries a grad_fn and needs no help.
+        """
+        if not output.requires_grad:
+            output.requires_grad_(True)
+        self._captured = output
 
     def generate_batch(
         self,
@@ -170,24 +189,39 @@ class GradCAM:
         Returns:
             heatmaps: (B, H, W) numpy array, each normalized to [0, 1].
         """
-        self.model.zero_grad()
+        if not self.handles:
+            raise RuntimeError("GradCAM hooks have been removed; build a new instance.")
 
-        # The target layer only enters the autograd graph if something upstream
-        # of it requires grad. With a frozen backbone (head_only, or the warmup
-        # phase of partial) nothing does: the backward hook never fires and
-        # self.gradients stays None. Making a private copy of the input require
-        # grad restores the graph without unfreezing the model or allocating
-        # parameter gradients.
-        images = images.detach().clone().requires_grad_(True)
+        self._captured = None
 
-        logits = self.model(images)
+        # Gradients are needed even under an outer torch.no_grad()
+        with torch.enable_grad():
+            logits = self.model(images.detach())
 
-        if not isinstance(class_indices, torch.Tensor):
-            class_indices = torch.tensor(class_indices, device=logits.device)
-        class_indices = class_indices.to(logits.device).long()
+            if self._captured is None:
+                raise RuntimeError(
+                    "Target layer produced no activation — the registered layer "
+                    "was not executed during the forward pass."
+                )
 
-        rows = torch.arange(logits.size(0), device=logits.device)
-        logits[rows, class_indices].sum().backward()
+            if not isinstance(class_indices, torch.Tensor):
+                class_indices = torch.tensor(class_indices, device=logits.device)
+            class_indices = class_indices.to(logits.device).long()
+
+            rows = torch.arange(logits.size(0), device=logits.device)
+            selected = logits[rows, class_indices].sum()
+
+            # Only the target layer's gradient is required. autograd.grad walks
+            # back just that far and leaves parameter .grad untouched, so this
+            # is safe to call on a model mid-training.
+            (raw_gradients,) = torch.autograd.grad(selected, self._captured)
+
+        self.activations = self.reshape_transform(self._captured.detach())
+        self.gradients = self.reshape_transform(raw_gradients.detach())
+        # Part of the explainer interface: lets callers reuse this forward pass
+        # instead of running the model a second time for the probabilities.
+        self.last_logits = logits.detach()
+        self._captured = None
 
         # Channel importance via global average pooling of gradients
         weights = self.gradients.mean(dim=(2, 3), keepdim=True)  # (B, C, 1, 1)
@@ -241,6 +275,9 @@ class AttentionRollout:
     # work, but they measure where the model attends overall rather than what
     # supported a specific pathology.
     class_agnostic = True
+
+    # Logits from the most recent generate_batch forward pass
+    last_logits: torch.Tensor | None = None
 
     def __init__(self, model: nn.Module):
         self.model = model
@@ -330,7 +367,8 @@ class AttentionRollout:
         # Temporarily patch to capture attention weights
         self._patch_encoder_blocks()
         try:
-            _ = self.model(images)
+            # Same interface contract as GradCAM: expose this forward's logits
+            self.last_logits = self.model(images).detach()
         finally:
             self._unpatch_encoder_blocks()
 

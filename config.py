@@ -181,3 +181,11 @@ LOCALIZATION_THRESHOLDS = [0.1, 0.25, 0.5, 0.75, 0.9]
 
 # Qualitative figures saved per category (TP / FN / FP / best / worst)
 LOCALIZATION_NUM_FIGURES = 3
+
+# Batch size for localization scoring, independent of the training batch size.
+# Grad-CAM needs gradients, which cost several times more memory than plain
+# inference, and MPS degrades sharply past a threshold rather than raising:
+# measured stable at 16 and 32 but falling to ~80s/batch and worsening at 64,
+# which reads as a hung run. Inheriting BATCH_SIZE would make an ordinary
+# `--batch-size 64` silently stall this stage.
+LOCALIZATION_BATCH_SIZE = 16

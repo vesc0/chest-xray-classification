@@ -523,17 +523,20 @@ def print_results(results: dict, model_name: str) -> None:
         print(f"{'-' * 96}")
         trainable = run.get("trainable_params")
         trainable_str = (
-            f"{trainable:,} trainable ({run.get('trainable_fraction', 0):.2%})"
+            f"{trainable:,} trainable ({run.get('trainable_fraction') or 0:.2%})"
             if trainable else "trainable unknown"
         )
+        origin = "" if run.get("trained_this_run", True) else "  [recovered]"
         print(
             f"  Device: {run.get('device')}  |  batch {run.get('batch_size')}  |  "
             f"workers {run.get('num_workers')}  |  AMP {run.get('amp')}"
         )
         print(
             f"  Model:  {run.get('total_params', 0):,} params, {trainable_str}  |  "
-            f"tuning {run.get('tuning_mode')}  |  loss {run.get('loss')}  |  "
-            f"lr {run.get('learning_rate')}"
+            f"tuning {run.get('tuning_mode') or 'unknown'}  |  "
+            f"loss {run.get('loss') or 'unknown'}  |  "
+            f"lr {run.get('learning_rate') if run.get('learning_rate') is not None else 'unknown'}"
+            f"{origin}"
         )
     if training:
         origin = " [from the original training run]" if timing.get(
@@ -605,18 +608,45 @@ def evaluate_model(
     """
     device = next(model.parameters()).device
 
-    # Not training this time (--eval-only): keep whatever the run that produced
-    # this checkpoint measured, rather than nulling it out. requires_grad is
-    # meaningless here — nothing applied a tuning mode to this fresh model.
+    # Anything that describes how the checkpoint was *trained* is unknowable on
+    # an --eval-only run: the current config holds whatever the CLI happened to
+    # pass this time, which is not what produced these weights.
+    trained_this_run = training_timing is not None
     previous = _load_previous_results(model_name)
+
+    training_fields = {
+        "tuning_mode": config.TUNING_MODE,
+        "loss": config.LOSS_NAME,
+        "learning_rate": config.LEARNING_RATE,
+        "epochs_configured": config.NUM_EPOCHS,
+        "subset_size": config.SUBSET_SIZE or 0,
+        "checkpoint_metric": config.CHECKPOINT_METRIC,
+        "seed": config.SEED,
+        "trainable_params": trainable_params,
+    }
+
     carried_over = False
-    if training_timing is None:
+    if not trained_this_run:
+        previous_run = previous.get("run") or {}
+        recovered = {key: previous_run[key] for key in training_fields if key in previous_run}
         training_timing = (previous.get("timing") or {}).get("training")
-        carried_over = training_timing is not None
-        if carried_over:
-            print("[evaluate] Reusing training timing from the existing results file")
-    if trainable_params is None:
-        trainable_params = (previous.get("run") or {}).get("trainable_params")
+        carried_over = bool(recovered) or training_timing is not None
+
+        if recovered:
+            training_fields.update(recovered)
+            print(
+                "[evaluate] Reusing training configuration and timing from the "
+                "existing results file"
+            )
+        else:
+            # Nothing to recover: report unknown rather than the current config
+            training_fields = dict.fromkeys(training_fields)
+            print(
+                "[evaluate] WARNING: no previous results to recover the training "
+                "configuration from; it will be recorded as unknown."
+            )
+
+    trainable_params = training_fields["trainable_params"]
 
     print(f"[evaluate] Running inference on the test set ({len(test_loader.dataset)} samples) ...")
     labels, probs, inference_timing = collect_predictions(model, test_loader, device)
@@ -629,23 +659,19 @@ def evaluate_model(
     # misleading: a head_only probe trains 25k of EfficientNet-B4's 17.6M.
     total_params = sum(p.numel() for p in model.parameters())
     results["run"] = {
-        "tuning_mode": config.TUNING_MODE,
-        "loss": config.LOSS_NAME,
-        "learning_rate": config.LEARNING_RATE,
-        "batch_size": config.BATCH_SIZE,
-        "num_workers": config.NUM_WORKERS,
-        "epochs_configured": config.NUM_EPOCHS,
-        "subset_size": config.SUBSET_SIZE or 0,
-        "checkpoint_metric": config.CHECKPOINT_METRIC,
-        "threshold_metric": config.THRESHOLD_METRIC,
-        "seed": config.SEED,
-        "device": device.type,
-        "amp": device.type == "cuda",
-        "total_params": total_params,
-        "trainable_params": trainable_params,
+        # How the checkpoint was trained (carried over on --eval-only)
+        **training_fields,
         "trainable_fraction": (
             round(trainable_params / total_params, 6) if trainable_params else None
         ),
+        "total_params": total_params,
+        # Conditions of *this* evaluation, always current
+        "threshold_metric": config.THRESHOLD_METRIC,
+        "batch_size": config.BATCH_SIZE,
+        "num_workers": config.NUM_WORKERS,
+        "device": device.type,
+        "amp": device.type == "cuda",
+        "trained_this_run": trained_this_run,
     }
 
     results["timing"] = {

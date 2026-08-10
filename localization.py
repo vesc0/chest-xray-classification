@@ -177,8 +177,17 @@ def _predicted_box(heatmap: np.ndarray) -> tuple[int, int, int, int] | None:
 
     This is the Wang et al. construction: threshold, take connected components,
     keep the biggest, and treat its extent as the detection.
+
+    A heatmap with no positive signal (Grad-CAM's ReLU can zero one out
+    entirely) yields no detection at all. Thresholding it would otherwise pass
+    every pixel and report a whole-image box, which quietly scores at the random
+    baseline instead of admitting the method found nothing.
     """
-    binary = heatmap >= (config.LOCALIZATION_CAM_THRESHOLD * heatmap.max())
+    maximum = float(heatmap.max())
+    if maximum <= 0.0:
+        return None
+
+    binary = heatmap >= (config.LOCALIZATION_CAM_THRESHOLD * maximum)
     if not binary.any():
         return None
 
@@ -224,6 +233,7 @@ def _save_figure(
     predicted: tuple[int, int, int, int] | None,
     title: str,
     save_path: Path,
+    method_label: str = "Heatmap",
 ) -> None:
     """Original / heatmap / overlay, with ground truth in green and the detection in red."""
     original = _denormalize(image_tensor)
@@ -232,7 +242,7 @@ def _save_figure(
     axes[0].imshow(original)
     axes[0].set_title("Original X-ray")
     axes[1].imshow(heatmap, cmap="jet")
-    axes[1].set_title("Grad-CAM")
+    axes[1].set_title(method_label)
     axes[2].imshow(original)
     axes[2].imshow(heatmap, cmap="jet", alpha=0.4)
     axes[2].set_title("Overlay - GT (green) vs detected (red)")
@@ -284,10 +294,12 @@ def _select_cases(records: list[dict]) -> dict[str, list[dict]]:
         "false_negative": [
             r for r in by_energy if not r["predicted_positive"]
         ][:limit],
-        # confident about a class the image does not have
+        # Confident about a class the image does not have. These are rendered
+        # for the *absent* class, not the annotated one, so the figure shows the
+        # evidence behind the false positive rather than an unrelated heatmap.
         "false_positive": [
             r for r in sorted(records, key=lambda r: r["top_absent_prob"], reverse=True)
-            if r["top_absent_prob"] > 0
+            if r["top_absent_predicted_positive"]
         ][:limit],
         "best_localized": by_energy[:limit],
         "worst_localized": by_energy[-limit:][::-1],
@@ -410,8 +422,13 @@ def _score_method(
         # Class-agnostic methods ignore the index and return one map per image.
         heatmaps = explainer.generate_batch(images, class_indices)
 
-        with torch.no_grad():
-            probs = torch.sigmoid(model(images)).cpu().numpy()
+        # Reuse that forward pass rather than running the model again — a second
+        # pass doubles the work and the peak memory for no new information.
+        logits = explainer.last_logits
+        if logits is None:
+            with torch.no_grad():
+                logits = model(images)
+        probs = torch.sigmoid(logits).cpu().numpy()
 
         for position in range(images.size(0)):
             index = int(batch["index"][position])
@@ -451,7 +468,11 @@ def _score_method(
                     "probability": float(probs[position, class_idx]),
                     "predicted_positive": bool(probs[position, class_idx] >= thresholds[class_idx]),
                     "top_absent_class": config.CLASS_NAMES[top_absent],
+                    "top_absent_idx": top_absent,
                     "top_absent_prob": float(max(absent[top_absent], 0.0)),
+                    "top_absent_predicted_positive": bool(
+                        absent[top_absent] >= thresholds[top_absent]
+                    ),
                 }
             )
             figure_cache[len(records) - 1] = (
@@ -494,16 +515,37 @@ def _score_method(
     for category, chosen in _select_cases(records).items():
         for rank, record in enumerate(chosen):
             image_tensor, heatmap, boxes, predicted = figure_cache[record["_index"]]
-            title = (
-                f"{category.replace('_', ' ')} - {model_name} / {method_label}\n"
-                f"{record['class_name']}: p={record['probability']:.2f} "
-                f"(thr={thresholds[record['class_idx']]:.2f})  |  "
-                f"hit={record['hit']}  energy={record['energy_fraction']:.2f}  "
-                f"IoBB={record['iobb']:.2f}"
-            )
+
+            if category == "false_positive":
+                # Re-explain for the over-predicted class; the cached map targets
+                # the annotated class and would not show why this fired.
+                absent_idx = record["top_absent_idx"]
+                heatmap = explainer.generate_batch(
+                    image_tensor.unsqueeze(0).to(device), [absent_idx]
+                )[0]
+                predicted = _predicted_box(heatmap)
+                agnostic = getattr(explainer, "class_agnostic", False)
+                title = (
+                    f"false positive - {model_name} / {method_label}\n"
+                    f"predicted {record['top_absent_class']} "
+                    f"p={record['top_absent_prob']:.2f} "
+                    f"(thr={thresholds[absent_idx]:.2f}) but that class is absent  |  "
+                    f"green boxes = true {record['class_name']}"
+                    + ("  |  map is class-agnostic" if agnostic else "")
+                )
+            else:
+                title = (
+                    f"{category.replace('_', ' ')} - {model_name} / {method_label}\n"
+                    f"{record['class_name']}: p={record['probability']:.2f} "
+                    f"(thr={thresholds[record['class_idx']]:.2f})  |  "
+                    f"hit={record['hit']}  energy={record['energy_fraction']:.2f}  "
+                    f"IoBB={record['iobb']:.2f}"
+                )
+
             _save_figure(
                 image_tensor, heatmap, boxes, predicted, title,
                 figure_dir / f"{category}_{rank}_{record['image']}",
+                method_label=method_label,
             )
             saved += 1
 
@@ -547,9 +589,11 @@ def evaluate_localization(
         print("[localization] No annotated images available - skipping.")
         return {}
 
+    # Deliberately not config.BATCH_SIZE — see LOCALIZATION_BATCH_SIZE
+    batch_size = max(1, int(config.LOCALIZATION_BATCH_SIZE))
     loader = DataLoader(
         _AnnotatedPairs(pairs, get_eval_transforms()),
-        batch_size=config.BATCH_SIZE,
+        batch_size=batch_size,
         shuffle=False,
         num_workers=config.NUM_WORKERS,
     )

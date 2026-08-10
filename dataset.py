@@ -3,7 +3,7 @@ Dataset module
 
 Handles:
   - Parsing the metadata CSV and official train/test splits
-  - Multi-label encoding (15 classes)
+  - Multi-label encoding (14 ChestX-ray14 pathologies)
   - Patient-aware train / validation splitting
   - Group-preserving subset sampling for fast local experiments
   - Radiograph-appropriate augmentation and preprocessing transforms
@@ -30,14 +30,24 @@ from utils import make_dataloader_generator, seed_worker
 # =============================================================================
 # Data indexing utilities
 # =============================================================================
+# Scanning the image directories costs a full walk of every entry on the
+# dataset drive, and several call sites need the index within one run.
+_IMAGE_INDEX_CACHE: dict[Path, dict[str, Path]] = {}
+
+
 def _build_image_index() -> dict[str, Path]:
     """
     Scan all image directories and return {filename: full_path}.
 
-    Raises if no image directory is readable — usually an unmounted drive or an
-    unset XRAY_DATASET_ROOT, which would otherwise surface much later as an
-    empty DataFrame.
+    Cached per dataset root: the walk is slow on an external drive and the
+    result cannot change mid-run. Raises if no image directory is readable —
+    usually an unmounted drive or an unset XRAY_DATASET_ROOT, which would
+    otherwise surface much later as an empty DataFrame.
     """
+    cached = _IMAGE_INDEX_CACHE.get(config.DATASET_ROOT)
+    if cached is not None:
+        return cached
+
     index: dict[str, Path] = {}
     found_dirs = 0
 
@@ -45,7 +55,10 @@ def _build_image_index() -> dict[str, Path]:
         if img_dir.exists():
             found_dirs += 1
             for path in img_dir.iterdir():
-                if path.suffix == ".png":
+                # Skip AppleDouble sidecars (._name.png) left by copying to a
+                # non-HFS filesystem. They carry the .png suffix but are
+                # metadata stubs, and would double the size of the index.
+                if path.suffix == ".png" and not path.name.startswith("._"):
                     index[path.name] = path
 
     if not index:
@@ -62,6 +75,7 @@ def _build_image_index() -> dict[str, Path]:
             "image directories were found."
         )
 
+    _IMAGE_INDEX_CACHE[config.DATASET_ROOT] = index
     return index
 
 
