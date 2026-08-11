@@ -525,7 +525,7 @@ def generate_explanations(
     test_loader: DataLoader,
     model_name: str,
     thresholds: np.ndarray | None = None,
-    num_samples: int = config.XAI_NUM_SAMPLES,
+    num_samples: int | None = None,
 ) -> None:
     """
     Generate and save XAI visualizations for a trained model.
@@ -540,8 +540,15 @@ def generate_explanations(
         test_loader: Test DataLoader.
         model_name: One of config.SUPPORTED_MODELS.
         thresholds: Per-class calibrated decision thresholds.
-        num_samples: Number of sample images to visualize.
+        num_samples: Number of sample images to visualize. Defaults to
+            config.XAI_NUM_SAMPLES, read here rather than as a default argument:
+            --xai-samples rewrites that value at runtime, long after this module
+            was imported, so a default bound at import time would always be the
+            0 the CLI was meant to override.
     """
+    if num_samples is None:
+        num_samples = config.XAI_NUM_SAMPLES
+
     device = next(model.parameters()).device
     model.eval()
 
