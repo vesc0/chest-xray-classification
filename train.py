@@ -18,72 +18,9 @@ import torch.nn as nn
 from torch.amp import GradScaler
 from torch.utils.data import DataLoader
 
-from sklearn.metrics import average_precision_score, roc_auc_score
-
 import config
-
-
-# =============================================================================
-# Device utilities
-# =============================================================================
-def _get_device() -> torch.device:
-    """Select the best available device: CUDA > MPS (Apple Silicon) > CPU."""
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-def synchronize(device: torch.device) -> None:
-    """
-    Block until queued accelerator work has finished.
-
-    CUDA and MPS dispatch kernels asynchronously, so a timer stopped without
-    this measures how long it took to *queue* the work, not to run it —
-    understating GPU time several-fold. Required around any timed region.
-    """
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    elif device.type == "mps":
-        torch.mps.synchronize()
-
-
-def _has_both_labels(labels: np.ndarray) -> bool:
-    """AUROC is defined only when both positive and negative labels exist."""
-    positives = labels.sum()
-    return 0 < positives < len(labels)
-
-
-# =============================================================================
-# Metric computation
-# =============================================================================
-def _compute_macro_auroc(labels: np.ndarray, probs: np.ndarray) -> float:
-    """Compute macro AUROC, skipping undefined classes."""
-    aurocs = []
-    for class_idx in range(labels.shape[1]):
-        targets = labels[:, class_idx]
-        if _has_both_labels(targets):
-            aurocs.append(roc_auc_score(targets, probs[:, class_idx]))
-    return float(np.mean(aurocs)) if aurocs else 0.0
-
-
-def _compute_macro_auprc(labels: np.ndarray, probs: np.ndarray) -> float:
-    """Compute macro average precision, skipping classes with no positives."""
-    auprcs = []
-    for class_idx in range(labels.shape[1]):
-        targets = labels[:, class_idx]
-        if targets.sum() > 0:
-            auprcs.append(average_precision_score(targets, probs[:, class_idx]))
-    return float(np.mean(auprcs)) if auprcs else 0.0
-
-
-def _compute_epoch_metrics(labels: np.ndarray, probs: np.ndarray) -> dict[str, float]:
-    """Summarize threshold-free ranking metrics for one epoch."""
-    return {
-        "auroc": _compute_macro_auroc(labels, probs),
-        "auprc": _compute_macro_auprc(labels, probs),
-    }
+from device import get_device, synchronize
+from metrics import epoch_metrics
 
 
 # =============================================================================
@@ -396,7 +333,7 @@ def train_one_epoch(
     labels_np = np.concatenate(all_labels)
     probs_np = np.concatenate(all_probs)
 
-    metrics = _compute_epoch_metrics(labels_np, probs_np)
+    metrics = epoch_metrics(labels_np, probs_np)
     metrics["loss"] = running_loss / max(len(loader.dataset), 1)
 
     return metrics
@@ -431,7 +368,7 @@ def validate(
     labels_np = np.concatenate(all_labels)
     probs_np = np.concatenate(all_probs)
 
-    metrics = _compute_epoch_metrics(labels_np, probs_np)
+    metrics = epoch_metrics(labels_np, probs_np)
     metrics["loss"] = running_loss / max(len(loader.dataset), 1)
 
     return metrics
@@ -468,7 +405,7 @@ def train_model(
     summary. Total time is confounded by when early stopping fired, so
     mean_epoch_seconds is the fair number to compare across architectures.
     """
-    device = _get_device()
+    device = get_device()
     print(f"[train] Using device: {device}")
     model = model.to(device)
 

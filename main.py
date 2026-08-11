@@ -17,11 +17,12 @@ import torch
 
 import config
 from dataset import get_dataloaders
+from device import get_device
 from evaluate import calibrate_thresholds, evaluate_model
 from explainability import generate_explanations
 from localization import evaluate_localization
 from models import build_model
-from train import _get_device, train_model
+from train import train_model
 from utils import (
     compare_experiments,
     compare_models,
@@ -53,7 +54,7 @@ def run_pipeline(
 
     # Model initialization
     print(f"[main] Step 1/5 - Building model: {model_name} ...")
-    device = _get_device()
+    device = get_device()
     model = build_model(model_name, pretrained=True).to(device)
 
     # Trainable count is only meaningful once the tuning mode has been applied,
@@ -317,7 +318,7 @@ def main():
     print(f"  Loss:               {config.LOSS_NAME}")
     print(f"  Checkpoint metric:  {config.CHECKPOINT_METRIC}")
     print(f"  Threshold metric:   {config.THRESHOLD_METRIC}")
-    print(f"  Device:             {_get_device()}")
+    print(f"  Device:             {get_device()}")
     print(f"  Num workers:        {config.NUM_WORKERS}")
 
     # Model selection logic

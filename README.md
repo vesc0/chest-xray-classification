@@ -59,6 +59,8 @@ The entire workflow is orchestrated natively via the `main.py` entry point.
 ## Python Modules
 
 - `config.py`: Centralizes all configurations, hyperparameters, and dataset directory paths.
+- `device.py`: Accelerator selection (CUDA > MPS > CPU) and synchronization around timed regions.
+- `metrics.py`: Threshold-free ranking metrics (per-class and macro AUROC/AUPRC) shared by training and evaluation, so the per-epoch validation curve and the reported test numbers are computed identically.
 - `dataset.py`: Handles metadata parsing, image augmentations, multi-hot label encoding, and group-aware data splitting.
 - `models.py`: Defines the supported architectures — two CNNs (`DenseNet121Classifier`, `EfficientNetB4Classifier`) and two transformers (`ViTClassifier`, `SwinV2Classifier`).
 - `train.py`: Contains the training loop, optimizer, mixed precision setup, and asymmetric loss implementation.

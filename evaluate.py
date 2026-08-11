@@ -31,13 +31,13 @@ from sklearn.metrics import (
 )
 
 import config
-from train import synchronize
-
-
-def _has_both_labels(labels: np.ndarray) -> bool:
-    """AUROC is defined only when both positive and negative labels exist."""
-    positives = labels.sum()
-    return 0 < positives < len(labels)
+from device import synchronize
+from metrics import (
+    class_auprc,
+    class_auroc,
+    has_both_labels,
+    macro_average,
+)
 
 
 # =============================================================================
@@ -184,7 +184,7 @@ def tune_thresholds(
         y_prob = probs[:, class_idx]
         support = int(y_true.sum())
 
-        if support < config.THRESHOLD_MIN_SUPPORT or not _has_both_labels(y_true):
+        if support < config.THRESHOLD_MIN_SUPPORT or not has_both_labels(y_true):
             summary[class_name] = {
                 "threshold": float(config.DEFAULT_THRESHOLD),
                 "objective": None,
@@ -308,7 +308,7 @@ def _normal_vs_abnormal_metrics(labels: np.ndarray, probs: np.ndarray) -> dict:
 
     results = {"prevalence": round(float(y_true.mean()), 4)}
     for name, score in scores.items():
-        if _has_both_labels(y_true):
+        if has_both_labels(y_true):
             results[f"{name}_auroc"] = round(float(roc_auc_score(y_true, score)), 4)
             results[f"{name}_auprc"] = round(float(average_precision_score(y_true, score)), 4)
         else:
@@ -366,15 +366,15 @@ def compute_metrics(
         predictions = preds[:, class_idx]
         support = int(targets.sum())
 
-        auroc = roc_auc_score(targets, scores) if _has_both_labels(targets) else float("nan")
-        auprc = average_precision_score(targets, scores) if support > 0 else float("nan")
+        # Same helpers the per-epoch training metrics use, so the validation
+        # curve and the number reported here mean the same thing
+        auroc = class_auroc(targets, scores)
+        auprc = class_auprc(targets, scores)
         brier = float(np.mean((scores - targets) ** 2))
         ece = _expected_calibration_error(targets, scores)
 
-        if not np.isnan(auroc):
-            per_class_auroc.append(auroc)
-        if not np.isnan(auprc):
-            per_class_auprc.append(auprc)
+        per_class_auroc.append(auroc)
+        per_class_auprc.append(auprc)
         per_class_brier.append(brier)
         per_class_ece.append(ece)
 
@@ -391,9 +391,11 @@ def compute_metrics(
             "prevalence": round(float(targets.mean()), 4),
         }
 
-    # Macro metrics
-    results["macro"]["auroc"] = round(float(np.mean(per_class_auroc)), 4) if per_class_auroc else None
-    results["macro"]["auprc"] = round(float(np.mean(per_class_auprc)), 4) if per_class_auprc else None
+    # Macro metrics — macro_average skips the classes that were not scorable
+    macro_auroc = macro_average(per_class_auroc)
+    macro_auprc = macro_average(per_class_auprc)
+    results["macro"]["auroc"] = round(macro_auroc, 4) if macro_auroc is not None else None
+    results["macro"]["auprc"] = round(macro_auprc, 4) if macro_auprc is not None else None
     results["macro"]["precision"] = round(
         float(precision_score(labels, preds, average="macro", zero_division=0)),
         4,
