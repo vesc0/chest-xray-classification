@@ -50,7 +50,7 @@ import matplotlib.pyplot as plt
 
 import config
 from dataset import get_eval_transforms, load_metadata
-from explainability import _denormalize, build_explainers, release_explainers
+from explainability import build_explainers, denormalize, release_explainers
 
 
 # =============================================================================
@@ -236,7 +236,7 @@ def _save_figure(
     method_label: str = "Heatmap",
 ) -> None:
     """Original / heatmap / overlay, with ground truth in green and the detection in red."""
-    original = _denormalize(image_tensor)
+    original = denormalize(image_tensor)
     figure, axes = plt.subplots(1, 3, figsize=(15, 5))
 
     axes[0].imshow(original)

@@ -436,10 +436,18 @@ class AttentionRollout:
 
 
 # =============================================================================
-# Visualization helper
+# Visualization helpers (shared with localization.py)
 # =============================================================================
-def _denormalize(tensor: torch.Tensor) -> np.ndarray:
-    """Reverse ImageNet normalization and convert to (H, W, 3) uint8 array."""
+def denormalize(tensor: torch.Tensor) -> np.ndarray:
+    """
+    Reverse ImageNet normalization and convert to (H, W, 3) uint8 array.
+
+    Public because localization.py renders its own box-annotated figures and
+    needs the identical inverse of the transform in dataset.py — if the two
+    drifted apart, one module's overlays would be tinted relative to the
+    other's, which is exactly the kind of difference nobody notices in a
+    heatmap. Keep this in step with get_eval_transforms()'s Normalize.
+    """
     mean = torch.tensor(config.IMAGENET_MEAN).view(3, 1, 1)
     std = torch.tensor(config.IMAGENET_STD).view(3, 1, 1)
     img = tensor.cpu() * std + mean
@@ -462,7 +470,7 @@ def overlay_heatmap(
         title: Plot title.
         save_path: Output file path.
     """
-    original = _denormalize(image_tensor)
+    original = denormalize(image_tensor)
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
