@@ -9,7 +9,9 @@ Computes and reports:
   - Validation-set threshold tuning for long-tailed labels
 """
 
+import importlib.metadata
 import json
+import platform
 import time
 from pathlib import Path
 
@@ -563,6 +565,44 @@ def print_results(results: dict, model_name: str) -> None:
     print(f"{'=' * 96}\n")
 
 
+# Distribution names (not import names) of the packages that can move a
+# reported number: torchvision decides which pretrained weights `.DEFAULT`
+# resolves to, scikit-learn implements every metric here, Pillow decodes the
+# radiographs, and torch/numpy/scipy supply the arithmetic underneath.
+_PROVENANCE_PACKAGES = (
+    "torch",
+    "torchvision",
+    "numpy",
+    "scipy",
+    "scikit-learn",
+    "pandas",
+    "pillow",
+)
+
+
+def _environment_versions() -> dict[str, str | None]:
+    """
+    Record the library versions this evaluation ran under.
+
+    Without them a results file cannot be compared to one written months later:
+    a torchvision upgrade can change which ImageNet weights `.DEFAULT` means, so
+    the model starts fine-tuning from somewhere else entirely, and a
+    scikit-learn upgrade can shift a metric's edge cases — both silently. The
+    lock file records the current environment; this records the one that
+    produced these particular numbers.
+
+    Missing packages are reported as None rather than raising: provenance is
+    not worth losing a finished training run over.
+    """
+    versions: dict[str, str | None] = {"python": platform.python_version()}
+    for package in _PROVENANCE_PACKAGES:
+        try:
+            versions[package] = importlib.metadata.version(package)
+        except Exception:
+            versions[package] = None
+    return versions
+
+
 def _load_previous_results(model_name: str) -> dict:
     """
     Read this experiment's existing results file, if any.
@@ -674,6 +714,11 @@ def evaluate_model(
         "device": device.type,
         "amp": device.type == "cuda",
         "trained_this_run": trained_this_run,
+        # Deliberately not carried over on --eval-only: these describe the
+        # environment that computed the metrics in this file, which is the
+        # current one. When trained_this_run is false, training may well have
+        # happened under different versions.
+        "versions": _environment_versions(),
     }
 
     results["timing"] = {

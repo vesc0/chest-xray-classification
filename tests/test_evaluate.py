@@ -5,11 +5,16 @@ Nothing here touches a model or the disk: every function under test takes
 label/probability arrays.
 """
 
+import importlib.metadata
+import json
+
 import numpy as np
 import pytest
 
 import config
 from evaluate import (
+    _PROVENANCE_PACKAGES,
+    _environment_versions,
     _expected_calibration_error,
     _normal_vs_abnormal_metrics,
     apply_thresholds,
@@ -134,6 +139,44 @@ class TestNormalVsAbnormal:
         probs = np.full((10, config.NUM_CLASSES), 0.2, dtype=np.float32)
         result = _normal_vs_abnormal_metrics(labels, probs)
         assert result["max_auroc"] is None
+
+
+class TestEnvironmentVersions:
+    """
+    Provenance stamped into every results file.
+
+    Two results files months apart are only comparable if you can see they were
+    produced under the same libraries.
+    """
+
+    def test_reports_python_and_every_listed_package(self):
+        versions = _environment_versions()
+        assert "python" in versions
+        assert set(_PROVENANCE_PACKAGES) <= set(versions)
+
+    def test_records_the_versions_actually_installed(self):
+        import importlib.metadata
+
+        assert _environment_versions()["torch"] == importlib.metadata.version("torch")
+
+    def test_torchvision_is_recorded(self):
+        # The one that decides which pretrained weights `.DEFAULT` resolves to
+        assert _environment_versions()["torchvision"] is not None
+
+    def test_reports_none_for_a_missing_package_instead_of_raising(self, monkeypatch):
+        """A finished training run must not be lost to a provenance lookup."""
+
+        def explode(name):
+            raise importlib.metadata.PackageNotFoundError(name)
+
+        monkeypatch.setattr(importlib.metadata, "version", explode)
+        versions = _environment_versions()
+        assert versions["python"]  # still filled in
+        assert all(versions[package] is None for package in _PROVENANCE_PACKAGES)
+
+    def test_is_json_serializable(self):
+        # It gets written straight into the results file
+        json.dumps(_environment_versions())
 
 
 class TestComputeMetrics:

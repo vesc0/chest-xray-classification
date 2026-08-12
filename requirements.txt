@@ -1,25 +1,40 @@
 # Python 3.10+
+#
+# Two files, two jobs:
+#
+#   requirements.txt       what the code needs — readable ranges, installs on
+#                          any platform, safe to update.
+#   requirements.lock.txt  the exact environment that produced the published
+#                          results, transitive dependencies included.
+#
+# Install this file for development; install the lock file to reproduce
+# reported numbers (see the Setup section of README.md).
+#
+# Every range is capped below the next major version. Floors alone are not
+# enough: `numpy>=1.24` and `pandas>=2.0` resolve to numpy 2.x and pandas 3.x
+# today, so a fresh install silently lands on majors the results were never
+# produced under.
 
 # Core ML
-torch>=2.1.0
-torchvision>=0.16.0
+torch>=2.1.0,<3.0.0
+torchvision>=0.16.0,<1.0.0
 
 # Data & metrics
-numpy>=1.24.0
-pandas>=2.0.0
-scikit-learn>=1.3.0
-scipy>=1.11.0          # connected components for localization scoring
+numpy>=1.24.0,<3.0.0
+pandas>=2.0.0,<4.0.0
+scikit-learn>=1.3.0,<2.0.0
+scipy>=1.11.0,<2.0.0          # connected components for localization scoring
 
 # Image processing
-Pillow>=10.0.0
+Pillow>=10.0.0,<13.0.0
 
 # Visualization
-matplotlib>=3.7.0
-seaborn>=0.13.0        # notebooks only
+matplotlib>=3.7.0,<4.0.0
+seaborn>=0.13.0,<0.15.0       # notebooks only
 
 # Notebooks (not needed for the main.py pipeline)
-ipykernel>=6.29.0
+ipykernel>=6.29.0,<8.0.0
 
 # Tests (not needed to run the pipeline). The suite is synthetic throughout:
 # no dataset, no GPU, no checkpoint. Run it with `pytest`.
-pytest>=8.0.0
+pytest>=8.0.0,<10.0.0

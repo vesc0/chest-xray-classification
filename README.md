@@ -8,6 +8,22 @@ This project implements a multi-label classification pipeline for the NIH Chest 
 pip install -r requirements.txt
 ```
 
+To reproduce published numbers rather than just run the code, install the
+pinned environment instead — same package versions, transitive dependencies
+included:
+
+```bash
+pip install -r requirements.lock.txt
+```
+
+`requirements.txt` declares what the code needs as version ranges, each capped
+below the next major release. `requirements.lock.txt` is `pip freeze` output
+recording the exact environment the results were produced under. Ranges alone
+are not enough for reproducibility: floors like `numpy>=1.24` and `pandas>=2.0`
+resolve to numpy 2.x and pandas 3.x today, so a fresh install lands on majors
+the results were never produced under. Regenerate the lock file with
+`pip freeze > requirements.lock.txt` after deliberately upgrading anything.
+
 The pipeline expects the NIH dataset directory (containing `Data_Entry_2017.csv`,
 `train_val_list.txt`, `test_list.txt`, and the `images_001/` … `images_012/` folders).
 Point it at your copy with:
@@ -52,7 +68,8 @@ class sets.
 3. **Training**: The model is trained using an Asymmetric Loss function to handle class imbalance, with performance tracked via AUPRC/AUROC metrics (`train.py`).
 4. **Calibration**: Probabilistic thresholds are calibrated on a validation set to optimize metrics (`evaluate.py`).
 5. **Evaluation**: Calibrated models are evaluated on the held-out test set to produce detailed final metrics (`evaluate.py`).
-6. **Explainability (XAI)**: Visualizations (Grad-CAM or Attention Rollout) are generated for the predictions to ensure interpretability (`explainability.py`).
+6. **Explainability (XAI)**: Heatmaps are generated for the predictions — Grad-CAM for every architecture, plus Attention Rollout for ViT (`explainability.py`). Off by default; enable with `--xai-samples N`.
+7. **Weakly-supervised localization**: The heatmaps are scored against the 984 hand-drawn boxes shipped with ChestX-ray14, asking whether a classifier trained only on image-level labels looks in the right place (`localization.py`).
 
 The entire workflow is orchestrated natively via the `main.py` entry point.
 
@@ -65,8 +82,9 @@ The entire workflow is orchestrated natively via the `main.py` entry point.
 - `models.py`: Defines the supported architectures — two CNNs (`DenseNet121Classifier`, `EfficientNetB4Classifier`) and two transformers (`ViTClassifier`, `SwinV2Classifier`).
 - `train.py`: Contains the training loop, optimizer, mixed precision setup, and asymmetric loss implementation.
 - `evaluate.py`: Responsible for inference, computing metrics (AUROC, AUPRC, F1, Brier, ECE), and determining optimal class-specific decision thresholds.
-- `explainability.py`: Implements XAI techniques (Grad-CAM for CNNs, Attention Rollout for ViTs) to visualize model predictions spatially.
-- `utils.py`: Provides helper functions for reproducible seeding, plotting training curves, and building model/experiment comparison tables.
+- `explainability.py`: Implements the XAI methods — Grad-CAM for all four architectures (each with its own reshape transform), plus Attention Rollout for ViT — and renders heatmap overlays.
+- `localization.py`: Scores those heatmaps against the ground-truth boxes (pointing game, energy fraction, IoU/IoBB) and saves the diagnostic figures.
+- `utils.py`: Provides helper functions for reproducible seeding, run logging, plotting training curves, and building model/experiment comparison tables.
 - `main.py`: The primary command-line interface and orchestrator for running the training, evaluation, and XAI pipelines.
 
 ## Supported Models
@@ -172,6 +190,11 @@ and `--compare-all` surfaces it alongside the accuracy metrics:
 
 Timings are recorded together with the conditions that produced them (device,
 batch size, workers, AMP, parameter count) — they mean nothing without those.
+The `run.versions` block additionally stamps Python and the packages that can
+move a number — `torchvision` decides which pretrained weights `.DEFAULT`
+resolves to, `scikit-learn` implements every metric, `Pillow` decodes the
+images — so two results files written months apart can be checked for
+comparability rather than assumed to be comparable.
 `device.synchronize()` is called around every timed region, because CUDA and MPS
 queue kernels asynchronously and a timer stopped without it measures dispatch
 rather than execution (understating GPU time by ~3× on MPS here).
@@ -191,7 +214,9 @@ outputs/<experiment>/
 ├── results/       # metrics JSON, tuned thresholds, training curves, split summary,
 │                  # and <model>_localization_<method>.json
 ├── logs/          # full console output per run, timestamped
-└── xai/<model>/localization/<method>/   # figures with ground-truth boxes drawn
+└── xai/<model>/
+    ├── localization/<method>/   # figures with ground-truth boxes drawn
+    └── <method>/                # only with --xai-samples N (see below)
 ```
 
 Localization figures are selected diagnostically — true positives that localized
