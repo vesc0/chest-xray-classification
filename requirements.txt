@@ -19,3 +19,7 @@ seaborn>=0.13.0        # notebooks only
 
 # Notebooks (not needed for the main.py pipeline)
 ipykernel>=6.29.0
+
+# Tests (not needed to run the pipeline). The suite is synthetic throughout:
+# no dataset, no GPU, no checkpoint. Run it with `pytest`.
+pytest>=8.0.0

@@ -89,6 +89,31 @@ folded back into a 14×14 grid). ViT additionally gets Attention Rollout as a
 native second view; note it is *class-agnostic*, showing where the model
 attends rather than what supported a specific pathology.
 
+## Tests
+
+```bash
+pytest
+```
+
+132 tests, no dataset required — everything is synthetic, so the suite
+runs with the drive unmounted, no GPU, and no checkpoint on disk. It
+covers the pure functions behind the reported numbers:
+
+| Area | What is pinned |
+| ---- | -------------- |
+| `metrics.py` | NaN-vs-zero handling for unscorable classes; that training's per-epoch AUROC and evaluation's macro AUROC agree on identical input |
+| `dataset.py` | train/val patient-disjointness; nested subsets (5k ⊂ 15k ⊂ 30k); that a stratified prefix tracks the pool's label distribution better than the best of 20 random draws |
+| `localization.py` | box scaling, mask union and clipping, largest-connected-component detection, and the IoBB denominator (intersection over the *predicted* box, per Wang et al.) |
+| `evaluate.py` | threshold tuning and its low-support fallback; ECE at the calibrated and confidently-wrong extremes; normal-vs-abnormal derivation |
+| `train.py` | asymmetric loss under fp16 and saturating logits; head/backbone split for all four architectures; that freezing also stops BatchNorm statistics drifting |
+| `explainability.py` | ViT token→grid and Swin NHWC reshapes; that every architecture's Grad-CAM target layer still resolves; Grad-CAM under a frozen backbone; hook cleanup |
+
+The suite was checked by mutation: deliberately switching the IoBB denominator
+to the union, dropping the loss's fp32 cast, moving the ViT Grad-CAM target back
+to `encoder.ln`, letting frozen BatchNorm keep updating, removing the
+low-support threshold fallback, breaking patient grouping, and replacing
+stratified subsetting with a random sample are each caught by a failing test.
+
 ## Notebooks
 
 The `notebooks/` directory contains Jupyter notebooks showcasing different phases of the project. **These are primarily included to help understand the dataflow step-by-step and are not strictly necessary to run the core pipeline**, with the exception of `1-EDA.ipynb` which is recommended for initial exploratory data analysis.
@@ -147,7 +172,7 @@ and `--compare-all` surfaces it alongside the accuracy metrics:
 
 Timings are recorded together with the conditions that produced them (device,
 batch size, workers, AMP, parameter count) — they mean nothing without those.
-`train.synchronize()` is called around every timed region, because CUDA and MPS
+`device.synchronize()` is called around every timed region, because CUDA and MPS
 queue kernels asynchronously and a timer stopped without it measures dispatch
 rather than execution (understating GPU time by ~3× on MPS here).
 
