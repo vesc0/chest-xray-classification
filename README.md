@@ -66,6 +66,27 @@ catch. Each run writes `results/dataset_summary.json` recording the class list
 and per-split support, and `--compare-all` warns if two runs scored different
 class sets.
 
+### Preprocessing
+
+Three choices in `dataset.py` are deliberate and easy to mistake for oversights:
+
+- **Direct square resize to 224, no centre crop.** The NIH images are already
+  square, so nothing is distorted, and a resize-shorter-side-plus-crop would
+  remove the costophrenic angles and lung apices — exactly where effusions and
+  pneumothoraces present.
+- **No horizontal flip.** Chest radiographs have fixed laterality, so mirroring
+  one would teach the model that dextrocardia is unremarkable and blunt a
+  left-sided finding like cardiomegaly. The remaining augmentation (±7°, ±2%
+  translation, 0.95–1.05 scale, occasional light blur) approximates real
+  positioning variation rather than the aggressive crops used on natural images.
+- **Bicubic resampling**, matching the recipe four of the five backbones were
+  pretrained under. torchvision's `Resize` defaults to bilinear, so leaving it
+  implicit would fine-tune under a different filter than pretraining.
+
+Train and evaluation share one geometry: thresholds are calibrated on the
+validation pipeline and applied to the test pipeline, so a difference between
+them would silently decalibrate every reported number.
+
 ## Dataflow
 
 1. **Data Indexing & Loading**: Images and metadata are parsed from the NIH dataset (`dataset.py`).
@@ -190,7 +211,7 @@ localization as though the two were interchangeable measurements.
 pytest
 ```
 
-158 tests, no dataset required — everything is synthetic, so the suite
+165 tests, no dataset required — everything is synthetic, so the suite
 runs with the drive unmounted, no GPU, and no checkpoint on disk. Backbones are
 built with `pretrained=False`, so nothing downloads weights either. It covers
 the pure functions behind the reported numbers:
@@ -199,6 +220,7 @@ the pure functions behind the reported numbers:
 | ---- | -------------- |
 | `metrics.py` | NaN-vs-zero handling for unscorable classes; that training's per-epoch AUROC and evaluation's macro AUROC agree on identical input |
 | `dataset.py` | train/val patient-disjointness; nested subsets (5k ⊂ 15k ⊂ 30k); that a stratified prefix tracks the pool's label distribution better than the best of 20 random draws |
+| preprocessing | bicubic resampling in both pipelines; that train and eval share one geometry; that no centre crop and no horizontal flip creep in; grayscale→3-channel replication |
 | `localization.py` | box scaling, mask union and clipping, largest-connected-component detection, and the IoBB denominator (intersection over the *predicted* box, per Wang et al.) |
 | `evaluate.py` | threshold tuning and its low-support fallback; ECE at the calibrated and confidently-wrong extremes; normal-vs-abnormal derivation |
 | `train.py` | asymmetric loss under fp16 and saturating logits; head/backbone split for all five architectures; that freezing also stops BatchNorm statistics drifting |
@@ -209,10 +231,10 @@ The suite was checked by mutation: deliberately switching the IoBB denominator
 to the union, dropping the loss's fp32 cast, moving the ViT Grad-CAM target to
 the final norm, leaving timm's fused attention enabled so rollout silently
 captures nothing, leaving a stale architecture in the Grad-CAM target table,
-hardcoding the wrong prefix-token count, letting frozen BatchNorm keep updating,
-removing the low-support threshold fallback, breaking patient grouping, and
-replacing stratified subsetting with a random sample are each caught by a
-failing test.
+hardcoding the wrong prefix-token count, falling back to bilinear resampling,
+letting frozen BatchNorm keep updating, removing the low-support threshold
+fallback, breaking patient grouping, and replacing stratified subsetting with a
+random sample are each caught by a failing test.
 
 ## Notebooks
 

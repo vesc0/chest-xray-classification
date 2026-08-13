@@ -462,11 +462,44 @@ class ChestXrayDataset(Dataset):
 # =============================================================================
 # Transforms
 # =============================================================================
+# Bicubic, matching the recipe four of the five backbones were pretrained under
+# (SwinV2-T, MaxViT-T, ViT-S/16 and ConvNeXtV2-T; only DenseNet-121 used
+# bilinear). torchvision's Resize defaults to bilinear, so leaving it implicit
+# meant fine-tuning under a different resampling filter than pretraining. It is
+# also the better filter for the 1024 -> 224 downsample these radiographs need.
+RESIZE_INTERPOLATION = transforms.InterpolationMode.BICUBIC
+
+
+def _resize() -> transforms.Resize:
+    """
+    Square resize to IMAGE_SIZE, shared by both pipelines.
+
+    Deliberately a direct resize rather than resize-shorter-side plus a centre
+    crop: the NIH images are already square, so nothing is distorted, and a
+    centre crop would cut off the costophrenic angles and lung apices — exactly
+    where effusions and pneumothoraces present. Train and eval must stay
+    identical here, or the model is calibrated at one geometry and scored at
+    another.
+    """
+    return transforms.Resize(
+        (config.IMAGE_SIZE, config.IMAGE_SIZE),
+        interpolation=RESIZE_INTERPOLATION,
+    )
+
+
 def get_train_transforms() -> transforms.Compose:
-    """Augmentation pipeline tuned for frontal radiographs."""
+    """
+    Augmentation pipeline tuned for frontal radiographs.
+
+    Deliberately mild, and deliberately without a horizontal flip: chest
+    radiographs have fixed laterality, so mirroring one would teach the model
+    that dextrocardia is unremarkable and blunt a left-sided finding like
+    cardiomegaly. The affine ranges approximate real positioning variation
+    rather than the aggressive crops used on natural images.
+    """
     return transforms.Compose(
         [
-            transforms.Resize((config.IMAGE_SIZE, config.IMAGE_SIZE)),
+            _resize(),
             transforms.RandomAffine(
                 degrees=7,
                 translate=(0.02, 0.02),
@@ -486,7 +519,7 @@ def get_eval_transforms() -> transforms.Compose:
     """Deterministic pipeline for validation / test."""
     return transforms.Compose(
         [
-            transforms.Resize((config.IMAGE_SIZE, config.IMAGE_SIZE)),
+            _resize(),
             transforms.ToTensor(),
             transforms.Normalize(mean=config.IMAGENET_MEAN, std=config.IMAGENET_STD),
         ]
