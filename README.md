@@ -24,6 +24,11 @@ resolve to numpy 2.x and pandas 3.x today, so a fresh install lands on majors
 the results were never produced under. Regenerate the lock file with
 `pip freeze > requirements.lock.txt` after deliberately upgrading anything.
 
+The first run of each architecture downloads its ImageNet weights: the three
+torchvision backbones from `download.pytorch.org`, and ViT-S/ConvNeXtV2 from
+the HuggingFace Hub via `timm`. Both are cached afterwards. The test suite
+never downloads anything.
+
 The pipeline expects the NIH dataset directory (containing `Data_Entry_2017.csv`,
 `train_val_list.txt`, `test_list.txt`, and the `images_001/` … `images_012/` folders).
 Point it at your copy with:
@@ -64,7 +69,7 @@ class sets.
 ## Dataflow
 
 1. **Data Indexing & Loading**: Images and metadata are parsed from the NIH dataset (`dataset.py`).
-2. **Model Initialization**: Pre-trained backbones (CNN or ViT) are loaded and their classification heads are adapted for the 14 pathology classes (`models.py`).
+2. **Model Initialization**: Pre-trained backbones (CNN, ViT, or hybrid) are loaded and their classification heads are adapted for the 14 pathology classes (`models.py`).
 3. **Training**: The model is trained using an Asymmetric Loss function to handle class imbalance, with performance tracked via AUPRC/AUROC metrics (`train.py`).
 4. **Calibration**: Probabilistic thresholds are calibrated on a validation set to optimize metrics (`evaluate.py`).
 5. **Evaluation**: Calibrated models are evaluated on the held-out test set to produce detailed final metrics (`evaluate.py`).
@@ -79,33 +84,105 @@ The entire workflow is orchestrated natively via the `main.py` entry point.
 - `device.py`: Accelerator selection (CUDA > MPS > CPU) and synchronization around timed regions.
 - `metrics.py`: Threshold-free ranking metrics (per-class and macro AUROC/AUPRC) shared by training and evaluation, so the per-epoch validation curve and the reported test numbers are computed identically.
 - `dataset.py`: Handles metadata parsing, image augmentations, multi-hot label encoding, and group-aware data splitting.
-- `models.py`: Defines the supported architectures — two CNNs (`DenseNet121Classifier`, `EfficientNetB4Classifier`) and two transformers (`ViTClassifier`, `SwinV2Classifier`).
+- `models.py`: Defines the five supported architectures — one per family, with the pinned pretrained-weight tags and the reasoning behind each choice.
 - `train.py`: Contains the training loop, optimizer, mixed precision setup, and asymmetric loss implementation.
 - `evaluate.py`: Responsible for inference, computing metrics (AUROC, AUPRC, F1, Brier, ECE), and determining optimal class-specific decision thresholds.
-- `explainability.py`: Implements the XAI methods — Grad-CAM for all four architectures (each with its own reshape transform), plus Attention Rollout for ViT — and renders heatmap overlays.
+- `explainability.py`: Implements the XAI methods — Grad-CAM for all five architectures (each with its own reshape transform), plus Attention Rollout for ViT — and renders heatmap overlays.
 - `localization.py`: Scores those heatmaps against the ground-truth boxes (pointing game, energy fraction, IoU/IoBB) and saves the diagnostic figures.
 - `utils.py`: Provides helper functions for reproducible seeding, run logging, plotting training curves, and building model/experiment comparison tables.
 - `main.py`: The primary command-line interface and orchestrator for running the training, evaluation, and XAI pipelines.
 
 ## Supported Models
 
-| `--model`         | Architecture   | Type        | Grad-CAM target layer     | Extra XAI         |
-| ----------------- | -------------- | ----------- | ------------------------- | ----------------- |
-| `densenet121`     | DenseNet-121   | CNN         | `features.denseblock4`    | —                 |
-| `efficientnet_b4` | EfficientNet-B4| CNN         | `features[-1]`            | —                 |
-| `vit_b_16`        | ViT-B/16       | Transformer | `encoder.layers[-1].ln_1` | Attention Rollout |
-| `swin_v2_b`       | SwinV2-B       | Transformer | `norm`                    | —                 |
+One backbone per architecture family, so a difference between two results is
+attributable to the architecture rather than to capacity, input resolution, or
+pretraining data:
 
-`--model all` runs every architecture in the table.
+| `--model`      | Architecture | Family        | Params | Source | Weights |
+| -------------- | ------------ | ------------- | ------ | ------ | ------- |
+| `densenet121`  | DenseNet-121 | CNN baseline  | 7.0M   | torchvision | `IMAGENET1K_V1` |
+| `vit_s_16`     | ViT-S/16     | pure ViT      | 21.7M  | timm   | `deit_small_patch16_224.fb_in1k` |
+| `convnextv2_t` | ConvNeXtV2-T | modern CNN    | 27.9M  | timm   | `convnextv2_tiny.fcmae_ft_in1k` |
+| `swin_v2_t`    | SwinV2-T     | modern ViT    | 27.6M  | torchvision | `IMAGENET1K_V1` |
+| `maxvit_t`     | MaxViT-T     | hybrid CNN/ViT| 30.4M  | torchvision | `IMAGENET1K_V1` |
 
-**Grad-CAM runs for all four models** so heatmaps are comparable across
+`--model all` runs every architecture in the table. Parameter counts are as
+built here, with the 14-class head — a few percent below the 1000-class
+ImageNet figures usually quoted.
+
+**What is held constant.** The last four models sit in a 22–31M band, so
+"modern CNN vs modern ViT" is a comparison at matched capacity. Every model is
+pretrained on **ImageNet-1k only** — no IN21k/IN22k checkpoint is used even
+where one exists, because DenseNet, SwinV2 and MaxViT have no IN21k option
+here, and using 21k for the two that do would confound architecture with
+pretraining data while specifically flattering the pure ViT. Every model takes
+**224×224 input with ImageNet normalization**, so a single shared transform
+serves the whole roster.
+
+**What is deliberately not constant.** DenseNet-121 is not scale-matched: its
+value is being the exact backbone behind the CheXNet results, which a deeper
+variant chosen to close the parameter gap would throw away. Its ImageNet
+weights also come from torchvision's original recipe (74.4% top-1) rather than
+the modern recipes behind SwinV2-T (82.1%) and MaxViT-T (83.7%), so the
+comparison is between architectures *as they are normally obtained*, not
+between architectures pretrained identically.
+
+Two constraints are worth knowing before changing `IMAGE_SIZE`:
+
+- **MaxViT-T fixes the resolution at 224.** torchvision builds its attention
+  partition sizes from a declared input size and reshapes against them, so any
+  other resolution raises inside the partitioning rather than adapting.
+- **SwinV2 is therefore used slightly off-resolution.** torchvision's SwinV2
+  weights — every size — were trained at 256. At 224 the final stage is a 7×7
+  map against a window size of 8. SwinV2's log-spaced continuous position bias
+  is designed for exactly this transfer (it is the headline change from
+  SwinV1), so the effect is a soft degradation, but it is a real limitation of
+  this comparison.
+
+### Explainability per architecture
+
+| `--model`      | Grad-CAM target layer  | Layout       | CAM grid | Extra XAI         |
+| -------------- | ---------------------- | ------------ | -------- | ----------------- |
+| `densenet121`  | `features.denseblock4` | NCHW         | 7×7      | —                 |
+| `vit_s_16`     | `blocks[-1].norm1`     | tokens→grid  | 14×14    | Attention Rollout |
+| `convnextv2_t` | `stages[-1]`           | NCHW         | 7×7      | —                 |
+| `swin_v2_t`    | `norm`                 | NHWC→NCHW    | 7×7      | —                 |
+| `maxvit_t`     | `blocks[-1]`           | NCHW         | 7×7      | —                 |
+
+**Grad-CAM runs for all five models** so heatmaps are comparable across
 architectures — comparing localization is meaningless if the CNNs and the
 transformers are explained by different methods. Transformers do not emit NCHW
 feature maps, so each architecture registers a reshape transform in
-`explainability.GRADCAM_TARGETS` (Swin is NHWC; ViT is a token sequence that is
-folded back into a 14×14 grid). ViT additionally gets Attention Rollout as a
-native second view; note it is *class-agnostic*, showing where the model
-attends rather than what supported a specific pathology.
+`explainability.GRADCAM_TARGETS` (Swin is NHWC; ViT is a token sequence folded
+back into a grid; MaxViT ends in grid attention but still emits NCHW, so the
+hybrid needs no special handling).
+
+Note the **CAM grid** column. ViT-S/16 produces a 14×14 map where the
+hierarchical models produce 7×7, because a patch-16 transformer keeps one token
+per 16×16 patch while the others have downsampled four times. Upsampled to 224
+this gives ViT finer predicted boxes for free, which inflates its IoU and IoBB
+relative to the rest. The **pointing game** is far less sensitive to grid size
+and is the fairer cross-architecture comparison.
+
+**Attention Rollout is ViT-only by necessity, not oversight.** SwinV2 attends
+inside shifted local windows and merges patches between stages, so there is no
+single token set to multiply across layers; MaxViT interleaves MBConv blocks
+that carry no attention at all, breaking the chain outright. Adapting rollout
+to either is a research problem — which is exactly why Grad-CAM, defined for
+all five, is the method the comparison rests on. Rollout is also
+*class-agnostic*, showing where the model attends rather than what supported a
+specific pathology.
+
+**Rollout's localization scores will look broken, and are not.** ViTs
+repurpose a few low-information background patches as global scratch space,
+and those tokens carry very large activations (Darcet et al., *Vision
+Transformers Need Registers*, 2024, which shows the effect on DeiT). Rollout
+multiplies attention across all 12 layers, compounding exactly those tokens,
+so the heatmap peak routinely lands on an image corner rather than on anatomy
+— driving the pointing game to ≈0 against a ≈0.07 random baseline. This is the
+method meeting the architecture, not a defect in the implementation. Report it
+as a property of Attention Rollout; do not compare it against Grad-CAM's
+localization as though the two were interchangeable measurements.
 
 ## Tests
 
@@ -113,9 +190,10 @@ attends rather than what supported a specific pathology.
 pytest
 ```
 
-132 tests, no dataset required — everything is synthetic, so the suite
-runs with the drive unmounted, no GPU, and no checkpoint on disk. It
-covers the pure functions behind the reported numbers:
+158 tests, no dataset required — everything is synthetic, so the suite
+runs with the drive unmounted, no GPU, and no checkpoint on disk. Backbones are
+built with `pretrained=False`, so nothing downloads weights either. It covers
+the pure functions behind the reported numbers:
 
 | Area | What is pinned |
 | ---- | -------------- |
@@ -123,14 +201,18 @@ covers the pure functions behind the reported numbers:
 | `dataset.py` | train/val patient-disjointness; nested subsets (5k ⊂ 15k ⊂ 30k); that a stratified prefix tracks the pool's label distribution better than the best of 20 random draws |
 | `localization.py` | box scaling, mask union and clipping, largest-connected-component detection, and the IoBB denominator (intersection over the *predicted* box, per Wang et al.) |
 | `evaluate.py` | threshold tuning and its low-support fallback; ECE at the calibrated and confidently-wrong extremes; normal-vs-abnormal derivation |
-| `train.py` | asymmetric loss under fp16 and saturating logits; head/backbone split for all four architectures; that freezing also stops BatchNorm statistics drifting |
-| `explainability.py` | ViT token→grid and Swin NHWC reshapes; that every architecture's Grad-CAM target layer still resolves; Grad-CAM under a frozen backbone; hook cleanup |
+| `train.py` | asymmetric loss under fp16 and saturating logits; head/backbone split for all five architectures; that freezing also stops BatchNorm statistics drifting |
+| `models.py` | that the factory and `SUPPORTED_MODELS` describe the same roster; that neither timm tag pulls in 21k pretraining; ViT's prefix-token count; that MaxViT is what fixes `IMAGE_SIZE` at 224 |
+| `explainability.py` | ViT token→grid and Swin NHWC reshapes; that every architecture's Grad-CAM target layer still resolves; the 14×14-vs-7×7 CAM grid asymmetry; that Attention Rollout actually captures attention and restores the model afterwards; Grad-CAM under a frozen backbone; hook cleanup |
 
 The suite was checked by mutation: deliberately switching the IoBB denominator
-to the union, dropping the loss's fp32 cast, moving the ViT Grad-CAM target back
-to `encoder.ln`, letting frozen BatchNorm keep updating, removing the
-low-support threshold fallback, breaking patient grouping, and replacing
-stratified subsetting with a random sample are each caught by a failing test.
+to the union, dropping the loss's fp32 cast, moving the ViT Grad-CAM target to
+the final norm, leaving timm's fused attention enabled so rollout silently
+captures nothing, leaving a stale architecture in the Grad-CAM target table,
+hardcoding the wrong prefix-token count, letting frozen BatchNorm keep updating,
+removing the low-support threshold fallback, breaking patient grouping, and
+replacing stratified subsetting with a random sample are each caught by a
+failing test.
 
 ## Notebooks
 
@@ -152,7 +234,7 @@ The `notebooks/` directory contains Jupyter notebooks showcasing different phase
 python main.py --model densenet121
 
 # Train ViT
-python main.py --model vit_b_16
+python main.py --model vit_s_16
 
 # Run every supported architecture
 python main.py --model all

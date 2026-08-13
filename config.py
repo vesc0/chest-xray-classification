@@ -95,9 +95,22 @@ SEED = 42
 # =============================================================================
 # Preprocessing & Augmentation
 # =============================================================================
-# Input resolution for both CNN and ViT
+# Input resolution, shared by every architecture so that resolution is a
+# controlled variable rather than a per-model choice.
+#
+# 224 is not free to change. torchvision's MaxViT-T builds its attention
+# partition sizes from a declared input size and raises on anything else, so
+# 224 is a hard floor and ceiling for that model. In the other direction,
+# torchvision's SwinV2 weights were trained at 256 and are therefore being used
+# slightly off-resolution here; SwinV2's log-spaced continuous position bias is
+# built for that transfer, and the trade is documented in models.py. Raising
+# this (e.g. for a resolution study) means re-sourcing both models.
 IMAGE_SIZE = 224
-# ImageNet normalization (pretrained models expect this)
+# ImageNet normalization. Every backbone in SUPPORTED_MODELS expects these
+# statistics — including the two timm models, which is why the ViT slot uses
+# DeiT weights rather than the augreg checkpoints that expect mean/std = 0.5.
+# A backbone with different statistics would need its own transform, and
+# main.py could no longer build the loaders once and share them.
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
@@ -121,8 +134,14 @@ ASL_GAMMA_NEG = 4.0
 ASL_GAMMA_POS = 1.0
 ASL_CLIP = 0.05
 
-# Model choices: "densenet121" (CNN), "vit_b_16" (ViT), "swin_v2_b" (ViT), "efficientnet_b4" (CNN)
-SUPPORTED_MODELS = ["densenet121", "vit_b_16", "swin_v2_b", "efficientnet_b4"]
+# Parameter counts are as built here, with the 14-class head.
+#
+#   densenet121   (7.0M)  CNN baseline        torchvision
+#   vit_s_16     (21.7M)  pure ViT            timm (DeiT-S weights)
+#   convnextv2_t (27.9M)  modern CNN          timm
+#   swin_v2_t    (27.6M)  modern ViT          torchvision
+#   maxvit_t     (30.4M)  hybrid CNN/ViT      torchvision
+SUPPORTED_MODELS = ["densenet121", "vit_s_16", "convnextv2_t", "swin_v2_t", "maxvit_t"]
 
 # Fine-tuning strategy:
 #   - "full": train all parameters for all epochs

@@ -567,11 +567,13 @@ def print_results(results: dict, model_name: str) -> None:
 
 # Distribution names (not import names) of the packages that can move a
 # reported number: torchvision decides which pretrained weights `.DEFAULT`
-# resolves to, scikit-learn implements every metric here, Pillow decodes the
+# resolves to and timm does the same for the tags behind ViT-S and
+# ConvNeXtV2, scikit-learn implements every metric here, Pillow decodes the
 # radiographs, and torch/numpy/scipy supply the arithmetic underneath.
 _PROVENANCE_PACKAGES = (
     "torch",
     "torchvision",
+    "timm",
     "numpy",
     "scipy",
     "scikit-learn",
@@ -698,7 +700,7 @@ def evaluate_model(
     results = compute_metrics(labels, probs, preds, thresholds=thresholds)
 
     # Conditions the numbers above were produced under. total_params alone is
-    # misleading: a head_only probe trains 25k of EfficientNet-B4's 17.6M.
+    # misleading: a head_only probe trains 14k of DenseNet-121's 7.0M.
     total_params = sum(p.numel() for p in model.parameters())
     results["run"] = {
         # How the checkpoint was trained (carried over on --eval-only)

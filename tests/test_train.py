@@ -3,7 +3,7 @@ Loss, freezing, and checkpoint-metric direction.
 
 The tuning-mode tests build real backbones (randomly initialized, no download)
 because the head/backbone split is resolved by attribute name per architecture
-— exactly the thing a torchvision upgrade renames without warning.
+— exactly the thing a torchvision or timm upgrade renames without warning.
 """
 
 import numpy as np
@@ -22,7 +22,7 @@ from train import (
     _split_backbone_head_params,
 )
 
-ARCHITECTURES = ["densenet121", "efficientnet_b4", "vit_b_16", "swin_v2_b"]
+ARCHITECTURES = list(config.SUPPORTED_MODELS)
 
 
 class TestAsymmetricLoss:

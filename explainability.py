@@ -1,7 +1,7 @@
 """
 Explainability module
 
-  1. Grad-CAM — for all four architectures
+  1. Grad-CAM — for all five architectures
      Weights the last spatial feature map by the gradient of the target class.
      Applied to every model so that explanations are comparable across
      architectures: a "which model localizes better" claim is meaningless if
@@ -10,19 +10,37 @@ Explainability module
      Transformers do not emit NCHW feature maps, so each architecture pairs a
      target layer with a reshape transform that normalizes its output:
 
-       DenseNet-121     features.denseblock4          NCHW already
-       EfficientNet-B4  features[-1]                  NCHW already
-       SwinV2-B         norm                          NHWC -> NCHW
-       ViT-B/16         encoder.layers[-1].ln_1       tokens -> 14x14 grid
+       DenseNet-121   features.denseblock4    NCHW already        7x7
+       ConvNeXtV2-T   stages[-1]              NCHW already        7x7
+       SwinV2-T       norm                    NHWC -> NCHW        7x7
+       MaxViT-T       blocks[-1]              NCHW already        7x7
+       ViT-S/16       blocks[-1].norm1        tokens -> grid    14x14
 
-  2. Attention Rollout — ViT-B/16 only, as an architecture-native second view
+     Note the resolution in the last column. ViT-S produces a 14x14 CAM where
+     the other four produce 7x7, because a patch-16 transformer keeps one token
+     per 16x16 patch while the hierarchical models have downsampled four times.
+     Upsampled to 224 this gives ViT finer predicted boxes for free, which
+     inflates the IoU/IoBB numbers in localization.py relative to the rest. The
+     pointing game is far less sensitive to it; interpret the overlap metrics
+     with the grid size in mind.
+
+  2. Attention Rollout — ViT-S/16 only, as an architecture-native second view
      Recursively multiplies attention matrices across all transformer layers
      to produce a single spatial attention map from the [CLS] token. Unlike
      Grad-CAM this is class-agnostic: it shows where the model looks, not what
      evidence supported a particular pathology.
 
+     It stays ViT-only by necessity, not oversight. SwinV2 attends inside
+     shifted local windows and merges patches between stages, so there is no
+     single token set to multiply across layers; MaxViT interleaves MBConv
+     blocks that carry no attention at all, breaking the chain outright.
+     Adapting rollout to either is a research problem, which is precisely why
+     Grad-CAM — defined for all five — is the method the comparison rests on.
+
 Both methods overlay a heatmap on the original X-ray and save the result.
 """
+
+from functools import partial
 
 import numpy as np
 
@@ -53,9 +71,20 @@ def _nhwc_to_nchw(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.permute(0, 3, 1, 2).contiguous()
 
 
-def _tokens_to_grid(tensor: torch.Tensor) -> torch.Tensor:
-    """Reshape ViT tokens (B, 1 + N, C) into a (B, C, sqrt(N), sqrt(N)) map."""
-    tokens = tensor[:, 1:, :]  # drop the [CLS] token, which has no location
+def _tokens_to_grid(tensor: torch.Tensor, num_prefix_tokens: int = 1) -> torch.Tensor:
+    """
+    Reshape ViT tokens (B, P + N, C) into a (B, C, sqrt(N), sqrt(N)) map.
+
+    Args:
+        tensor: Token sequence straight off the target layer.
+        num_prefix_tokens: Leading non-spatial tokens to drop — [CLS] for
+            ViT-S/16, but distillation or register tokens push this higher on
+            other checkpoints, and dropping the wrong number silently shifts
+            every patch by one position. The registry below binds this from
+            the backbone rather than assuming it, and a token count that is
+            not square after the drop raises instead of reshaping to nonsense.
+    """
+    tokens = tensor[:, num_prefix_tokens:, :]  # prefix tokens carry no location
     batch, num_tokens, channels = tokens.shape
 
     grid_size = int(round(num_tokens ** 0.5))
@@ -67,28 +96,49 @@ def _tokens_to_grid(tensor: torch.Tensor) -> torch.Tensor:
     return tokens.reshape(batch, grid_size, grid_size, channels).permute(0, 3, 1, 2).contiguous()
 
 
+def _fixed(transform):
+    """
+    Wrap a model-independent reshape as a factory.
+
+    Every registry entry below is `(resolve_layer, build_transform)`, both
+    taking the model, because the ViT reshape needs to read the backbone's
+    prefix-token count. This keeps the three model-independent reshapes
+    readable under that uniform contract.
+    """
+    return lambda model: transform
+
+
 # Target layer + layout transform per architecture. Getting the layer wrong is
 # quiet rather than loud: a transformer layout fed straight into the CNN maths
 # produces a plausible-looking but meaningless heatmap.
 GRADCAM_TARGETS: dict = {
     "densenet121": (
         lambda model: model.backbone.features.denseblock4,
-        _identity_transform,
+        _fixed(_identity_transform),
     ),
-    "efficientnet_b4": (
-        lambda model: model.backbone.features[-1],
-        _identity_transform,
+    "convnextv2_t": (
+        lambda model: model.backbone.stages[-1],
+        _fixed(_identity_transform),
     ),
-    "swin_v2_b": (
+    "swin_v2_t": (
         lambda model: model.backbone.norm,
-        _nhwc_to_nchw,
+        _fixed(_nhwc_to_nchw),
     ),
-    # NOT encoder.ln: the head reads only token 0, so gradients w.r.t. every
-    # patch token at that final norm are exactly zero and the CAM comes out
-    # blank. ln_1 of the last block still routes through attention to all tokens.
-    "vit_b_16": (
-        lambda model: model.backbone.encoder.layers[-1].ln_1,
-        _tokens_to_grid,
+    # MaxViT's stages end in grid attention but still emit NCHW, so the hybrid
+    # needs no special handling — unlike the two pure transformers.
+    "maxvit_t": (
+        lambda model: model.backbone.blocks[-1],
+        _fixed(_identity_transform),
+    ),
+    # NOT backbone.norm: the head reads only the [CLS] token, so gradients
+    # w.r.t. every patch token at that final norm are exactly zero and the CAM
+    # comes out blank. norm1 of the last block still routes through attention
+    # to all tokens.
+    "vit_s_16": (
+        lambda model: model.backbone.blocks[-1].norm1,
+        lambda model: partial(
+            _tokens_to_grid, num_prefix_tokens=model.backbone.num_prefix_tokens
+        ),
     ),
 }
 
@@ -122,8 +172,9 @@ class GradCAM:
                 f"Known: {sorted(GRADCAM_TARGETS)}"
             )
 
-        resolve_layer, self.reshape_transform = GRADCAM_TARGETS[model_name]
+        resolve_layer, build_transform = GRADCAM_TARGETS[model_name]
         target_layer = resolve_layer(model)
+        self.reshape_transform = build_transform(model)
 
         # Raw (untransformed) target-layer output, kept between the forward pass
         # and the gradient call
@@ -260,15 +311,34 @@ class GradCAM:
 # =============================================================================
 class AttentionRollout:
     """
-    Attention Rollout for Vision Transformer (ViT-B/16).
+    Attention Rollout for Vision Transformer (ViT-S/16).
 
-    Torchvision's ViT calls self_attention with need_weights=False by default,
-    so each encoder block's forward method is temporarily patched to force
-    need_weights=True and capture the attention weight matrices.
+    timm's Attention dispatches to F.scaled_dot_product_attention whenever
+    `fused_attn` is set, which is the default. SDPA never materializes the
+    attention matrix, so there is nothing to hook and a naive port of this
+    class returns blank maps *without raising*. Capture therefore has two
+    halves: switch every block to the unfused path for the duration of the
+    forward pass, and hook each block's `attn_drop`, the module the softmaxed
+    (B, heads, S, S) matrix passes through on that path. Dropout is the
+    identity in eval mode, so the hook observes the attention unmodified.
+
+    Both changes are reverted afterwards, so a rollout leaves the model exactly
+    as it found it.
 
     The captured attention maps are then multiplied across layers (with
     residual connections) to produce a single spatial heatmap from the
     [CLS] token to every image patch.
+
+    **Expect border artifacts, and do not read them as a bug.** ViTs repurpose
+    a few low-information background patches as global scratch space, and those
+    tokens carry very large activations (Darcet et al., "Vision Transformers
+    Need Registers", 2024 — DeiT among the models shown). Rollout multiplies
+    attention across all 12 layers, which compounds exactly those tokens, so
+    the peak frequently lands on an image corner or edge rather than on
+    anatomy. On the 984 annotated ChestX-ray14 instances this drives the
+    pointing game to ~0 against a ~0.07 random baseline. That is the method
+    meeting the architecture, not a defect in this implementation, and it is
+    one more reason the cross-architecture comparison rests on Grad-CAM.
     """
 
     # One map per image, whatever the class: metrics computed per class still
@@ -285,64 +355,48 @@ class AttentionRollout:
 
         # Store attention maps across layers
         self.attention_maps: list[torch.Tensor] = []
-        self._patched = False
+        self._handles: list = []
+        self._saved_fused_attn: list[bool] = []
 
-    def _patch_encoder_blocks(self):
-        """Replace each encoder block's forward to capture attention weights."""
-        import types
+    @property
+    def _blocks(self):
+        """The transformer blocks whose attention gets rolled up."""
+        return self.model.backbone.blocks
 
-        self._original_forwards: list = []
+    def _capture_attention(self, module, inputs, output):
+        """Record one layer's head-averaged attention matrix."""
+        # Verify the head axis is there before collapsing it. Averaging at
+        # capture time rather than in generate_batch keeps 6x less attention
+        # resident: a batch of 32 would otherwise hold 12 layers of
+        # (32, 6, 197, 197).
+        torch._assert(
+            output.dim() == 4,
+            f"Expected (B, heads, S, S) attention, got {tuple(output.shape)}",
+        )
+        self.attention_maps.append(output.detach().mean(dim=1))
 
-        for block in self.model.backbone.encoder.layers:
-            self._original_forwards.append(block.forward)
-
-            # Closure to capture `block` correctly
-            def make_patched_forward(blk):
-                def patched_forward(input: torch.Tensor):
-                    # Ensure transformer input shape is correct
-                    import torch as _torch
-                    _torch._assert(input.dim() == 3, f"Expected 3D got {input.shape}")
-                    x = blk.ln_1(input)
-
-                    # Force need_weights=True so attn_weights are computed.
-                    # average_attn_weights=False keeps the per-head matrices;
-                    # the default pre-averages them and drops the head axis,
-                    # which makes the rollout below average the wrong dimension.
-                    x, attn_weights = blk.self_attention(
-                        x, x, x, need_weights=True, average_attn_weights=False
-                    )
-
-                    # Verify the head axis survived before collapsing it. Doing
-                    # the head-mean here rather than in generate_batch keeps
-                    # 12x less attention in memory: a batch of 32 would
-                    # otherwise hold 12 layers x (32, 12, 197, 197).
-                    _torch._assert(
-                        attn_weights.dim() == 4,
-                        f"Expected (B, heads, S, S) attention, got {attn_weights.shape}",
-                    )
-                    self.attention_maps.append(attn_weights.detach().mean(dim=1))
-                    x = blk.dropout(x)
-                    x = x + input
-                    y = blk.ln_2(x)
-                    y = blk.mlp(y)
-
-                    return x + y
-                
-                return patched_forward
-
-            # Replace original forward
-            block.forward = types.MethodType(
-                lambda self_block, input, _fn=make_patched_forward(block): _fn(input),
-                block,
+    def _start_capture(self):
+        """Force the unfused attention path and hook each block's attn_drop."""
+        self._saved_fused_attn = []
+        for block in self._blocks:
+            # Remember the flag rather than assuming it was True, so this
+            # restores the model's own configuration and stays correct if timm
+            # ever changes the default.
+            self._saved_fused_attn.append(block.attn.fused_attn)
+            block.attn.fused_attn = False
+            self._handles.append(
+                block.attn.attn_drop.register_forward_hook(self._capture_attention)
             )
 
-        self._patched = True
+    def _stop_capture(self):
+        """Detach the hooks and put fused attention back the way it was."""
+        for handle in self._handles:
+            handle.remove()
+        self._handles = []
 
-    # Restore original transformer behavior
-    def _unpatch_encoder_blocks(self):
-        for block, orig in zip(self.model.backbone.encoder.layers, self._original_forwards):
-            block.forward = orig
-        self._patched = False
+        for block, fused in zip(self._blocks, self._saved_fused_attn):
+            block.attn.fused_attn = fused
+        self._saved_fused_attn = []
 
     @torch.no_grad()
     def generate_batch(
@@ -364,19 +418,26 @@ class AttentionRollout:
         """
         self.attention_maps.clear()
 
-        # Temporarily patch to capture attention weights
-        self._patch_encoder_blocks()
+        # Temporarily capture attention weights
+        self._start_capture()
         try:
             # Same interface contract as GradCAM: expose this forward's logits
             self.last_logits = self.model(images).detach()
         finally:
-            self._unpatch_encoder_blocks()
+            self._stop_capture()
 
         batch, _, height, width = images.shape
 
-        # Fallback if no attention captured
+        # Raise rather than fall back to a constant map. An empty capture means
+        # the forward pass never took the unfused attention path, and a uniform
+        # heatmap would sail through localization scoring as a real result
+        # instead of surfacing the bug.
         if not self.attention_maps:
-            return np.full((batch, height, width), 0.5, dtype=np.float32)
+            raise RuntimeError(
+                "Attention Rollout captured no attention matrices. The forward "
+                "pass did not take the unfused attention path, so there was "
+                "nothing to hook."
+            )
 
         # Average attention across heads, then rollout across layers
         result = None
@@ -400,8 +461,10 @@ class AttentionRollout:
             # Multiply across layers (rollout)
             result = attn_avg if result is None else attn_avg @ result
 
-        # [CLS] token attention to all patches (skip [CLS] itself)
-        cls_attention = result[:, 0, 1:]  # (B, num_patches)
+        # [CLS] token attention to all patches, dropping the prefix tokens that
+        # carry no location — the same count _tokens_to_grid drops.
+        num_prefix_tokens = self.model.backbone.num_prefix_tokens
+        cls_attention = result[:, 0, num_prefix_tokens:]  # (B, num_patches)
 
         num_patches = cls_attention.size(1)
         grid_size = int(round(num_patches ** 0.5))
@@ -504,8 +567,9 @@ def build_explainers(model: nn.Module, model_name: str) -> list[tuple[str, str, 
     Explainers available for an architecture, as (key, label, instance).
 
     Grad-CAM for every model so results are comparable across architectures;
-    Attention Rollout additionally for ViT as a native second view. Shared by
-    the qualitative sampler and the localization scorer so the two can never
+    Attention Rollout additionally for ViT-S/16 as a native second view — it is
+    not defined for SwinV2 or MaxViT, see the module docstring. Shared by the
+    qualitative sampler and the localization scorer so the two can never
     disagree about which methods exist.
 
     Grad-CAM instances attach hooks — call remove_hooks() when finished.
@@ -513,7 +577,7 @@ def build_explainers(model: nn.Module, model_name: str) -> list[tuple[str, str, 
     explainers: list[tuple[str, str, object]] = []
     if model_name in GRADCAM_TARGETS:
         explainers.append(("gradcam", "Grad-CAM", GradCAM(model, model_name=model_name)))
-    if model_name == "vit_b_16":
+    if model_name == "vit_s_16":
         explainers.append(("rollout", "Attention Rollout", AttentionRollout(model)))
     return explainers
 
@@ -539,9 +603,9 @@ def generate_explanations(
     Generate and save XAI visualizations for a trained model.
 
     Grad-CAM runs for every architecture, so heatmaps are comparable across
-    models. ViT-B/16 additionally gets Attention Rollout as a native second
+    models. ViT-S/16 additionally gets Attention Rollout as a native second
     view. Output goes to xai/<model>/<method>/, which makes it easy to line up
-    one method across all four models.
+    one method across all five models.
 
     Args:
         model: Trained model (already on the right device, in eval mode).

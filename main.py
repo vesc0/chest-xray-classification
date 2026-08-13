@@ -3,7 +3,7 @@ Main entry point for the chest X-ray classification pipeline.
 
 Usage:
   python main.py --model densenet121
-  python main.py --model vit_b_16
+  python main.py --model vit_s_16
   python main.py --model all
   python main.py --model densenet121 --eval-only
   python main.py --model all --subset 5000 --experiment my_run

@@ -176,15 +176,18 @@ def _split_backbone_head_params(model: nn.Module) -> tuple[list[nn.Parameter], l
     backbone = model.backbone
     head_module = None
 
-    # DenseNet / EfficientNet
+    # DenseNet / MaxViT
     if hasattr(backbone, "classifier"):
         head_module = backbone.classifier
 
-    # ViT
+    # torchvision's ViT. No model in the current roster uses this name — the
+    # ViT slot comes from timm and lands on `head` below — but the attribute
+    # is what distinguishes it, and the fallthrough at the bottom returns an
+    # empty head, which would leave head_only mode training nothing at all.
     elif hasattr(backbone, "heads"):
         head_module = backbone.heads
 
-    # Swin / SwinV2
+    # SwinV2 / ViT-S (timm) / ConvNeXtV2 (timm)
     elif hasattr(backbone, "head"):
         head_module = backbone.head
 

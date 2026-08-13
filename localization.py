@@ -7,7 +7,15 @@ to the paper. The model is never trained on boxes — this asks whether a
 classifier trained on image-level labels happens to look in the right place.
 
 Every explainer the architecture supports is scored on identical instances with
-identical metrics: Grad-CAM for all four models, plus Attention Rollout for ViT.
+identical metrics: Grad-CAM for all five models, plus Attention Rollout for
+ViT-S/16.
+
+One caveat when reading the overlap metrics across architectures: ViT-S/16
+produces a 14x14 Grad-CAM grid where the other four produce 7x7, so its
+predicted boxes are finer before either is upsampled to 224. That favours ViT on
+IoU and IoBB specifically. The pointing game is far less sensitive to grid size
+and is the fairer cross-architecture comparison.
+
 Rollout is class-agnostic, so it produces one map per image regardless of the
 annotated class — the per-class rows remain well defined but measure where the
 model attends overall rather than evidence for that class. That flag is recorded

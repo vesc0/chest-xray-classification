@@ -18,6 +18,10 @@
 # Core ML
 torch>=2.1.0,<3.0.0
 torchvision>=0.16.0,<1.0.0
+# Backbone source for ViT-S/16 and ConvNeXtV2-T, neither of which torchvision
+# ships. The exact weight tags are pinned in models.py, because a timm model
+# name maps to several checkpoints that differ in pretraining data.
+timm>=1.0.0,<2.0.0
 
 # Data & metrics
 numpy>=1.24.0,<3.0.0
