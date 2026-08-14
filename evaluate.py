@@ -26,7 +26,6 @@ from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
     f1_score,
-    fbeta_score,
     hamming_loss as sk_hamming_loss,
     precision_score,
     recall_score,
@@ -135,52 +134,164 @@ def apply_thresholds(probs: np.ndarray, thresholds: np.ndarray | float | None) -
     return (probs >= thresholds).astype(np.int32)
 
 
-def _threshold_objective(
-    labels: np.ndarray,
-    probs: np.ndarray,
-    threshold: float,
-) -> tuple[float, float, float]:
-    """Score a decision threshold and return (objective, precision, recall)."""
-    preds = (probs >= threshold).astype(np.int32)
-    precision = precision_score(labels, preds, zero_division=0)
-    recall = recall_score(labels, preds, zero_division=0)
+THRESHOLD_METRICS = ("f1", "fbeta", "youden", "sensitivity")
 
-    metric_name = config.THRESHOLD_METRIC.lower()
-    if metric_name == "f1":
-        score = f1_score(labels, preds, zero_division=0)
-    elif metric_name == "fbeta":
-        score = fbeta_score(labels, preds, beta=config.THRESHOLD_BETA, zero_division=0)
-    elif metric_name == "youden":
-        negatives = len(labels) - labels.sum()
-        tn = int(((preds == 0) & (labels == 0)).sum())
-        specificity = tn / negatives if negatives > 0 else 0.0
-        score = recall + specificity - 1.0
-    else:
+
+def resolve_threshold_metric() -> str:
+    """Validate config.THRESHOLD_METRIC up front and return it normalized."""
+    metric_name = str(config.THRESHOLD_METRIC).lower()
+    if metric_name not in THRESHOLD_METRICS:
         raise ValueError(
             f"Unsupported threshold metric '{config.THRESHOLD_METRIC}'. "
-            "Use one of: f1, fbeta, youden."
+            f"Use one of: {', '.join(THRESHOLD_METRICS)}."
         )
+    return metric_name
 
-    return float(score), float(precision), float(recall)
+
+def _safe_divide(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
+    """Elementwise ratio, zero wherever the denominator is zero."""
+    numerator = np.asarray(numerator, dtype=np.float64)
+    denominator = np.asarray(denominator, dtype=np.float64)
+    return np.divide(
+        numerator,
+        denominator,
+        out=np.zeros(np.broadcast(numerator, denominator).shape, dtype=np.float64),
+        where=denominator > 0,
+    )
+
+
+def confusion_sweep(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Confusion counts at every distinct predicted score.
+
+    The candidates are the scores the model actually produced — the same set
+    behind sklearn's precision_recall_curve — so no achievable operating point
+    is out of reach and none of them is unreachable. A fixed grid fails on both
+    counts: it cannot express an optimum outside its bounds, and on a rare class
+    whose scores all sit below the grid's floor every grid point scores zero, so
+    the search returns the floor with all-negative predictions.
+
+    Sorting once and taking a cumulative sum gives all four counts in one pass,
+    which also replaces the previous 91 x 3 scalar sklearn calls per class.
+
+    Returns (thresholds, tp, fp, fn, tn) in descending threshold order, matching
+    the `probs >= threshold` rule apply_thresholds() uses: index 0 is the
+    strictest point and the last index predicts every sample positive. Recall is
+    therefore non-decreasing in the index.
+    """
+    order = np.argsort(-y_prob, kind="mergesort")
+    sorted_true = y_true[order].astype(np.int64)
+    sorted_prob = y_prob[order]
+
+    # One candidate per distinct score. Tied scores have to enter the positive
+    # set together, or the counts describe a split no threshold can produce.
+    last_of_run = np.r_[np.flatnonzero(np.diff(sorted_prob)), sorted_prob.size - 1]
+
+    true_positive = np.cumsum(sorted_true)[last_of_run]
+    false_positive = (last_of_run + 1) - true_positive
+
+    positives = int(sorted_true.sum())
+    negatives = sorted_true.size - positives
+
+    return (
+        sorted_prob[last_of_run],
+        true_positive,
+        false_positive,
+        positives - true_positive,
+        negatives - false_positive,
+    )
+
+
+def _fbeta_curve(precision: np.ndarray, recall: np.ndarray, beta: float) -> np.ndarray:
+    """F-beta at every candidate, zero where precision and recall are both zero."""
+    beta_squared = beta * beta
+    return _safe_divide(
+        (1.0 + beta_squared) * precision * recall,
+        beta_squared * precision + recall,
+    )
+
+
+def select_candidate(
+    true_positive: np.ndarray,
+    false_positive: np.ndarray,
+    false_negative: np.ndarray,
+    true_negative: np.ndarray,
+    metric_name: str | None = None,
+) -> dict[str, float | int]:
+    """
+    Pick one candidate from a confusion sweep under the configured objective.
+
+    Returns the chosen index alongside the rates there, so the caller can record
+    what the operating point actually costs rather than only its score.
+    """
+    metric_name = resolve_threshold_metric() if metric_name is None else metric_name
+
+    precision = _safe_divide(true_positive, true_positive + false_positive)
+    recall = _safe_divide(true_positive, true_positive + false_negative)
+    specificity = _safe_divide(true_negative, true_negative + false_positive)
+
+    if metric_name == "sensitivity":
+        target = float(config.THRESHOLD_TARGET_SENSITIVITY)
+        reaches_target = recall >= target
+        # Recall only grows with the index, so the first candidate to clear the
+        # target is also the most specific one that does. The last index
+        # predicts everything positive and has recall 1.0, so this is always
+        # reachable — the fallback is defensive only.
+        index = int(np.argmax(reaches_target)) if reaches_target.any() else recall.size - 1
+        score = float(specificity[index])
+    else:
+        if metric_name == "youden":
+            objective = recall + specificity - 1.0
+        else:
+            beta = 1.0 if metric_name == "f1" else float(config.THRESHOLD_BETA)
+            objective = _fbeta_curve(precision, recall, beta)
+
+        # Ties break toward recall, which increases with the index, so take the
+        # last member of a tied run rather than the first.
+        tied = np.flatnonzero(objective >= objective.max() - 1e-12)
+        index = int(tied[-1])
+        score = float(objective[index])
+
+    return {
+        "index": index,
+        "objective": score,
+        "precision": float(precision[index]),
+        "recall": float(recall[index]),
+        "specificity": float(specificity[index]),
+    }
 
 
 def tune_thresholds(
     labels: np.ndarray,
     probs: np.ndarray,
-) -> tuple[np.ndarray, dict[str, dict[str, float | int | str]]]:
+) -> tuple[np.ndarray, dict[str, dict[str, float | int | str | None]]]:
     """
-    Tune one threshold per class using the validation set.
+    Fit one threshold per class on the validation set.
 
-    Classes with too few positives fall back to config.DEFAULT_THRESHOLD to
-    avoid unstable operating points.
+    Two situations fall back to config.DEFAULT_THRESHOLD rather than returning a
+    fitted number, and each records why:
+
+      "default"    - too few positives to fit anything stable, or the class has
+                     only one outcome present.
+      "degenerate" - no candidate threshold scored above zero, so no operating
+                     point separates anything.
+
+    "degenerate" is unreachable for f1 and fbeta by construction: the lowest
+    candidate is the smallest score the model produced, predicting every sample
+    positive, so recall is 1 and F1 is positive whenever the class has a single
+    positive. That is the guarantee the old fixed grid could not make — with a
+    floor of 0.05 and a rare class scored entirely below it, every grid point
+    scored zero and the search returned 0.05, labelled it "tuned", and predicted
+    the class negative everywhere. The status is still checked because Youden
+    and the fixed-sensitivity rule can legitimately reach it: both go to zero or
+    below for a class the model cannot rank at all.
     """
+    metric_name = resolve_threshold_metric()
     thresholds = np.full(labels.shape[1], config.DEFAULT_THRESHOLD, dtype=np.float32)
-    summary: dict[str, dict[str, float | int | str]] = {}
-    threshold_grid = np.linspace(
-        config.THRESHOLD_MIN,
-        config.THRESHOLD_MAX,
-        config.THRESHOLD_STEPS,
-    )
+    summary: dict[str, dict[str, float | int | str | None]] = {}
 
     for class_idx, class_name in enumerate(config.CLASS_NAMES):
         y_true = labels[:, class_idx]
@@ -193,54 +304,81 @@ def tune_thresholds(
                 "objective": None,
                 "support": support,
                 "status": "default",
+                "reason": (
+                    f"support {support} below THRESHOLD_MIN_SUPPORT "
+                    f"{config.THRESHOLD_MIN_SUPPORT}"
+                    if support < config.THRESHOLD_MIN_SUPPORT
+                    else "only one outcome present in validation"
+                ),
             }
             continue
 
-        best_threshold = float(config.DEFAULT_THRESHOLD)
-        best_score = float("-inf")
-        best_precision = 0.0
-        best_recall = 0.0
+        candidates, *counts = confusion_sweep(y_true, y_prob)
+        best = select_candidate(*counts, metric_name=metric_name)
 
-        for threshold in threshold_grid:
-            score, precision, recall = _threshold_objective(y_true, y_prob, float(threshold))
+        if not np.isfinite(best["objective"]) or best["objective"] <= 0.0:
+            summary[class_name] = {
+                "threshold": float(config.DEFAULT_THRESHOLD),
+                "objective": round(float(best["objective"]), 4),
+                "support": support,
+                "status": "degenerate",
+                "reason": (
+                    f"no candidate threshold scored above zero under "
+                    f"'{metric_name}'; max predicted score was "
+                    f"{float(y_prob.max()):.4g}"
+                ),
+            }
+            continue
 
-            # Small tie-break bias toward recall
-            if (
-                score > best_score + 1e-8
-                or (
-                    abs(score - best_score) <= 1e-8
-                    and recall > best_recall + 1e-8
-                )
-            ):
-                best_threshold = float(threshold)
-                best_score = score
-                best_precision = precision
-                best_recall = recall
-
-        thresholds[class_idx] = best_threshold
+        thresholds[class_idx] = candidates[best["index"]]
         summary[class_name] = {
-            "threshold": round(best_threshold, 4),
-            "objective": round(best_score, 4),
-            "precision": round(best_precision, 4),
-            "recall": round(best_recall, 4),
+            "threshold": round(float(candidates[best["index"]]), 4),
+            "objective": round(float(best["objective"]), 4),
+            "precision": round(float(best["precision"]), 4),
+            "recall": round(float(best["recall"]), 4),
+            "specificity": round(float(best["specificity"]), 4),
             "support": support,
+            "num_candidates": int(candidates.size),
             "status": "tuned",
         }
 
     return thresholds, summary
 
 
+def threshold_settings() -> dict:
+    """
+    Every setting that determines which thresholds come out of tune_thresholds.
+
+    Recorded next to the thresholds themselves, so a thresholds file can be
+    reproduced from its own contents rather than from whatever config.py happens
+    to say later.
+    """
+    metric_name = str(config.THRESHOLD_METRIC).lower()
+    settings = {
+        "threshold_metric": metric_name,
+        "default_threshold": config.DEFAULT_THRESHOLD,
+        "min_support": config.THRESHOLD_MIN_SUPPORT,
+        "candidate_source": "distinct validation scores",
+    }
+    if metric_name == "fbeta":
+        settings["beta"] = config.THRESHOLD_BETA
+    if metric_name == "sensitivity":
+        settings["target_sensitivity"] = config.THRESHOLD_TARGET_SENSITIVITY
+    return settings
+
+
 def save_thresholds(
     thresholds: np.ndarray,
-    tuning_summary: dict[str, dict[str, float | int | str]],
+    tuning_summary: dict[str, dict[str, float | int | str | None]],
     model_name: str,
+    num_val_samples: int | None = None,
 ) -> Path:
     """Persist tuned thresholds for reproducible evaluation and XAI."""
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     path = config.RESULTS_DIR / f"{model_name}_thresholds.json"
     payload = {
-        "threshold_metric": config.THRESHOLD_METRIC,
-        "default_threshold": config.DEFAULT_THRESHOLD,
+        **threshold_settings(),
+        "num_val_samples": num_val_samples,
         "thresholds": {
             class_name: round(float(thresholds[idx]), 4)
             for idx, class_name in enumerate(config.CLASS_NAMES)
@@ -253,6 +391,66 @@ def save_thresholds(
     return path
 
 
+def save_predictions(
+    labels: np.ndarray,
+    probs: np.ndarray,
+    model_name: str,
+    split: str,
+    groups: np.ndarray | None = None,
+) -> Path | None:
+    """
+    Persist the raw labels and probabilities behind one split's metrics.
+
+    This is what makes every thresholding decision reversible. Without it,
+    switching from F1 to a fixed-sensitivity operating point — or putting a
+    confidence interval on a tuned threshold — means re-running inference on
+    every model. With it, all of that is a post-hoc script over ~1 MB of arrays.
+
+    Patient IDs are stored alongside so the post-hoc analysis can resample by
+    patient the way the in-run bootstrap does.
+    """
+    if not config.SAVE_PREDICTIONS:
+        return None
+
+    config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    path = config.RESULTS_DIR / f"{model_name}_{split}_predictions.npz"
+
+    payload = {
+        # int8 labels and float32 probabilities: the arrays are multi-hot and
+        # the probabilities came out of a float32 forward pass, so nothing is
+        # lost and the file stays small enough to keep for every model.
+        "labels": labels.astype(np.int8),
+        "probs": probs.astype(np.float32),
+        "class_names": np.asarray(config.CLASS_NAMES),
+    }
+    if groups is not None:
+        payload["groups"] = np.asarray(groups)
+
+    np.savez_compressed(path, **payload)
+    print(f"[evaluate] {split.capitalize()} predictions saved -> {path}")
+    return path
+
+
+def load_predictions(model_name: str, split: str) -> dict[str, np.ndarray]:
+    """Read back what save_predictions() wrote."""
+    path = config.RESULTS_DIR / f"{model_name}_{split}_predictions.npz"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"No saved {split} predictions at {path}. Re-run evaluation with "
+            "config.SAVE_PREDICTIONS enabled."
+        )
+    with np.load(path, allow_pickle=False) as archive:
+        return {key: archive[key] for key in archive.files}
+
+
+def _loader_patient_groups(loader: DataLoader) -> np.ndarray | None:
+    """Patient IDs for a loader, or None when they cannot be read off it."""
+    try:
+        return patient_groups(loader)
+    except (ValueError, KeyError, AttributeError):
+        return None
+
+
 def calibrate_thresholds(
     model: nn.Module,
     val_loader: DataLoader,
@@ -262,32 +460,82 @@ def calibrate_thresholds(
     device = next(model.parameters()).device
     print(f"[evaluate] Calibrating thresholds on the validation set ({len(val_loader.dataset)} samples) ...")
     labels, probs, _ = collect_predictions(model, val_loader, device)
+
+    save_predictions(labels, probs, model_name, "val", groups=_loader_patient_groups(val_loader))
+
     thresholds, summary = tune_thresholds(labels, probs)
-    save_thresholds(thresholds, summary, model_name)
+
+    fallbacks = [name for name, entry in summary.items() if entry["status"] != "tuned"]
+    if fallbacks:
+        print(
+            f"[evaluate] {len(fallbacks)} class(es) left at the default threshold "
+            f"({config.DEFAULT_THRESHOLD}): {', '.join(fallbacks)}"
+        )
+
+    save_thresholds(thresholds, summary, model_name, num_val_samples=int(labels.shape[0]))
     return thresholds
+
+
+def _calibration_bin_edges(probs: np.ndarray, num_bins: int, strategy: str) -> np.ndarray:
+    """Bin boundaries for one class's predictions under the chosen strategy."""
+    if strategy == "uniform":
+        return np.linspace(0.0, 1.0, num_bins + 1)
+
+    if strategy != "quantile":
+        raise ValueError(
+            f"Unsupported ECE bin strategy '{strategy}'. Use one of: quantile, uniform."
+        )
+
+    # Heavy ties collapse neighbouring quantiles onto the same value; unique
+    # merges them rather than leaving empty bins that contribute nothing.
+    edges = np.unique(np.quantile(probs, np.linspace(0.0, 1.0, num_bins + 1)))
+    if edges.size < 2:
+        # Every prediction is the same number: one bin that contains them all.
+        return np.array([edges[0], np.nextafter(edges[0], np.inf)])
+    return edges
 
 
 def _expected_calibration_error(
     labels: np.ndarray,
     probs: np.ndarray,
-    num_bins: int = config.ECE_BINS,
+    num_bins: int | None = None,
+    strategy: str | None = None,
 ) -> float:
-    """Compute binary expected calibration error for one class."""
-    bins = np.linspace(0.0, 1.0, num_bins + 1)
+    """
+    Binary expected calibration error for one class.
+
+    Config is read at call time rather than bound as a default argument, so a
+    runtime override reaches this the way it reaches every other setting.
+
+    Uniform bins are the textbook definition and are close to useless on the
+    rare classes here: nearly every prediction for a 0.16%-prevalence label
+    lands in the first bin, that bin is trivially well calibrated because the
+    disease really is that rare, and it carries almost all of the weight. The
+    class then scores an excellent ECE for knowing nothing about radiographs.
+    Quantile bins give each bin the same number of predictions instead, which
+    spreads that mass out and exposes whatever structure is inside it.
+    """
+    if probs.size == 0:
+        return 0.0
+
+    num_bins = config.ECE_BINS if num_bins is None else num_bins
+    strategy = (config.ECE_BIN_STRATEGY if strategy is None else strategy).lower()
+    edges = _calibration_bin_edges(probs, int(num_bins), strategy)
+
+    # Bins are (lower, upper], with the first extended down to include its own
+    # lower edge. Closing the top bin is what keeps a p = 1.0 prediction from
+    # falling outside every bin and being dropped from the average.
+    assignment = np.clip(np.searchsorted(edges, probs, side="left") - 1, 0, edges.size - 2)
+
     ece = 0.0
-
-    for start, end in zip(bins[:-1], bins[1:]):
-        if end == 1.0:
-            mask = (probs >= start) & (probs <= end)
-        else:
-            mask = (probs >= start) & (probs < end)
-
-        if not np.any(mask):
+    for bin_index in range(edges.size - 1):
+        mask = assignment == bin_index
+        count = int(mask.sum())
+        if count == 0:
             continue
-
         confidence = probs[mask].mean()
         accuracy = labels[mask].mean()
-        ece += np.abs(confidence - accuracy) * (mask.sum() / len(probs))
+        ece += abs(confidence - accuracy) * (count / probs.size)
 
     return float(ece)
 
@@ -365,13 +613,44 @@ def _percentile_ci(values: list[float]) -> list[float] | None:
     return [round(float(lower), 4), round(float(upper), 4)]
 
 
+def _rows_by_group(groups: np.ndarray) -> list[np.ndarray]:
+    """
+    Row indices belonging to each group, precomputed once.
+
+    Sorting and splitting is O(n log n); testing `inverse == g` once per group
+    is O(groups x rows), which on the test split is 2.8k patients scanned
+    against 25.6k rows for the same answer.
+    """
+    _, inverse = np.unique(groups, return_inverse=True)
+    order = np.argsort(inverse, kind="stable")
+    boundaries = np.flatnonzero(np.diff(inverse[order])) + 1
+    return np.split(order, boundaries)
+
+
+def _thresholded_rates(
+    labels: np.ndarray,
+    preds: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Per-class precision, recall and F1 from the confusion counts.
+
+    Matches sklearn's zero_division=0 convention, computed over all classes at
+    once so it costs nothing inside the bootstrap loop.
+    """
+    true_positive = np.logical_and(preds, labels).sum(axis=0)
+    precision = _safe_divide(true_positive, preds.sum(axis=0))
+    recall = _safe_divide(true_positive, labels.sum(axis=0))
+    return precision, recall, _safe_divide(2.0 * precision * recall, precision + recall)
+
+
 def bootstrap_cis(
     labels: np.ndarray,
     probs: np.ndarray,
+    preds: np.ndarray | None = None,
     groups: np.ndarray | None = None,
 ) -> dict:
     """
-    Percentile confidence intervals for per-class and macro AUROC / AUPRC.
+    Percentile confidence intervals for the per-class and macro metrics.
 
     Resamples the evaluation set with replacement and recomputes the metrics;
     no retraining is involved, so this is the cheap way to turn five point
@@ -382,9 +661,13 @@ def bootstrap_cis(
     correlated, so an image-level bootstrap treats correlated observations as
     independent and produces an interval that is too narrow.
 
-    Only the threshold-free metrics get intervals. Precision/recall/F1 depend on
-    thresholds calibrated on the validation set, so an interval around them would
-    blend test-set sampling noise with calibration noise and mean neither.
+    Passing `preds` adds intervals for precision/recall/F1. Those thresholds
+    were frozen on validation before the test set was touched, so resampling
+    test rows at a fixed operating point is an ordinary sampling interval and
+    means exactly what the AUROC interval means. It is also where the intervals
+    are needed most: Hernia's test F1 rests on 86 positives. What this does not
+    capture is uncertainty in the threshold itself — that needs resampling the
+    validation set, which threshold_analysis.py does.
 
     Returns a dict with "per_class", "macro", and the settings used.
     """
@@ -392,11 +675,8 @@ def bootstrap_cis(
     num_rows, num_classes = labels.shape
     rng = np.random.default_rng(config.SEED)
 
-    # Precompute each group's row indices once; resampling is then a draw over
-    # groups plus one concatenate, rather than a scan of the whole array.
     if groups is not None:
-        _, inverse = np.unique(groups, return_inverse=True)
-        rows_by_group = [np.flatnonzero(inverse == g) for g in range(inverse.max() + 1)]
+        rows_by_group = _rows_by_group(groups)
         num_groups = len(rows_by_group)
         unit = "patient"
     else:
@@ -408,6 +688,12 @@ def bootstrap_cis(
     auprc_draws: list[list[float]] = [[] for _ in range(num_classes)]
     macro_auroc_draws: list[float] = []
     macro_auprc_draws: list[float] = []
+
+    point_metrics = ("precision", "recall", "f1")
+    point_draws: dict[str, list[list[float]]] = {
+        name: [[] for _ in range(num_classes)] for name in point_metrics
+    }
+    macro_point_draws: dict[str, list[float]] = {name: [] for name in point_metrics}
 
     for _ in range(num_samples):
         if rows_by_group is None:
@@ -437,6 +723,34 @@ def bootstrap_cis(
         if macro_auprc is not None:
             macro_auprc_draws.append(macro_auprc)
 
+        if preds is not None:
+            rates = dict(zip(point_metrics, _thresholded_rates(sample_labels, preds[index])))
+            for name, values in rates.items():
+                for class_idx in range(num_classes):
+                    point_draws[name][class_idx].append(float(values[class_idx]))
+                # Matches f1_score(average="macro"): the mean over every class,
+                # including the ones that scored zero.
+                macro_point_draws[name].append(float(values.mean()))
+
+    per_class = {}
+    for idx, class_name in enumerate(config.CLASS_NAMES):
+        entry = {
+            "auroc": _percentile_ci(auroc_draws[idx]),
+            "auprc": _percentile_ci(auprc_draws[idx]),
+        }
+        if preds is not None:
+            entry.update(
+                {name: _percentile_ci(point_draws[name][idx]) for name in point_metrics}
+            )
+        per_class[class_name] = entry
+
+    macro = {
+        "auroc": _percentile_ci(macro_auroc_draws),
+        "auprc": _percentile_ci(macro_auprc_draws),
+    }
+    if preds is not None:
+        macro.update({name: _percentile_ci(macro_point_draws[name]) for name in point_metrics})
+
     return {
         "settings": {
             "samples": num_samples,
@@ -444,18 +758,10 @@ def bootstrap_cis(
             "resampling_unit": unit,
             "num_units": int(num_groups),
             "seed": config.SEED,
+            "includes_thresholded_metrics": preds is not None,
         },
-        "per_class": {
-            class_name: {
-                "auroc": _percentile_ci(auroc_draws[idx]),
-                "auprc": _percentile_ci(auprc_draws[idx]),
-            }
-            for idx, class_name in enumerate(config.CLASS_NAMES)
-        },
-        "macro": {
-            "auroc": _percentile_ci(macro_auroc_draws),
-            "auprc": _percentile_ci(macro_auprc_draws),
-        },
+        "per_class": per_class,
+        "macro": macro,
     }
 
 
@@ -465,6 +771,7 @@ def compute_metrics(
     preds: np.ndarray,
     thresholds: np.ndarray | float | None = None,
     groups: np.ndarray | None = None,
+    threshold_status: dict[str, str] | None = None,
 ) -> dict:
     """
     Compute a comprehensive set of evaluation metrics.
@@ -477,9 +784,14 @@ def compute_metrics(
         groups: Optional per-row grouping (patient IDs) for the bootstrap, so
             correlated studies from one patient resample together. Ignored when
             config.BOOTSTRAP_ENABLED is False.
+        threshold_status: Per-class outcome from tune_thresholds. Carried into
+            the report so a class left at the default is not read as a fitted
+            operating point that happened to score badly — at Hernia's
+            prevalence those two look identical in the table and mean opposite
+            things.
 
     Returns a dict containing per-class, macro, micro, and calibration figures,
-    plus bootstrap confidence intervals on AUROC/AUPRC when enabled.
+    plus bootstrap confidence intervals when enabled.
     """
     if thresholds is None:
         thresholds = np.full(labels.shape[1], config.DEFAULT_THRESHOLD, dtype=np.float32)
@@ -529,6 +841,7 @@ def compute_metrics(
 
         results["per_class"][class_name] = {
             "threshold": round(float(thresholds[class_idx]), 4),
+            "threshold_status": (threshold_status or {}).get(class_name),
             "auroc": round(float(auroc), 4) if not np.isnan(auroc) else None,
             "auprc": round(float(auprc), 4) if not np.isnan(auprc) else None,
             "precision": round(float(precision_score(targets, predictions, zero_division=0)), 4),
@@ -557,11 +870,21 @@ def compute_metrics(
         float(f1_score(labels, preds, average="macro", zero_division=0)),
         4,
     )
+    # zero_division=1, not 0. A study with no findings has an empty true label
+    # set, and predicting it correctly leaves precision and recall both 0/0;
+    # scoring that row 0.0 punishes the right answer. 38.5% of the official test
+    # split is No Finding, so under zero_division=0 a *perfect* model scores
+    # 0.615 here and the metric cannot be read at all. The price is that an
+    # all-negative model now collects those rows for free, which is what the
+    # baseline below is for.
+    all_negative_rows = float((labels.sum(axis=1) == 0).mean())
     results["macro"]["samples_f1"] = round(
-        float(f1_score(labels, preds, average="samples", zero_division=0)),
+        float(f1_score(labels, preds, average="samples", zero_division=1)),
         4,
     )
+    results["macro"]["all_negative_samples_f1_baseline"] = round(all_negative_rows, 4)
     results["macro"]["subset_accuracy"] = round(float(accuracy_score(labels, preds)), 4)
+    results["macro"]["all_negative_subset_accuracy_baseline"] = round(all_negative_rows, 4)
     results["macro"]["sample_accuracy"] = round(
         float(((preds == labels).sum(axis=1) / labels.shape[1]).mean()),
         4,
@@ -596,6 +919,9 @@ def compute_metrics(
     # Calibration metrics
     results["calibration"]["macro_brier"] = round(float(np.mean(per_class_brier)), 4)
     results["calibration"]["macro_ece"] = round(float(np.mean(per_class_ece)), 4)
+    # The binning changes what the number means, so it travels with it
+    results["calibration"]["ece_bins"] = int(config.ECE_BINS)
+    results["calibration"]["ece_bin_strategy"] = str(config.ECE_BIN_STRATEGY).lower()
 
     # Bootstrap intervals, attached alongside the point estimates they belong to
     if config.BOOTSTRAP_ENABLED:
@@ -603,15 +929,15 @@ def compute_metrics(
             f"[evaluate] Bootstrapping {config.BOOTSTRAP_SAMPLES} resamples "
             f"({'patient' if groups is not None else 'image'}-level) ..."
         )
-        intervals = bootstrap_cis(labels, probs, groups=groups)
+        intervals = bootstrap_cis(labels, probs, preds=preds, groups=groups)
         results["bootstrap"] = intervals["settings"]
 
         for class_name, class_cis in intervals["per_class"].items():
-            results["per_class"][class_name]["auroc_ci"] = class_cis["auroc"]
-            results["per_class"][class_name]["auprc_ci"] = class_cis["auprc"]
+            for metric_name, bounds in class_cis.items():
+                results["per_class"][class_name][f"{metric_name}_ci"] = bounds
 
-        results["macro"]["auroc_ci"] = intervals["macro"]["auroc"]
-        results["macro"]["auprc_ci"] = intervals["macro"]["auprc"]
+        for metric_name, bounds in intervals["macro"].items():
+            results["macro"][f"{metric_name}_ci"] = bounds
     else:
         results["bootstrap"] = None
 
@@ -623,33 +949,52 @@ def compute_metrics(
 # =============================================================================
 def print_results(results: dict, model_name: str) -> None:
     """Print a formatted summary table of evaluation results."""
-    print(f"\n{'=' * 96}")
-    print(f"  Evaluation Results - {model_name}")
-    print(f"{'=' * 96}")
-
     bootstrap = results.get("bootstrap")
+    ci_width = 16
+    ci_pad = " " * ci_width if bootstrap else ""
 
     def interval(metrics: dict, key: str) -> str:
-        """Render a CI as [lo, hi], or blank when there isn't one."""
+        """Render a CI as [lo, hi], padded, or blank when there isn't one."""
+        if not bootstrap:
+            return ""
         bounds = metrics.get(key)
-        return f"[{bounds[0]:.3f}, {bounds[1]:.3f}]" if bounds else ""
+        text = f"[{bounds[0]:.3f}, {bounds[1]:.3f}]" if bounds else ""
+        return f"{text:>{ci_width}}"
 
-    ci_header = f"{'AUROC ' + str(int(config.BOOTSTRAP_CI * 100)) + '% CI':>16}" if bootstrap else ""
+    def ci_label(metric_name: str) -> str:
+        if not bootstrap:
+            return ""
+        return f"{metric_name + ' ' + f'{config.BOOTSTRAP_CI:.0%}'.strip() + ' CI':>{ci_width}}"
+
     header = (
-        f"{'Class':<22} {'Thr':>6} {'AUROC':>8}{ci_header} {'AUPRC':>8} "
-        f"{'Prec':>7} {'Recall':>7} {'F1':>7} {'Support':>8}"
+        f"{'Class':<22} {'Thr':>7} {'AUROC':>8}{ci_label('AUROC')} {'AUPRC':>8} "
+        f"{'Prec':>7} {'Recall':>7} {'F1':>7}{ci_label('F1')} {'ECE':>7} {'Support':>8}"
     )
+    rule = "=" * len(header)
+
+    print(f"\n{rule}")
+    print(f"  Evaluation Results - {model_name}")
+    print(rule)
     print(header)
     print("-" * len(header))
 
+    # A class left at the default threshold is not a fitted operating point that
+    # scored badly, and in the table those two are indistinguishable
+    not_tuned = []
     for class_name, metrics in results["per_class"].items():
         auroc = f"{metrics['auroc']:.4f}" if metrics["auroc"] is not None else "N/A"
         auprc = f"{metrics['auprc']:.4f}" if metrics["auprc"] is not None else "N/A"
-        auroc_ci = f"{interval(metrics, 'auroc_ci'):>16}" if bootstrap else ""
+        status = metrics.get("threshold_status")
+        marker = "" if status in (None, "tuned") else "*"
+        if marker:
+            not_tuned.append(f"{class_name} ({status})")
+        threshold_text = f"{metrics['threshold']:.2f}{marker}"
         print(
-            f"{class_name:<22} {metrics['threshold']:>6.2f} {auroc:>8}{auroc_ci} {auprc:>8} "
+            f"{class_name:<22} {threshold_text:>7} "
+            f"{auroc:>8}{interval(metrics, 'auroc_ci')} {auprc:>8} "
             f"{metrics['precision']:>7.4f} {metrics['recall']:>7.4f} "
-            f"{metrics['f1']:>7.4f} {metrics['support']:>8d}"
+            f"{metrics['f1']:>7.4f}{interval(metrics, 'f1_ci')} "
+            f"{metrics['ece']:>7.4f} {metrics['support']:>8d}"
         )
 
     print("-" * len(header))
@@ -661,33 +1006,63 @@ def print_results(results: dict, model_name: str) -> None:
     macro_auprc = f"{macro['auprc']:.4f}" if macro["auprc"] is not None else "N/A"
     micro_auprc = f"{micro['auprc']:.4f}" if micro["auprc"] is not None else "N/A"
 
-    macro_ci = f"{interval(macro, 'auroc_ci'):>16}" if bootstrap else ""
     print(
-        f"{'Macro average':<22} {'-':>6} {macro_auroc:>8}{macro_ci} {macro_auprc:>8} "
-        f"{macro['precision']:>7.4f} {macro['recall']:>7.4f} {macro['f1']:>7.4f}"
+        f"{'Macro average':<22} {'-':>7} "
+        f"{macro_auroc:>8}{interval(macro, 'auroc_ci')} {macro_auprc:>8} "
+        f"{macro['precision']:>7.4f} {macro['recall']:>7.4f} "
+        f"{macro['f1']:>7.4f}{interval(macro, 'f1_ci')} "
+        f"{calibration['macro_ece']:>7.4f}"
     )
-    ci_pad = " " * 16 if bootstrap else ""
     print(
-        f"{'Micro average':<22} {'-':>6} {'-':>8}{ci_pad} {micro_auprc:>8} "
-        f"{micro['precision']:>7.4f} {micro['recall']:>7.4f} {micro['f1']:>7.4f}"
+        f"{'Micro average':<22} {'-':>7} {'-':>8}{ci_pad} {micro_auprc:>8} "
+        f"{micro['precision']:>7.4f} {micro['recall']:>7.4f} "
+        f"{micro['f1']:>7.4f}{ci_pad}"
     )
 
+    if not_tuned:
+        print(
+            f"\n  * threshold not fitted, left at the default "
+            f"{config.DEFAULT_THRESHOLD}: {', '.join(not_tuned)}. Precision, "
+            f"recall and F1 for these classes are not tuned results — AUROC and "
+            f"AUPRC are threshold-free and unaffected."
+        )
+
     if bootstrap:
+        thresholded = (
+            " Precision/recall/F1 intervals hold the calibrated threshold fixed, so "
+            "they carry test-set sampling noise only."
+            if bootstrap.get("includes_thresholded_metrics")
+            else ""
+        )
         print(
             f"\n  {config.BOOTSTRAP_CI:.0%} CI from {bootstrap['samples']} bootstrap "
             f"resamples over {bootstrap['num_units']:,} {bootstrap['resampling_unit']}s. "
             f"Overlapping intervals between two models mean the gap is not resolved."
+            f"{thresholded}"
         )
-    print(f"  Samples F1:                      {macro['samples_f1']:.4f}")
-    print(f"  Subset accuracy:                 {macro['subset_accuracy']:.4f}")
-    print(f"  Sample accuracy:                 {macro['sample_accuracy']:.4f}")
+
+    # Each aggregate sits next to the score an all-negative model would get,
+    # because on labels this sparse the bare number reads far better than it is.
     print(
-        f"  All-negative sample baseline:    "
-        f"{macro['all_negative_sample_accuracy_baseline']:.4f}"
+        f"  Samples F1:                      {macro['samples_f1']:.4f}"
+        f"   (all-negative baseline {macro['all_negative_samples_f1_baseline']:.4f})"
+    )
+    print(
+        f"  Subset accuracy:                 {macro['subset_accuracy']:.4f}"
+        f"   (all-negative baseline {macro['all_negative_subset_accuracy_baseline']:.4f})"
+    )
+    print(
+        f"  Sample accuracy:                 {macro['sample_accuracy']:.4f}"
+        f"   (all-negative baseline {macro['all_negative_sample_accuracy_baseline']:.4f})"
     )
     print(f"  Hamming loss:                    {macro['hamming_loss']:.4f}")
     print(f"  Macro Brier score:               {calibration['macro_brier']:.4f}")
-    print(f"  Macro ECE:                       {calibration['macro_ece']:.4f}")
+    print(
+        f"  Macro ECE:                       {calibration['macro_ece']:.4f}"
+        f"   ({calibration['ece_bins']} {calibration['ece_bin_strategy']} bins; "
+        f"read the per-class column instead — the macro figure is dominated by "
+        f"the rare classes, where it means little)"
+    )
 
     # Derived screening metric — not part of the 14-class averages above
     screening = results.get("normal_vs_abnormal", {})
@@ -707,7 +1082,7 @@ def print_results(results: dict, model_name: str) -> None:
     training = timing.get("training") or {}
     inference = timing.get("inference") or {}
     if run or training or inference:
-        print(f"{'-' * 96}")
+        print("-" * len(header))
         trainable = run.get("trainable_params")
         trainable_str = (
             f"{trainable:,} trainable ({run.get('trainable_fraction') or 0:.2%})"
@@ -745,7 +1120,7 @@ def print_results(results: dict, model_name: str) -> None:
             f"model-only {inference['model_images_per_second']:.1f} img/s "
             f"({inference['model_ms_per_image']:.2f} ms/img)"
         )
-    print(f"{'=' * 96}\n")
+    print(f"{rule}\n")
 
 
 # Distribution names (not import names) of the packages that can move a
@@ -805,6 +1180,28 @@ def _load_previous_results(model_name: str) -> dict:
             return json.load(handle)
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def load_threshold_status(model_name: str) -> dict[str, str]:
+    """
+    Per-class tuning outcome from the thresholds file calibration just wrote.
+
+    Read back rather than passed down, so calibrate_thresholds keeps returning a
+    plain array and the notebooks that unpack it still work.
+    """
+    path = config.RESULTS_DIR / f"{model_name}_thresholds.json"
+    if not path.exists():
+        return {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            summary = json.load(handle).get("tuning_summary") or {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {
+        class_name: entry.get("status")
+        for class_name, entry in summary.items()
+        if isinstance(entry, dict)
+    }
 
 
 def save_results(results: dict, model_name: str) -> Path:
@@ -879,21 +1276,32 @@ def evaluate_model(
     labels, probs, inference_timing = collect_predictions(model, test_loader, device)
     preds = apply_thresholds(probs, thresholds)
 
+    # Read once and reused: the same IDs group the bootstrap and travel into the
+    # saved predictions so a post-hoc analysis can group the same way.
+    test_patients = _loader_patient_groups(test_loader)
+    save_predictions(labels, probs, model_name, "test", groups=test_patients)
+
     # Resample whole patients, so the interval accounts for several correlated
     # studies coming from the same person. Losing the grouping is not worth
     # losing the run over — fall back to image-level and say so.
     groups = None
     if config.BOOTSTRAP_ENABLED and config.BOOTSTRAP_GROUP_BY_PATIENT:
-        try:
-            groups = patient_groups(test_loader)
-        except (ValueError, KeyError, AttributeError) as error:
+        groups = test_patients
+        if groups is None:
             print(
-                f"[evaluate] WARNING: falling back to image-level bootstrap "
-                f"({error}). Intervals will be narrower than they should be."
+                "[evaluate] WARNING: patient IDs unavailable; falling back to an "
+                "image-level bootstrap. Intervals will be narrower than they should be."
             )
 
     print("[evaluate] Computing calibrated metrics ...")
-    results = compute_metrics(labels, probs, preds, thresholds=thresholds, groups=groups)
+    results = compute_metrics(
+        labels,
+        probs,
+        preds,
+        thresholds=thresholds,
+        groups=groups,
+        threshold_status=load_threshold_status(model_name),
+    )
 
     # Conditions the numbers above were produced under. total_params alone is
     # misleading: a head_only probe trains 14k of DenseNet-121's 7.0M.
@@ -906,7 +1314,9 @@ def evaluate_model(
         ),
         "total_params": total_params,
         # Conditions of *this* evaluation, always current
-        "threshold_metric": config.THRESHOLD_METRIC,
+        **threshold_settings(),
+        "ece_bins": config.ECE_BINS,
+        "ece_bin_strategy": str(config.ECE_BIN_STRATEGY).lower(),
         "batch_size": config.BATCH_SIZE,
         "num_workers": config.NUM_WORKERS,
         "device": device.type,

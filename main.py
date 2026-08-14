@@ -18,7 +18,7 @@ import torch
 import config
 from dataset import get_dataloaders
 from device import get_device
-from evaluate import calibrate_thresholds, evaluate_model
+from evaluate import THRESHOLD_METRICS, calibrate_thresholds, evaluate_model
 from explainability import generate_explanations
 from localization import evaluate_localization
 from models import build_model
@@ -212,14 +212,46 @@ def main():
         "--threshold-metric",
         type=str,
         default=None,
-        choices=["f1", "fbeta", "youden"],
-        help="Override the validation objective used for threshold tuning",
+        choices=list(THRESHOLD_METRICS),
+        help=(
+            "Validation objective used for threshold tuning. 'sensitivity' "
+            "fixes recall at --target-sensitivity and reports the most specific "
+            "threshold that reaches it"
+        ),
     )
     parser.add_argument(
         "--threshold-beta",
         type=float,
         default=None,
         help="Beta for fbeta threshold tuning",
+    )
+    parser.add_argument(
+        "--target-sensitivity",
+        type=float,
+        default=None,
+        help="Recall floor for --threshold-metric sensitivity (default 0.90)",
+    )
+    parser.add_argument(
+        "--ece-bins",
+        type=int,
+        default=None,
+        help="Override config.ECE_BINS",
+    )
+    parser.add_argument(
+        "--ece-bin-strategy",
+        type=str,
+        default=None,
+        choices=["quantile", "uniform"],
+        help="Equal-count (quantile) or equal-width (uniform) calibration bins",
+    )
+    parser.add_argument(
+        "--no-save-predictions",
+        action="store_true",
+        help=(
+            "Skip writing raw val/test probabilities. Saving them is the default: "
+            "it makes every alternative thresholding scheme a post-hoc script "
+            "instead of another inference pass"
+        ),
     )
 
     parser.add_argument(
@@ -279,6 +311,14 @@ def main():
         config.THRESHOLD_METRIC = args.threshold_metric
     if args.threshold_beta is not None:
         config.THRESHOLD_BETA = args.threshold_beta
+    if args.target_sensitivity is not None:
+        config.THRESHOLD_TARGET_SENSITIVITY = args.target_sensitivity
+    if args.ece_bins is not None:
+        config.ECE_BINS = args.ece_bins
+    if args.ece_bin_strategy is not None:
+        config.ECE_BIN_STRATEGY = args.ece_bin_strategy
+    if args.no_save_predictions:
+        config.SAVE_PREDICTIONS = False
     if args.xai_samples is not None:
         config.XAI_NUM_SAMPLES = args.xai_samples
 
@@ -318,6 +358,12 @@ def main():
     print(f"  Loss:               {config.LOSS_NAME}")
     print(f"  Checkpoint metric:  {config.CHECKPOINT_METRIC}")
     print(f"  Threshold metric:   {config.THRESHOLD_METRIC}")
+    if config.THRESHOLD_METRIC == "fbeta":
+        print(f"  Threshold beta:     {config.THRESHOLD_BETA}")
+    if config.THRESHOLD_METRIC == "sensitivity":
+        print(f"  Target sensitivity: {config.THRESHOLD_TARGET_SENSITIVITY}")
+    print(f"  Threshold support:  >= {config.THRESHOLD_MIN_SUPPORT} val positives to fit")
+    print(f"  Save predictions:   {config.SAVE_PREDICTIONS}")
     print(f"  Device:             {get_device()}")
     print(f"  Num workers:        {config.NUM_WORKERS}")
 

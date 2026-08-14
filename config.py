@@ -161,21 +161,63 @@ HEAD_LR_MULTIPLIER = 1.0
 # Evaluation & Calibration
 # =============================================================================
 DEFAULT_THRESHOLD = 0.5
-THRESHOLD_MIN = 0.05
-THRESHOLD_MAX = 0.95
-THRESHOLD_STEPS = 91
-THRESHOLD_METRIC = "f1" # f1, fbeta, youden
+
+# Objective maximized when fitting one decision threshold per class on the
+# validation set:
+#   "f1"          - harmonic mean of precision and recall
+#   "fbeta"       - F-beta; beta > 1 weights recall over precision
+#   "youden"      - sensitivity + specificity - 1
+#   "sensitivity" - most specific point that still reaches TARGET_SENSITIVITY
+#
+# f1 is the default because it degrades gracefully across this dataset's
+# prevalence range and is what the ChestX-ray14 literature reports, so the
+# numbers stay comparable. Youden is prevalence-independent by construction,
+# which sounds desirable until you apply it to Hernia at 0.16% prevalence,
+# where a 50%/95% sensitivity/specificity point is a PPV of roughly 2%.
+# "sensitivity" is the clinically framed alternative: fixing recall puts every
+# architecture at the same operating point and makes specificity comparable.
+THRESHOLD_METRIC = "f1" # f1, fbeta, youden, sensitivity
 THRESHOLD_BETA = 1.0
-THRESHOLD_MIN_SUPPORT = 5
+THRESHOLD_TARGET_SENSITIVITY = 0.90
+
+# Candidate thresholds are the distinct predicted scores themselves — the same
+# candidate set behind sklearn's precision_recall_curve — rather than a fixed
+# grid. A grid cannot represent an optimum outside its own bounds, and a grid
+# whose lower bound sits above every score a model assigns to a rare class
+# scores 0 everywhere and silently returns that bound with all-negative
+# predictions, which reads as a tuned result and is an artifact.
+
+# Positives a class needs in validation before its threshold is fitted rather
+# than left at DEFAULT_THRESHOLD. With VAL_SPLIT = 0.1 the validation supports
+# run from ~1,380 (Infiltration) down to ~14 (Hernia); at 50 only Hernia falls
+# back, and a threshold fitted on 14 positives is noise that happens to be a
+# float. An honest default beats a fitted number that cannot be defended.
+THRESHOLD_MIN_SUPPORT = 50
+
+# Expected calibration error binning. "quantile" gives every bin the same
+# number of predictions, "uniform" the same width. Uniform is the textbook
+# definition and is close to meaningless on the rare classes here: nearly every
+# prediction for a 0.16%-prevalence label lands in the first bin, that bin is
+# trivially well calibrated, and it carries almost all of the weight — so the
+# class scores a near-perfect ECE for knowing only that the disease is rare.
 ECE_BINS = 15
+ECE_BIN_STRATEGY = "quantile" # quantile, uniform
+
+# Persist per-class probabilities and labels for the validation and test
+# splits. Every alternative thresholding scheme is then a post-hoc script over
+# these arrays (see threshold_analysis.py) instead of another inference pass
+# over five models. Roughly 1 MB per model per split.
+SAVE_PREDICTIONS = True
 
 # =============================================================================
 # Bootstrap confidence intervals
 # =============================================================================
-# Resampling the test set puts an uncertainty band on every reported AUROC and
-# AUPRC without retraining anything. With one seed per configuration, point
-# estimates alone cannot support a ranking claim: "0.812 vs 0.818" is not a
-# result until you know whether the interval around each number overlaps.
+# Resampling the test set puts an uncertainty band on every reported AUROC,
+# AUPRC, precision, recall and F1 without retraining anything. With one seed per
+# configuration, point estimates alone cannot support a ranking claim: "0.812 vs
+# 0.818" is not a result until you know whether the interval around each number
+# overlaps. The operating-point metrics need it most — Hernia rests on 86 test
+# positives, so its F1 moves substantially between resamples.
 #
 # Set to False to skip it — the results JSON then carries point estimates only.
 # The cost is roughly 70 seconds per model on the full 25,596-image test split

@@ -21,10 +21,16 @@ from evaluate import (
     _environment_versions,
     _expected_calibration_error,
     _normal_vs_abnormal_metrics,
+    _rows_by_group,
+    _thresholded_rates,
     apply_thresholds,
     bootstrap_cis,
     compute_metrics,
+    confusion_sweep,
+    load_predictions,
     patient_groups,
+    save_predictions,
+    threshold_settings,
     tune_thresholds,
 )
 
@@ -43,9 +49,41 @@ class TestApplyThresholds:
         assert apply_thresholds(np.array([[0.5]]), 0.5).tolist() == [[1]]
 
 
+class TestConfusionSweep:
+    """
+    The candidate set every threshold decision is made over. If the counts are
+    wrong the objective is wrong, silently and for every class at once.
+    """
+
+    def test_counts_match_a_brute_force_scan(self, rng):
+        y_true = (rng.random(200) < 0.3).astype(np.float32)
+        y_prob = rng.random(200).round(2).astype(np.float32)  # forces ties
+
+        thresholds, tp, fp, fn, tn = confusion_sweep(y_true, y_prob)
+        for index, threshold in enumerate(thresholds):
+            preds = y_prob >= threshold
+            assert tp[index] == np.logical_and(preds, y_true).sum()
+            assert fp[index] == np.logical_and(preds, 1 - y_true).sum()
+            assert fn[index] == np.logical_and(~preds, y_true).sum()
+            assert tn[index] == np.logical_and(~preds, 1 - y_true).sum()
+
+    def test_candidates_are_the_distinct_scores_in_descending_order(self, rng):
+        y_prob = rng.random(100).round(1).astype(np.float32)
+        thresholds, *_ = confusion_sweep(np.zeros(100, dtype=np.float32), y_prob)
+        assert thresholds.tolist() == sorted(set(y_prob.tolist()), reverse=True)
+
+    def test_the_last_candidate_predicts_everything_positive(self, rng):
+        """Why an F1 optimum can never be an all-negative rule."""
+        y_true = (rng.random(150) < 0.2).astype(np.float32)
+        y_prob = rng.random(150).astype(np.float32)
+        _, tp, _, fn, _ = confusion_sweep(y_true, y_prob)
+        assert fn[-1] == 0
+        assert tp[-1] == y_true.sum()
+
+
 class TestTuneThresholds:
     def _separable(self, n=200):
-        """Class 0 perfectly separable at 0.5; the rest are noise."""
+        """Class 0 perfectly separable at 0.9; the rest are noise."""
         labels = np.zeros((n, config.NUM_CLASSES), dtype=np.float32)
         probs = np.full((n, config.NUM_CLASSES), 0.5, dtype=np.float32)
         labels[: n // 2, 0] = 1.0
@@ -62,6 +100,7 @@ class TestTuneThresholds:
         entry = summary[config.CLASS_NAMES[1]]
         assert entry["status"] == "default"
         assert entry["support"] == 1
+        assert "THRESHOLD_MIN_SUPPORT" in entry["reason"]
         assert thresholds[1] == pytest.approx(config.DEFAULT_THRESHOLD)
 
     def test_a_separable_class_gets_tuned(self):
@@ -70,7 +109,7 @@ class TestTuneThresholds:
         entry = summary[config.CLASS_NAMES[0]]
         assert entry["status"] == "tuned"
         assert entry["objective"] == pytest.approx(1.0)
-        assert 0.1 < thresholds[0] <= 0.9
+        assert thresholds[0] == pytest.approx(0.9)
 
     def test_the_tuned_threshold_actually_separates(self):
         labels, probs = self._separable()
@@ -78,12 +117,48 @@ class TestTuneThresholds:
         preds = apply_thresholds(probs, thresholds)
         assert (preds[:, 0] == labels[:, 0]).all()
 
-    def test_every_threshold_stays_inside_the_configured_grid(self, rng):
-        labels = (rng.random((200, config.NUM_CLASSES)) < 0.3).astype(np.float32)
-        probs = rng.random((200, config.NUM_CLASSES)).astype(np.float32)
-        thresholds, _ = tune_thresholds(labels, probs)
-        assert (thresholds >= config.THRESHOLD_MIN).all()
-        assert (thresholds <= config.THRESHOLD_MAX).all()
+    def test_every_threshold_is_a_score_the_model_actually_produced(self, rng):
+        """
+        Candidates come from the predictions, not a grid, so each threshold is
+        reachable and reproduces the counts it was chosen for.
+        """
+        labels = (rng.random((400, config.NUM_CLASSES)) < 0.3).astype(np.float32)
+        probs = rng.random((400, config.NUM_CLASSES)).astype(np.float32)
+        thresholds, summary = tune_thresholds(labels, probs)
+
+        for class_idx, class_name in enumerate(config.CLASS_NAMES):
+            if summary[class_name]["status"] != "tuned":
+                continue
+            # Compared against the rounded value the summary reports, since the
+            # stored threshold is one of the raw float32 scores
+            assert np.isclose(probs[:, class_idx], thresholds[class_idx]).any()
+
+    def test_a_rare_class_scored_far_below_the_old_grid_floor_still_tunes(self):
+        """
+        The regression this whole change exists for.
+
+        A grid over [0.05, 0.95] scores zero at every point when a class's
+        scores all sit below 0.05, and returns 0.05 with all-negative
+        predictions labelled "tuned". The candidate set cannot do that: the
+        threshold has to be a score the model produced.
+        """
+        rng = np.random.default_rng(0)
+        labels = np.zeros((600, config.NUM_CLASSES), dtype=np.float32)
+        probs = np.full((600, config.NUM_CLASSES), 0.5, dtype=np.float32)
+
+        # 60 positives, every score for the class crushed below 0.05
+        labels[:60, 0] = 1.0
+        probs[:60, 0] = rng.uniform(0.02, 0.04, 60).astype(np.float32)
+        probs[60:, 0] = rng.uniform(0.0, 0.02, 540).astype(np.float32)
+
+        thresholds, summary = tune_thresholds(labels, probs)
+        entry = summary[config.CLASS_NAMES[0]]
+
+        assert entry["status"] == "tuned"
+        assert thresholds[0] < 0.05
+        assert entry["objective"] > 0.5
+        # And the decisive part: it does not predict the class negative everywhere
+        assert apply_thresholds(probs, thresholds)[:, 0].sum() > 0
 
     def test_reports_one_entry_per_class(self, rng):
         labels = (rng.random((80, config.NUM_CLASSES)) < 0.3).astype(np.float32)
@@ -97,11 +172,132 @@ class TestTuneThresholds:
         _, summary = tune_thresholds(labels, probs)
         assert summary[config.CLASS_NAMES[0]]["status"] == "tuned"
 
+    def test_youden_reports_an_unrankable_class_as_degenerate(self):
+        """
+        Youden can legitimately bottom out where F1 cannot. Saying so beats
+        returning a threshold that separates nothing.
+        """
+        config.THRESHOLD_METRIC = "youden"
+        labels = np.zeros((400, config.NUM_CLASSES), dtype=np.float32)
+        labels[:100, 0] = 1.0
+        probs = np.full((400, config.NUM_CLASSES), 0.3, dtype=np.float32)
+
+        thresholds, summary = tune_thresholds(labels, probs)
+        assert summary[config.CLASS_NAMES[0]]["status"] == "degenerate"
+        assert thresholds[0] == pytest.approx(config.DEFAULT_THRESHOLD)
+
+    def test_sensitivity_mode_reaches_its_target_recall(self, rng):
+        config.THRESHOLD_METRIC = "sensitivity"
+        config.THRESHOLD_TARGET_SENSITIVITY = 0.95
+
+        labels = (rng.random((800, config.NUM_CLASSES)) < 0.25).astype(np.float32)
+        probs = (labels * 0.4 + rng.random((800, config.NUM_CLASSES)) * 0.6).astype(np.float32)
+
+        thresholds, summary = tune_thresholds(labels, probs)
+        preds = apply_thresholds(probs, thresholds)
+
+        for class_idx, class_name in enumerate(config.CLASS_NAMES):
+            if summary[class_name]["status"] != "tuned":
+                continue
+            recall = preds[:, class_idx][labels[:, class_idx] == 1].mean()
+            assert recall >= 0.95
+
+    def test_sensitivity_mode_buys_recall_with_specificity(self, rng):
+        """The trade the fixed-sensitivity operating point exists to make."""
+        labels = (rng.random((800, config.NUM_CLASSES)) < 0.25).astype(np.float32)
+        probs = (labels * 0.4 + rng.random((800, config.NUM_CLASSES)) * 0.6).astype(np.float32)
+
+        config.THRESHOLD_METRIC = "f1"
+        by_f1, _ = tune_thresholds(labels, probs)
+        config.THRESHOLD_METRIC = "sensitivity"
+        config.THRESHOLD_TARGET_SENSITIVITY = 0.95
+        by_sensitivity, _ = tune_thresholds(labels, probs)
+
+        # A higher recall floor can only be met by a looser threshold
+        assert (by_sensitivity <= by_f1 + 1e-6).all()
+
     def test_rejects_an_unknown_threshold_metric(self):
         labels, probs = self._separable()
         config.THRESHOLD_METRIC = "nonsense"
         with pytest.raises(ValueError, match="Unsupported threshold metric"):
             tune_thresholds(labels, probs)
+
+    def test_rejects_an_unknown_metric_even_when_no_class_is_tunable(self):
+        """Fails fast on the config, not on whichever class happens to be first."""
+        config.THRESHOLD_METRIC = "nonsense"
+        labels = np.zeros((50, config.NUM_CLASSES), dtype=np.float32)
+        probs = np.full((50, config.NUM_CLASSES), 0.5, dtype=np.float32)
+        with pytest.raises(ValueError, match="Unsupported threshold metric"):
+            tune_thresholds(labels, probs)
+
+
+class TestThresholdSettings:
+    """
+    Provenance for the thresholds file. Reproducing an operating point needs the
+    support cutoff and the objective's own parameters, not just its name.
+    """
+
+    def test_records_the_support_cutoff(self):
+        assert threshold_settings()["min_support"] == config.THRESHOLD_MIN_SUPPORT
+
+    def test_beta_travels_with_fbeta_only(self):
+        config.THRESHOLD_METRIC = "f1"
+        assert "beta" not in threshold_settings()
+        config.THRESHOLD_METRIC = "fbeta"
+        assert threshold_settings()["beta"] == config.THRESHOLD_BETA
+
+    def test_target_sensitivity_travels_with_sensitivity_only(self):
+        config.THRESHOLD_METRIC = "f1"
+        assert "target_sensitivity" not in threshold_settings()
+        config.THRESHOLD_METRIC = "sensitivity"
+        assert threshold_settings()["target_sensitivity"] == (
+            config.THRESHOLD_TARGET_SENSITIVITY
+        )
+
+
+class TestSavePredictions:
+    """
+    The arrays that make every later thresholding decision a script rather than
+    another inference pass over five models.
+    """
+
+    def _arrays(self, rng, rows=40):
+        labels = (rng.random((rows, config.NUM_CLASSES)) < 0.3).astype(np.float32)
+        probs = rng.random((rows, config.NUM_CLASSES)).astype(np.float32)
+        return labels, probs
+
+    def test_round_trips_labels_probabilities_and_patients(self, rng, tmp_path):
+        config.RESULTS_DIR = tmp_path
+        labels, probs = self._arrays(rng)
+        groups = np.repeat(np.arange(20), 2).astype(str)
+
+        save_predictions(labels, probs, "densenet121", "val", groups=groups)
+        restored = load_predictions("densenet121", "val")
+
+        assert (restored["labels"] == labels.astype(np.int8)).all()
+        assert restored["probs"] == pytest.approx(probs)
+        assert list(restored["class_names"]) == list(config.CLASS_NAMES)
+        assert (restored["groups"] == groups).all()
+
+    def test_probabilities_survive_the_round_trip_exactly(self, rng, tmp_path):
+        """Thresholds are compared against these values with >=, so a lossy
+        round trip would shift which samples land on the positive side."""
+        config.RESULTS_DIR = tmp_path
+        labels, probs = self._arrays(rng)
+        save_predictions(labels, probs, "densenet121", "test")
+        assert (load_predictions("densenet121", "test")["probs"] == probs).all()
+
+    def test_writes_nothing_when_disabled(self, rng, tmp_path):
+        config.RESULTS_DIR = tmp_path
+        config.SAVE_PREDICTIONS = False
+        labels, probs = self._arrays(rng)
+        assert save_predictions(labels, probs, "densenet121", "val") is None
+        assert list(tmp_path.glob("*.npz")) == []
+
+    def test_a_missing_file_says_how_to_produce_it(self, tmp_path):
+        config.RESULTS_DIR = tmp_path
+        with pytest.raises(FileNotFoundError, match="SAVE_PREDICTIONS"):
+            load_predictions("densenet121", "val")
 
 
 class TestExpectedCalibrationError:
@@ -121,6 +317,57 @@ class TestExpectedCalibrationError:
         # Bin edges are half-open except the last; a p=1.0 sample must not be
         # dropped, or ECE would be computed over fewer samples than exist.
         assert _expected_calibration_error(np.zeros(10), np.ones(10)) > 0.0
+
+    def test_every_prediction_lands_in_exactly_one_bin(self, rng):
+        """A dropped sample would quietly shrink the denominator."""
+        probs = rng.random(500)
+        labels = (rng.random(500) < probs).astype(float)
+        for strategy in ("quantile", "uniform"):
+            # Perfectly miscalibrated: |confidence - accuracy| is 1 in every
+            # bin, so the weighted sum equals the fraction of samples counted.
+            assert _expected_calibration_error(
+                np.zeros(500), np.ones(500), strategy=strategy
+            ) == pytest.approx(1.0)
+            assert 0.0 <= _expected_calibration_error(labels, probs, strategy=strategy) <= 1.0
+
+    def test_uniform_bins_hide_miscalibration_in_the_rare_class_mass(self):
+        """
+        The reason quantile is the default.
+
+        Every prediction is tiny, as it is for a 0.16%-prevalence label, and the
+        model is badly calibrated *within* that mass — confident-ish scores are
+        no likelier to be positive than near-zero ones. Uniform bins put the lot
+        in bin 1 and average the error away; quantile bins split it and see it.
+        """
+        low = np.linspace(0.001, 0.06, 500)
+        # Positives concentrated at the *bottom* of the range: ranking inverted
+        labels = (np.arange(500) < 100).astype(float)
+
+        uniform = _expected_calibration_error(labels, low, strategy="uniform")
+        quantile = _expected_calibration_error(labels, low, strategy="quantile")
+        assert quantile > uniform
+
+    def test_reads_the_bin_count_at_call_time(self):
+        """
+        Config is read when the function runs, not when the module is imported.
+        Bound as a default argument, a runtime override would never arrive.
+        """
+        # Four score groups; coarse bins merge them in pairs whose errors
+        # partially cancel, so the granularity has to change the answer.
+        probs = np.repeat([0.1, 0.3, 0.7, 0.9], 100)
+        labels = np.repeat([0.0, 1.0, 0.0, 1.0], 100)
+
+        config.ECE_BINS = 2
+        coarse = _expected_calibration_error(labels, probs)
+        config.ECE_BINS = 8
+        fine = _expected_calibration_error(labels, probs)
+
+        assert coarse == pytest.approx(0.3)
+        assert fine == pytest.approx(0.4)
+
+    def test_rejects_an_unknown_bin_strategy(self):
+        with pytest.raises(ValueError, match="Unsupported ECE bin strategy"):
+            _expected_calibration_error(np.zeros(10), np.ones(10), strategy="nonsense")
 
 
 class TestNormalVsAbnormal:
@@ -249,6 +496,55 @@ class TestBootstrapConfidenceIntervals:
 
         assert (by_patient[1] - by_patient[0]) > (by_image[1] - by_image[0])
 
+    def test_thresholded_metrics_get_intervals_when_predictions_are_given(self, rng):
+        """
+        The threshold is frozen on validation before test is touched, so
+        resampling test rows at that fixed operating point is an ordinary
+        sampling interval — and F1 on the rare classes is the noisiest number
+        in the whole table.
+        """
+        config.BOOTSTRAP_ENABLED = True
+        config.BOOTSTRAP_SAMPLES = 60
+        labels, probs, _ = self._scored(rng, rows=1000)
+        preds = apply_thresholds(probs, 0.5)
+        results = compute_metrics(labels, probs, preds)
+
+        assert results["bootstrap"]["includes_thresholded_metrics"] is True
+        for metric in ("precision", "recall", "f1"):
+            low, high = results["macro"][f"{metric}_ci"]
+            assert low <= results["macro"][metric] <= high
+
+        entry = results["per_class"][config.CLASS_NAMES[0]]
+        assert entry["f1_ci"][0] <= entry["f1"] <= entry["f1_ci"][1]
+
+    def test_rare_classes_get_relatively_wider_f1_intervals(self, rng):
+        """
+        Compared relative to the estimate, not in absolute width: an F1 near
+        zero is squeezed against the floor, so the rare class can hold a
+        narrower absolute interval while being far less determined. Relative
+        width is what "we do not really know Hernia's F1" actually means.
+        """
+        config.BOOTSTRAP_ENABLED = True
+        config.BOOTSTRAP_SAMPLES = 80
+        labels, probs, _ = self._scored(rng, rows=1500)
+        results = compute_metrics(labels, probs, apply_thresholds(probs, 0.3))
+
+        def relative_width(entry):
+            low, high = entry["f1_ci"]
+            return (high - low) / max(entry["f1"], 1e-9)
+
+        common = results["per_class"][config.CLASS_NAMES[0]]
+        rare = results["per_class"][config.CLASS_NAMES[-1]]
+        assert rare["support"] < common["support"]
+        assert relative_width(rare) > 3 * relative_width(common)
+
+    def test_omitting_predictions_leaves_the_thresholded_metrics_alone(self, rng):
+        config.BOOTSTRAP_SAMPLES = 20
+        labels, probs, _ = self._scored(rng)
+        intervals = bootstrap_cis(labels, probs)
+        assert intervals["settings"]["includes_thresholded_metrics"] is False
+        assert "f1" not in intervals["macro"]
+
     def test_rare_classes_get_wider_intervals(self, rng):
         """A class resting on a handful of positives should say so."""
         config.BOOTSTRAP_ENABLED = True
@@ -355,3 +651,72 @@ class TestComputeMetrics:
         probs = rng.random((100, config.NUM_CLASSES)).astype(np.float32)
         results = compute_metrics(labels, probs, apply_thresholds(probs, 0.5))
         assert 0.9 < results["macro"]["all_negative_sample_accuracy_baseline"] <= 1.0
+
+    def test_samples_f1_credits_a_correctly_predicted_normal_study(self):
+        """
+        38.5% of the official test split has no findings at all. Under
+        sklearn's zero_division=0 those rows score 0.0 when predicted
+        correctly, which caps a *perfect* model at 0.615 and makes the metric
+        unreadable next to the others.
+        """
+        labels = np.zeros((10, config.NUM_CLASSES), dtype=np.float32)
+        labels[:4, 0] = 1.0  # 6 of 10 studies are normal
+
+        results = compute_metrics(labels, labels, labels.astype(np.int32))
+        assert results["macro"]["samples_f1"] == pytest.approx(1.0)
+        assert results["macro"]["all_negative_samples_f1_baseline"] == pytest.approx(0.6)
+
+    def test_the_free_score_from_normal_studies_is_reported_as_a_baseline(self):
+        """The cost of zero_division=1: an all-negative model collects those
+        rows. Stating the baseline is what keeps the metric honest."""
+        labels = np.zeros((10, config.NUM_CLASSES), dtype=np.float32)
+        labels[:4, 0] = 1.0
+        all_negative = np.zeros((10, config.NUM_CLASSES), dtype=np.int32)
+
+        results = compute_metrics(labels, all_negative.astype(np.float32), all_negative)
+        assert results["macro"]["samples_f1"] == pytest.approx(
+            results["macro"]["all_negative_samples_f1_baseline"]
+        )
+
+    def test_calibration_records_the_binning_that_produced_it(self, rng):
+        labels = (rng.random((50, config.NUM_CLASSES)) < 0.3).astype(np.float32)
+        probs = rng.random((50, config.NUM_CLASSES)).astype(np.float32)
+        results = compute_metrics(labels, probs, apply_thresholds(probs, 0.5))
+        assert results["calibration"]["ece_bins"] == config.ECE_BINS
+        assert results["calibration"]["ece_bin_strategy"] == config.ECE_BIN_STRATEGY
+
+
+class TestThresholdedRates:
+    """The vectorized confusion counts the bootstrap runs a thousand times."""
+
+    def test_matches_sklearn(self, rng):
+        from sklearn.metrics import precision_score, recall_score, f1_score
+
+        labels = (rng.random((200, config.NUM_CLASSES)) < 0.3).astype(np.float32)
+        preds = (rng.random((200, config.NUM_CLASSES)) < 0.3).astype(np.int32)
+        precision, recall, f1 = _thresholded_rates(labels, preds)
+
+        assert precision == pytest.approx(
+            precision_score(labels, preds, average=None, zero_division=0)
+        )
+        assert recall == pytest.approx(
+            recall_score(labels, preds, average=None, zero_division=0)
+        )
+        assert f1 == pytest.approx(f1_score(labels, preds, average=None, zero_division=0))
+
+    def test_a_class_predicted_never_scores_zero_not_nan(self):
+        labels = np.ones((5, 1), dtype=np.float32)
+        preds = np.zeros((5, 1), dtype=np.int32)
+        assert all(np.isfinite(rate).all() for rate in _thresholded_rates(labels, preds))
+
+
+class TestRowsByGroup:
+    def test_partitions_every_row_exactly_once(self, rng):
+        groups = rng.integers(0, 40, 500).astype(str)
+        partition = _rows_by_group(groups)
+        assert sorted(np.concatenate(partition).tolist()) == list(range(500))
+
+    def test_each_block_holds_one_group(self, rng):
+        groups = rng.integers(0, 40, 500).astype(str)
+        for rows in _rows_by_group(groups):
+            assert len(set(groups[rows])) == 1

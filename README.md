@@ -107,7 +107,8 @@ The entire workflow is orchestrated natively via the `main.py` entry point.
 - `dataset.py`: Handles metadata parsing, image augmentations, multi-hot label encoding, and group-aware data splitting.
 - `models.py`: Defines the five supported architectures — one per family, with the pinned pretrained-weight tags and the reasoning behind each choice.
 - `train.py`: Contains the training loop, optimizer, mixed precision setup, and asymmetric loss implementation.
-- `evaluate.py`: Responsible for inference, computing metrics (AUROC, AUPRC, F1, Brier, ECE), and determining optimal class-specific decision thresholds.
+- `evaluate.py`: Responsible for inference, computing metrics (AUROC, AUPRC, F1, Brier, ECE) with bootstrap intervals, determining class-specific decision thresholds on validation, and saving the raw probabilities behind every reported number.
+- `threshold_analysis.py`: Post-hoc comparison of thresholding schemes over those saved probabilities — fits F1 / Youden / fixed-sensitivity operating points, puts a confidence interval on each threshold, and scores them on test. Runs no model.
 - `explainability.py`: Implements the XAI methods — Grad-CAM for all five architectures (each with its own reshape transform), plus Attention Rollout for ViT — and renders heatmap overlays.
 - `localization.py`: Scores those heatmaps against the ground-truth boxes (pointing game, energy fraction, IoU/IoBB) and saves the diagnostic figures.
 - `utils.py`: Provides helper functions for reproducible seeding, run logging, plotting training curves, and building model/experiment comparison tables.
@@ -222,7 +223,7 @@ the pure functions behind the reported numbers:
 | `dataset.py` | train/val patient-disjointness; nested subsets (5k ⊂ 15k ⊂ 30k); that a stratified prefix tracks the pool's label distribution better than the best of 20 random draws |
 | preprocessing | bicubic resampling in both pipelines; that train and eval share one geometry; that no centre crop and no horizontal flip creep in; grayscale→3-channel replication |
 | `localization.py` | box scaling, mask union and clipping, largest-connected-component detection, and the IoBB denominator (intersection over the *predicted* box, per Wang et al.) |
-| `evaluate.py` | threshold tuning and its low-support fallback; ECE at the calibrated and confidently-wrong extremes; normal-vs-abnormal derivation; that bootstrap intervals contain their own point estimate, widen for rare classes, widen again under patient grouping, and are withheld entirely for unscorable classes |
+| `evaluate.py` | confusion-sweep counts against a brute-force scan; that a class scored entirely below the old grid floor still tunes and still predicts positives; the low-support and degenerate fallbacks; that fixed-sensitivity mode reaches its target and pays for it in specificity; ECE under both binning strategies and that no prediction is dropped from either; that samples-F1 credits a correctly-predicted normal study; that bootstrap intervals contain their own point estimate, widen for rare classes, widen again under patient grouping, and are withheld entirely for unscorable classes; prediction round-trips |
 | `train.py` | asymmetric loss under fp16 and saturating logits; head/backbone split for all five architectures; that freezing also stops BatchNorm statistics drifting |
 | `models.py` | that the factory and `SUPPORTED_MODELS` describe the same roster; that neither timm tag pulls in 21k pretraining; ViT's prefix-token count; that MaxViT is what fixes `IMAGE_SIZE` at 224 |
 | `explainability.py` | ViT token→grid and Swin NHWC reshapes; that every architecture's Grad-CAM target layer still resolves; the 14×14-vs-7×7 CAM grid asymmetry; that Attention Rollout actually captures attention and restores the model afterwards; Grad-CAM under a frozen backbone; hook cleanup |
@@ -277,7 +278,8 @@ python main.py --compare-all
 Common overrides: `--epochs`, `--batch-size`, `--lr`, `--num-workers`,
 `--tuning-mode {full,head_only,partial}`, `--loss {asymmetric,weighted_bce,bce}`,
 `--checkpoint-metric {val_loss,val_auroc,val_auprc}`,
-`--threshold-metric {f1,fbeta,youden}`. Run `python main.py --help` for the full list.
+`--threshold-metric {f1,fbeta,youden,sensitivity}`, `--target-sensitivity`,
+`--ece-bin-strategy {quantile,uniform}`. Run `python main.py --help` for the full list.
 
 ## Confidence intervals
 
@@ -309,12 +311,76 @@ that is too narrow — measured at ~2.3× too narrow on correlated synthetic dat
 The grouping is matched to predictions positionally, so it requires an
 unshuffled loader and raises rather than guessing if given a shuffled one.
 
-Only the threshold-free metrics get intervals. Precision/recall/F1 depend on
-thresholds calibrated on the validation set, so an interval around them would
-blend test-set sampling noise with calibration noise and mean neither.
+Precision, recall and F1 get intervals too, written as `precision_ci` /
+`recall_ci` / `f1_ci`. The thresholds behind them were frozen on validation
+before the test set was touched, so resampling test rows at a fixed operating
+point is an ordinary sampling interval and means the same thing the AUROC
+interval does. This is where the intervals matter most — Hernia's test F1 rests
+on 86 positives.
+
+What that interval does *not* cover is uncertainty in the threshold itself. That
+needs resampling **validation** and refitting, which `threshold_analysis.py`
+does (see below). On the rare classes the second interval is the wider of the
+two, and reading a test-set F1 interval as though it settled the operating point
+would understate how loosely that point is located.
 
 Configured in `config.py` — `BOOTSTRAP_ENABLED` (set `False` to skip it),
 `BOOTSTRAP_SAMPLES`, `BOOTSTRAP_CI`, and `BOOTSTRAP_GROUP_BY_PATIENT`.
+
+## Thresholds
+
+Architecture comparison rests on **AUROC and AUPRC**, which are threshold-free.
+Any threshold adds variance that is not about the model, and the ChestX-ray14
+leaderboard lineage reports AUROC. The binary metrics are reported alongside
+them, not instead of them.
+
+When a threshold is needed, one is fitted **per class, on validation only**, and
+frozen before the test set is read. Nothing else touches test.
+
+**F1 is the default objective.** It degrades gracefully across this dataset's
+prevalence range — Hernia at 0.16%, Infiltration at 15.9% — and it is what most
+ChestX-ray14 papers report when they report binary metrics, so the numbers stay
+comparable. Youden's J is prevalence-independent by construction, which sounds
+desirable until it is applied to the tail: at 0.16% prevalence it will happily
+take 50% sensitivity and 95% specificity, a PPV of about 2%. `sensitivity` is
+the clinically framed alternative — it fixes recall at
+`THRESHOLD_TARGET_SENSITIVITY` and reports the most specific threshold reaching
+it, which puts every architecture at the same operating point.
+
+**Candidates are the model's own scores**, not a grid. A grid cannot represent
+an optimum outside its bounds, and — the failure that motivated this — a grid
+floored at 0.05 scores zero at every point for a class whose scores all sit
+below 0.05, then returns 0.05, labels it `tuned`, and predicts the class
+negative everywhere. That reads as a result and is an artifact. With the scores
+themselves as candidates the lowest candidate predicts everything positive, so
+F1 is positive whenever the class has a single positive and an all-negative
+"tuned" rule is unreachable by construction.
+
+**A class needs 50 validation positives to be fitted at all**
+(`THRESHOLD_MIN_SUPPORT`). Validation supports run from ~1,380 (Infiltration)
+down to ~14 (Hernia); a threshold fitted on 14 positives is noise that happens
+to be a float. Classes below the line stay at 0.5, are recorded with a `status`
+and a `reason` in the thresholds JSON, and are marked `*` in the results table —
+a fallback and a fitted-but-poor operating point look identical otherwise.
+
+### Post-hoc analysis
+
+Raw validation and test probabilities are saved per model
+(`<model>_{val,test}_predictions.npz`, ~1 MB each), so changing the thresholding
+scheme never costs another inference pass. `threshold_analysis.py` reads them:
+
+```bash
+python threshold_analysis.py --model all --experiment full_dataset \
+    --metric f1 youden sensitivity
+```
+
+It fits each objective on validation, bootstraps the **threshold itself** by
+refitting on validation resamples, applies the frozen thresholds to test, and
+prints them side by side with intervals on both. A wide threshold CI next to a
+narrow test-set CI means the operating point is poorly located rather than
+precisely measured — the distinction the rare classes turn on.
+
+Disable the saved arrays with `--no-save-predictions` if disk is a concern.
 
 ## Timing
 
@@ -353,7 +419,8 @@ given, otherwise `subset_<N>` or `full_dataset`:
 ```
 outputs/<experiment>/
 ├── checkpoints/   # best model weights per architecture
-├── results/       # metrics JSON, tuned thresholds, training curves, split summary,
+├── results/       # metrics JSON, tuned thresholds, raw val/test predictions (.npz),
+│                  # training curves, split summary, threshold analysis,
 │                  # and <model>_localization_<method>.json
 ├── logs/          # full console output per run, timestamped
 └── xai/<model>/
