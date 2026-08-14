@@ -1,15 +1,19 @@
 """
-Thresholding, calibration, and the derived screening metric.
+Thresholding, calibration, the derived screening metric, and the bootstrap.
 
 Nothing here touches a model or the disk: every function under test takes
-label/probability arrays.
+label/probability arrays. The one exception is the patient-grouping helper,
+which needs a DataLoader to read its sampler — that loader wraps an in-memory
+frame, not the dataset.
 """
 
 import importlib.metadata
 import json
 
 import numpy as np
+import pandas as pd
 import pytest
+from torch.utils.data import DataLoader
 
 import config
 from evaluate import (
@@ -18,7 +22,9 @@ from evaluate import (
     _expected_calibration_error,
     _normal_vs_abnormal_metrics,
     apply_thresholds,
+    bootstrap_cis,
     compute_metrics,
+    patient_groups,
     tune_thresholds,
 )
 
@@ -177,6 +183,141 @@ class TestEnvironmentVersions:
     def test_is_json_serializable(self):
         # It gets written straight into the results file
         json.dumps(_environment_versions())
+
+
+class TestBootstrapConfidenceIntervals:
+    """
+    The intervals are the difference between five numbers and five claims. Their
+    failure mode is not a crash — it is an interval that looks authoritative and
+    is quietly too narrow.
+    """
+
+    @staticmethod
+    def _scored(rng, rows=800, groups_of=1):
+        """Labels and probabilities carrying real but imperfect signal."""
+        labels = (
+            rng.random((rows, config.NUM_CLASSES)) < np.linspace(0.35, 0.02, config.NUM_CLASSES)
+        ).astype(np.float32)
+        probs = (labels * 0.4 + rng.random((rows, config.NUM_CLASSES)) * 0.6).astype(np.float32)
+        groups = np.repeat(np.arange(rows // groups_of), groups_of)
+        return labels, probs, groups
+
+    def test_absent_when_disabled(self, rng):
+        labels, probs, _ = self._scored(rng)
+        config.BOOTSTRAP_ENABLED = False
+        results = compute_metrics(labels, probs, apply_thresholds(probs, 0.5))
+        assert results["bootstrap"] is None
+        assert "auroc_ci" not in results["macro"]
+
+    def test_present_when_enabled(self, rng):
+        labels, probs, _ = self._scored(rng)
+        config.BOOTSTRAP_ENABLED = True
+        config.BOOTSTRAP_SAMPLES = 40
+        results = compute_metrics(labels, probs, apply_thresholds(probs, 0.5))
+
+        assert results["bootstrap"]["samples"] == 40
+        low, high = results["macro"]["auroc_ci"]
+        assert low < high
+
+    def test_the_point_estimate_falls_inside_its_own_interval(self, rng):
+        labels, probs, _ = self._scored(rng)
+        config.BOOTSTRAP_ENABLED = True
+        config.BOOTSTRAP_SAMPLES = 60
+        results = compute_metrics(labels, probs, apply_thresholds(probs, 0.5))
+
+        for metric in ("auroc", "auprc"):
+            low, high = results["macro"][f"{metric}_ci"]
+            assert low <= results["macro"][metric] <= high
+
+    def test_patient_grouping_widens_the_interval(self, rng):
+        """
+        The reason grouping exists. Several studies from one patient are
+        correlated; resampling images pretends they are independent, and returns
+        an interval narrower than the evidence supports.
+        """
+        config.BOOTSTRAP_SAMPLES = 120
+        labels, probs, groups = self._scored(rng, rows=600, groups_of=6)
+
+        # Make studies from one patient near-identical, which is what the real
+        # correlation looks like and what image-level resampling ignores.
+        for start in range(0, len(labels), 6):
+            labels[start:start + 6] = labels[start]
+            probs[start:start + 6] = probs[start]
+
+        by_image = bootstrap_cis(labels, probs, groups=None)["macro"]["auroc"]
+        by_patient = bootstrap_cis(labels, probs, groups=groups)["macro"]["auroc"]
+
+        assert (by_patient[1] - by_patient[0]) > (by_image[1] - by_image[0])
+
+    def test_rare_classes_get_wider_intervals(self, rng):
+        """A class resting on a handful of positives should say so."""
+        config.BOOTSTRAP_ENABLED = True
+        config.BOOTSTRAP_SAMPLES = 80
+        labels, probs, _ = self._scored(rng, rows=1200)
+        results = compute_metrics(labels, probs, apply_thresholds(probs, 0.5))
+
+        common = results["per_class"][config.CLASS_NAMES[0]]
+        rare = results["per_class"][config.CLASS_NAMES[-1]]
+        assert rare["support"] < common["support"]
+        assert (rare["auroc_ci"][1] - rare["auroc_ci"][0]) > (
+            common["auroc_ci"][1] - common["auroc_ci"][0]
+        )
+
+    def test_an_unscorable_class_reports_no_interval(self):
+        """Better nothing than an interval built from a few lucky resamples."""
+        config.BOOTSTRAP_SAMPLES = 30
+        labels = np.zeros((60, config.NUM_CLASSES), dtype=np.float32)
+        probs = np.full((60, config.NUM_CLASSES), 0.3, dtype=np.float32)
+        intervals = bootstrap_cis(labels, probs)
+        assert intervals["per_class"][config.CLASS_NAMES[0]]["auroc"] is None
+        assert intervals["macro"]["auroc"] is None
+
+    def test_is_reproducible(self, rng):
+        config.BOOTSTRAP_SAMPLES = 40
+        labels, probs, groups = self._scored(rng)
+        first = bootstrap_cis(labels, probs, groups=groups)
+        second = bootstrap_cis(labels, probs, groups=groups)
+        assert first == second
+
+    def test_results_stay_json_serializable(self, rng):
+        config.BOOTSTRAP_ENABLED = True
+        config.BOOTSTRAP_SAMPLES = 30
+        labels, probs, groups = self._scored(rng)
+        results = compute_metrics(labels, probs, apply_thresholds(probs, 0.5), groups=groups)
+        json.dumps(results)
+
+
+class TestPatientGroups:
+    class _Frame:
+        def __init__(self, frame):
+            self.df = frame
+
+        def __len__(self):
+            return len(self.df)
+
+        def __getitem__(self, idx):
+            return idx
+
+    def _loader(self, shuffle):
+        frame = pd.DataFrame({config.PATIENT_ID_COLUMN: ["a", "a", "b", "c"]})
+        return DataLoader(self._Frame(frame), batch_size=2, shuffle=shuffle)
+
+    def test_reads_patient_ids_in_loader_order(self):
+        assert list(patient_groups(self._loader(shuffle=False))) == ["a", "a", "b", "c"]
+
+    def test_refuses_a_shuffled_loader(self):
+        """
+        Predictions and patient IDs are matched by position, so a shuffled
+        loader would pair each prediction with the wrong patient and produce a
+        confident, wrong interval.
+        """
+        with pytest.raises(ValueError, match="unshuffled"):
+            patient_groups(self._loader(shuffle=True))
+
+    def test_reports_a_missing_patient_column(self):
+        loader = DataLoader(self._Frame(pd.DataFrame({"other": [1, 2]})), batch_size=1)
+        with pytest.raises(KeyError):
+            patient_groups(loader)
 
 
 class TestComputeMetrics:

@@ -211,7 +211,7 @@ localization as though the two were interchangeable measurements.
 pytest
 ```
 
-165 tests, no dataset required — everything is synthetic, so the suite
+176 tests, no dataset required — everything is synthetic, so the suite
 runs with the drive unmounted, no GPU, and no checkpoint on disk. Backbones are
 built with `pretrained=False`, so nothing downloads weights either. It covers
 the pure functions behind the reported numbers:
@@ -222,7 +222,7 @@ the pure functions behind the reported numbers:
 | `dataset.py` | train/val patient-disjointness; nested subsets (5k ⊂ 15k ⊂ 30k); that a stratified prefix tracks the pool's label distribution better than the best of 20 random draws |
 | preprocessing | bicubic resampling in both pipelines; that train and eval share one geometry; that no centre crop and no horizontal flip creep in; grayscale→3-channel replication |
 | `localization.py` | box scaling, mask union and clipping, largest-connected-component detection, and the IoBB denominator (intersection over the *predicted* box, per Wang et al.) |
-| `evaluate.py` | threshold tuning and its low-support fallback; ECE at the calibrated and confidently-wrong extremes; normal-vs-abnormal derivation |
+| `evaluate.py` | threshold tuning and its low-support fallback; ECE at the calibrated and confidently-wrong extremes; normal-vs-abnormal derivation; that bootstrap intervals contain their own point estimate, widen for rare classes, widen again under patient grouping, and are withheld entirely for unscorable classes |
 | `train.py` | asymmetric loss under fp16 and saturating logits; head/backbone split for all five architectures; that freezing also stops BatchNorm statistics drifting |
 | `models.py` | that the factory and `SUPPORTED_MODELS` describe the same roster; that neither timm tag pulls in 21k pretraining; ViT's prefix-token count; that MaxViT is what fixes `IMAGE_SIZE` at 224 |
 | `explainability.py` | ViT token→grid and Swin NHWC reshapes; that every architecture's Grad-CAM target layer still resolves; the 14×14-vs-7×7 CAM grid asymmetry; that Attention Rollout actually captures attention and restores the model afterwards; Grad-CAM under a frozen backbone; hook cleanup |
@@ -232,6 +232,7 @@ to the union, dropping the loss's fp32 cast, moving the ViT Grad-CAM target to
 the final norm, leaving timm's fused attention enabled so rollout silently
 captures nothing, leaving a stale architecture in the Grad-CAM target table,
 hardcoding the wrong prefix-token count, falling back to bilinear resampling,
+bootstrapping images instead of patients,
 letting frozen BatchNorm keep updating, removing the low-support threshold
 fallback, breaking patient grouping, and replacing stratified subsetting with a
 random sample are each caught by a failing test.
@@ -277,6 +278,43 @@ Common overrides: `--epochs`, `--batch-size`, `--lr`, `--num-workers`,
 `--tuning-mode {full,head_only,partial}`, `--loss {asymmetric,weighted_bce,bce}`,
 `--checkpoint-metric {val_loss,val_auroc,val_auprc}`,
 `--threshold-metric {f1,fbeta,youden}`. Run `python main.py --help` for the full list.
+
+## Confidence intervals
+
+Every reported AUROC and AUPRC — per class and macro — carries a bootstrap
+confidence interval, written into the results JSON as `auroc_ci` / `auprc_ci`
+alongside the point estimate and printed next to it in the summary table:
+
+```
+Class                     Thr    AUROC    AUROC 95% CI    AUPRC     ...
+Atelectasis              0.50   0.8153  [0.803, 0.827]   0.4472     ...
+Pneumonia                0.50   0.7188  [0.671, 0.764]   0.0512     ...
+```
+
+This exists because a run produces **one seed per configuration**. Five
+architectures reported as five point estimates cannot support a ranking claim,
+and it is the first thing a reader should push back on. Resampling the test set
+costs no retraining at all — roughly 70 seconds per model against hours of
+training — and turns "0.812 vs 0.818" into a statement about whether the gap is
+resolved. **If two models' intervals overlap, the comparison is not settled.**
+
+Note how much wider the interval is for the rare classes: a Pneumonia AUROC
+resting on ~300 positives is a far softer number than an Atelectasis AUROC
+resting on ~3,200, and the point estimate alone hides that entirely.
+
+**Whole patients are resampled, not individual images.** ChestX-ray14 has
+several studies per patient and those rows are correlated, so an image-level
+bootstrap treats correlated observations as independent and returns an interval
+that is too narrow — measured at ~2.3× too narrow on correlated synthetic data.
+The grouping is matched to predictions positionally, so it requires an
+unshuffled loader and raises rather than guessing if given a shuffled one.
+
+Only the threshold-free metrics get intervals. Precision/recall/F1 depend on
+thresholds calibrated on the validation set, so an interval around them would
+blend test-set sampling noise with calibration noise and mean neither.
+
+Configured in `config.py` — `BOOTSTRAP_ENABLED` (set `False` to skip it),
+`BOOTSTRAP_SAMPLES`, `BOOTSTRAP_CI`, and `BOOTSTRAP_GROUP_BY_PATIENT`.
 
 ## Timing
 

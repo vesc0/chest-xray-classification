@@ -38,6 +38,21 @@ def restore_config():
         setattr(config, name, value)
 
 
+@pytest.fixture(autouse=True)
+def disable_bootstrap(restore_config):
+    """
+    Keep the bootstrap out of the tests that are not about it.
+
+    compute_metrics() otherwise runs config.BOOTSTRAP_SAMPLES resamples on every
+    call, which turns this suite from two seconds into forty. Tests that do
+    exercise it turn it back on with a small sample count.
+
+    Depends on restore_config so that it runs *after* the snapshot is taken, and
+    the real value is put back at teardown.
+    """
+    config.BOOTSTRAP_ENABLED = False
+
+
 @pytest.fixture
 def rng():
     return np.random.default_rng(20260811)

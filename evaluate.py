@@ -7,6 +7,7 @@ Computes and reports:
   - Micro/macro aggregate metrics
   - Calibration metrics (Brier score, ECE)
   - Validation-set threshold tuning for long-tailed labels
+  - Bootstrap confidence intervals on the ranking metrics
 """
 
 import importlib.metadata
@@ -19,7 +20,7 @@ import numpy as np
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, SequentialSampler
 
 from sklearn.metrics import (
     accuracy_score,
@@ -323,16 +324,162 @@ def _normal_vs_abnormal_metrics(labels: np.ndarray, probs: np.ndarray) -> dict:
 # =============================================================================
 # Metrics computation
 # =============================================================================
+# =============================================================================
+# Bootstrap confidence intervals
+# =============================================================================
+def patient_groups(loader: DataLoader) -> np.ndarray:
+    """
+    Patient ID per row, aligned with what collect_predictions returns.
+
+    The alignment is positional: collect_predictions concatenates batches in
+    loader order, so this is only valid for an unshuffled loader. A shuffled one
+    would pair each prediction with some other patient's ID and yield confident,
+    wrong intervals — so it raises rather than guessing.
+    """
+    sampler = getattr(loader, "sampler", None)
+    if not isinstance(sampler, SequentialSampler):
+        raise ValueError(
+            "Patient grouping needs an unshuffled loader; predictions and "
+            f"patient IDs are matched by position. Got sampler {type(sampler).__name__}."
+        )
+
+    frame = loader.dataset.df
+    if config.PATIENT_ID_COLUMN not in frame.columns:
+        raise KeyError(
+            f"No '{config.PATIENT_ID_COLUMN}' column to group the bootstrap by."
+        )
+    return frame[config.PATIENT_ID_COLUMN].to_numpy()
+
+
+def _percentile_ci(values: list[float]) -> list[float] | None:
+    """Two-sided percentile interval, or None if too little of it was scorable."""
+    finite = np.asarray([v for v in values if v is not None and np.isfinite(v)])
+
+    # A handful of degenerate resamples is expected for the rare classes; an
+    # interval built from a handful of points is not worth reporting.
+    if finite.size < 0.5 * max(len(values), 1) or finite.size < 2:
+        return None
+
+    tail = (1.0 - config.BOOTSTRAP_CI) / 2.0
+    lower, upper = np.percentile(finite, [100 * tail, 100 * (1 - tail)])
+    return [round(float(lower), 4), round(float(upper), 4)]
+
+
+def bootstrap_cis(
+    labels: np.ndarray,
+    probs: np.ndarray,
+    groups: np.ndarray | None = None,
+) -> dict:
+    """
+    Percentile confidence intervals for per-class and macro AUROC / AUPRC.
+
+    Resamples the evaluation set with replacement and recomputes the metrics;
+    no retraining is involved, so this is the cheap way to turn five point
+    estimates into five intervals you can actually compare.
+
+    When `groups` is given, whole patients are resampled rather than individual
+    images. ChestX-ray14 carries several studies per patient and those rows are
+    correlated, so an image-level bootstrap treats correlated observations as
+    independent and produces an interval that is too narrow.
+
+    Only the threshold-free metrics get intervals. Precision/recall/F1 depend on
+    thresholds calibrated on the validation set, so an interval around them would
+    blend test-set sampling noise with calibration noise and mean neither.
+
+    Returns a dict with "per_class", "macro", and the settings used.
+    """
+    num_samples = int(config.BOOTSTRAP_SAMPLES)
+    num_rows, num_classes = labels.shape
+    rng = np.random.default_rng(config.SEED)
+
+    # Precompute each group's row indices once; resampling is then a draw over
+    # groups plus one concatenate, rather than a scan of the whole array.
+    if groups is not None:
+        _, inverse = np.unique(groups, return_inverse=True)
+        rows_by_group = [np.flatnonzero(inverse == g) for g in range(inverse.max() + 1)]
+        num_groups = len(rows_by_group)
+        unit = "patient"
+    else:
+        rows_by_group = None
+        num_groups = num_rows
+        unit = "image"
+
+    auroc_draws: list[list[float]] = [[] for _ in range(num_classes)]
+    auprc_draws: list[list[float]] = [[] for _ in range(num_classes)]
+    macro_auroc_draws: list[float] = []
+    macro_auprc_draws: list[float] = []
+
+    for _ in range(num_samples):
+        if rows_by_group is None:
+            index = rng.integers(0, num_rows, num_rows)
+        else:
+            picked = rng.integers(0, num_groups, num_groups)
+            index = np.concatenate([rows_by_group[g] for g in picked])
+
+        sample_labels = labels[index]
+        sample_probs = probs[index]
+
+        sample_auroc, sample_auprc = [], []
+        for class_idx in range(num_classes):
+            targets = sample_labels[:, class_idx]
+            scores = sample_probs[:, class_idx]
+            auroc = class_auroc(targets, scores)
+            auprc = class_auprc(targets, scores)
+            auroc_draws[class_idx].append(auroc)
+            auprc_draws[class_idx].append(auprc)
+            sample_auroc.append(auroc)
+            sample_auprc.append(auprc)
+
+        macro_auroc = macro_average(sample_auroc)
+        macro_auprc = macro_average(sample_auprc)
+        if macro_auroc is not None:
+            macro_auroc_draws.append(macro_auroc)
+        if macro_auprc is not None:
+            macro_auprc_draws.append(macro_auprc)
+
+    return {
+        "settings": {
+            "samples": num_samples,
+            "ci": config.BOOTSTRAP_CI,
+            "resampling_unit": unit,
+            "num_units": int(num_groups),
+            "seed": config.SEED,
+        },
+        "per_class": {
+            class_name: {
+                "auroc": _percentile_ci(auroc_draws[idx]),
+                "auprc": _percentile_ci(auprc_draws[idx]),
+            }
+            for idx, class_name in enumerate(config.CLASS_NAMES)
+        },
+        "macro": {
+            "auroc": _percentile_ci(macro_auroc_draws),
+            "auprc": _percentile_ci(macro_auprc_draws),
+        },
+    }
+
+
 def compute_metrics(
     labels: np.ndarray,
     probs: np.ndarray,
     preds: np.ndarray,
     thresholds: np.ndarray | float | None = None,
+    groups: np.ndarray | None = None,
 ) -> dict:
     """
     Compute a comprehensive set of evaluation metrics.
 
-    Returns a dict containing per-class, macro, micro, and calibration figures.
+    Args:
+        labels: (N, NUM_CLASSES) ground-truth multi-hot.
+        probs: (N, NUM_CLASSES) predicted probabilities.
+        preds: (N, NUM_CLASSES) thresholded predictions.
+        thresholds: Per-class decision thresholds.
+        groups: Optional per-row grouping (patient IDs) for the bootstrap, so
+            correlated studies from one patient resample together. Ignored when
+            config.BOOTSTRAP_ENABLED is False.
+
+    Returns a dict containing per-class, macro, micro, and calibration figures,
+    plus bootstrap confidence intervals on AUROC/AUPRC when enabled.
     """
     if thresholds is None:
         thresholds = np.full(labels.shape[1], config.DEFAULT_THRESHOLD, dtype=np.float32)
@@ -450,6 +597,24 @@ def compute_metrics(
     results["calibration"]["macro_brier"] = round(float(np.mean(per_class_brier)), 4)
     results["calibration"]["macro_ece"] = round(float(np.mean(per_class_ece)), 4)
 
+    # Bootstrap intervals, attached alongside the point estimates they belong to
+    if config.BOOTSTRAP_ENABLED:
+        print(
+            f"[evaluate] Bootstrapping {config.BOOTSTRAP_SAMPLES} resamples "
+            f"({'patient' if groups is not None else 'image'}-level) ..."
+        )
+        intervals = bootstrap_cis(labels, probs, groups=groups)
+        results["bootstrap"] = intervals["settings"]
+
+        for class_name, class_cis in intervals["per_class"].items():
+            results["per_class"][class_name]["auroc_ci"] = class_cis["auroc"]
+            results["per_class"][class_name]["auprc_ci"] = class_cis["auprc"]
+
+        results["macro"]["auroc_ci"] = intervals["macro"]["auroc"]
+        results["macro"]["auprc_ci"] = intervals["macro"]["auprc"]
+    else:
+        results["bootstrap"] = None
+
     return results
 
 
@@ -462,8 +627,16 @@ def print_results(results: dict, model_name: str) -> None:
     print(f"  Evaluation Results - {model_name}")
     print(f"{'=' * 96}")
 
+    bootstrap = results.get("bootstrap")
+
+    def interval(metrics: dict, key: str) -> str:
+        """Render a CI as [lo, hi], or blank when there isn't one."""
+        bounds = metrics.get(key)
+        return f"[{bounds[0]:.3f}, {bounds[1]:.3f}]" if bounds else ""
+
+    ci_header = f"{'AUROC ' + str(int(config.BOOTSTRAP_CI * 100)) + '% CI':>16}" if bootstrap else ""
     header = (
-        f"{'Class':<22} {'Thr':>6} {'AUROC':>8} {'AUPRC':>8} "
+        f"{'Class':<22} {'Thr':>6} {'AUROC':>8}{ci_header} {'AUPRC':>8} "
         f"{'Prec':>7} {'Recall':>7} {'F1':>7} {'Support':>8}"
     )
     print(header)
@@ -472,8 +645,9 @@ def print_results(results: dict, model_name: str) -> None:
     for class_name, metrics in results["per_class"].items():
         auroc = f"{metrics['auroc']:.4f}" if metrics["auroc"] is not None else "N/A"
         auprc = f"{metrics['auprc']:.4f}" if metrics["auprc"] is not None else "N/A"
+        auroc_ci = f"{interval(metrics, 'auroc_ci'):>16}" if bootstrap else ""
         print(
-            f"{class_name:<22} {metrics['threshold']:>6.2f} {auroc:>8} {auprc:>8} "
+            f"{class_name:<22} {metrics['threshold']:>6.2f} {auroc:>8}{auroc_ci} {auprc:>8} "
             f"{metrics['precision']:>7.4f} {metrics['recall']:>7.4f} "
             f"{metrics['f1']:>7.4f} {metrics['support']:>8d}"
         )
@@ -487,14 +661,23 @@ def print_results(results: dict, model_name: str) -> None:
     macro_auprc = f"{macro['auprc']:.4f}" if macro["auprc"] is not None else "N/A"
     micro_auprc = f"{micro['auprc']:.4f}" if micro["auprc"] is not None else "N/A"
 
+    macro_ci = f"{interval(macro, 'auroc_ci'):>16}" if bootstrap else ""
     print(
-        f"{'Macro average':<22} {'-':>6} {macro_auroc:>8} {macro_auprc:>8} "
+        f"{'Macro average':<22} {'-':>6} {macro_auroc:>8}{macro_ci} {macro_auprc:>8} "
         f"{macro['precision']:>7.4f} {macro['recall']:>7.4f} {macro['f1']:>7.4f}"
     )
+    ci_pad = " " * 16 if bootstrap else ""
     print(
-        f"{'Micro average':<22} {'-':>6} {'-':>8} {micro_auprc:>8} "
+        f"{'Micro average':<22} {'-':>6} {'-':>8}{ci_pad} {micro_auprc:>8} "
         f"{micro['precision']:>7.4f} {micro['recall']:>7.4f} {micro['f1']:>7.4f}"
     )
+
+    if bootstrap:
+        print(
+            f"\n  {config.BOOTSTRAP_CI:.0%} CI from {bootstrap['samples']} bootstrap "
+            f"resamples over {bootstrap['num_units']:,} {bootstrap['resampling_unit']}s. "
+            f"Overlapping intervals between two models mean the gap is not resolved."
+        )
     print(f"  Samples F1:                      {macro['samples_f1']:.4f}")
     print(f"  Subset accuracy:                 {macro['subset_accuracy']:.4f}")
     print(f"  Sample accuracy:                 {macro['sample_accuracy']:.4f}")
@@ -696,8 +879,21 @@ def evaluate_model(
     labels, probs, inference_timing = collect_predictions(model, test_loader, device)
     preds = apply_thresholds(probs, thresholds)
 
+    # Resample whole patients, so the interval accounts for several correlated
+    # studies coming from the same person. Losing the grouping is not worth
+    # losing the run over — fall back to image-level and say so.
+    groups = None
+    if config.BOOTSTRAP_ENABLED and config.BOOTSTRAP_GROUP_BY_PATIENT:
+        try:
+            groups = patient_groups(test_loader)
+        except (ValueError, KeyError, AttributeError) as error:
+            print(
+                f"[evaluate] WARNING: falling back to image-level bootstrap "
+                f"({error}). Intervals will be narrower than they should be."
+            )
+
     print("[evaluate] Computing calibrated metrics ...")
-    results = compute_metrics(labels, probs, preds, thresholds=thresholds)
+    results = compute_metrics(labels, probs, preds, thresholds=thresholds, groups=groups)
 
     # Conditions the numbers above were produced under. total_params alone is
     # misleading: a head_only probe trains 14k of DenseNet-121's 7.0M.

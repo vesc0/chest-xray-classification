@@ -170,6 +170,33 @@ THRESHOLD_MIN_SUPPORT = 5
 ECE_BINS = 15
 
 # =============================================================================
+# Bootstrap confidence intervals
+# =============================================================================
+# Resampling the test set puts an uncertainty band on every reported AUROC and
+# AUPRC without retraining anything. With one seed per configuration, point
+# estimates alone cannot support a ranking claim: "0.812 vs 0.818" is not a
+# result until you know whether the interval around each number overlaps.
+#
+# Set to False to skip it — the results JSON then carries point estimates only.
+# The cost is roughly 70 seconds per model on the full 25,596-image test split
+# at the default sample count, against hours of training.
+BOOTSTRAP_ENABLED = True
+
+# Resamples. 1000 is the usual floor for stable 95% percentile bounds; below a
+# few hundred the interval endpoints themselves become noisy.
+BOOTSTRAP_SAMPLES = 1000
+
+# Two-sided interval width, e.g. 0.95 -> 2.5th and 97.5th percentiles.
+BOOTSTRAP_CI = 0.95
+
+# Resample whole patients rather than individual images. ChestX-ray14 has
+# several studies per patient, and images from one patient are correlated, so
+# an image-level bootstrap treats correlated rows as independent and returns an
+# interval that is too narrow. Only set this False if a split is known to be
+# one image per patient.
+BOOTSTRAP_GROUP_BY_PATIENT = True
+
+# =============================================================================
 # Explainability
 # =============================================================================
 # Number of unselected test images to render heatmaps for. 0 disables the step.
