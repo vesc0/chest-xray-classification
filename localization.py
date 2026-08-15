@@ -26,7 +26,11 @@ Reported per class:
   pointing game   does the heatmap's peak fall inside a ground-truth box?
                   Threshold-free and the most robust single number.
   energy fraction share of total heatmap mass inside the box. Also
-                  threshold-free, and less noisy than the peak alone.
+                  threshold-free, and less noisy than the peak alone. Measured
+                  on the un-normalized map: the per-sample min-max the
+                  explainers apply for display would subtract away any uniform
+                  component, and a uniform map is exactly what the random
+                  baseline below is defined as.
   IoU / IoBB      overlap of the *predicted* box (largest connected component
                   of the binarized heatmap) with the ground-truth box, reported
                   as accuracy at each T in config.LOCALIZATION_THRESHOLDS.
@@ -39,6 +43,13 @@ Every metric is reported next to a random baseline (the box's share of the
 image). Without it the numbers are uninterpretable: boxes range from 17.6% of
 the image for Cardiomegaly down to 0.5% for Nodule, so an identical hit rate
 means very different things per class.
+
+Alongside them, `degenerate_fraction`: the share of instances where the
+explainer returned no signal at all — Grad-CAM's ReLU can zero a map entirely.
+Those count as pointing-game misses, which is honest, but a model that scores
+badly by pointing in the wrong place and one that scores badly by producing
+blank maps have failed in different ways, and the aggregate alone cannot tell
+them apart.
 """
 
 import json
@@ -58,7 +69,12 @@ import matplotlib.pyplot as plt
 
 import config
 from dataset import get_eval_transforms, load_metadata
-from explainability import build_explainers, denormalize, release_explainers
+from explainability import (
+    available_explainers,
+    build_explainer,
+    denormalize,
+    release_explainers,
+)
 
 
 # =============================================================================
@@ -155,6 +171,11 @@ def _scale_boxes(boxes: np.ndarray, width: int, height: int) -> np.ndarray:
 
     Uses the file's real dimensions rather than assuming 1024x1024, so this
     keeps working if IMAGE_SIZE or the resize transform ever changes.
+
+    Assumes an independent linear scale per axis, which is only the right
+    mapping while the eval pipeline is a bare square resize. That assumption is
+    checked against the actual transform by
+    check_eval_transform_geometry() rather than left as a comment.
     """
     scale_x = config.IMAGE_SIZE / float(width)
     scale_y = config.IMAGE_SIZE / float(height)
@@ -164,6 +185,80 @@ def _scale_boxes(boxes: np.ndarray, width: int, height: int) -> np.ndarray:
     scaled[:, 2] *= scale_x
     scaled[:, 3] *= scale_y
     return scaled
+
+
+# A correct pipeline scores ~0.97 against the probe below (bicubic softens the
+# rectangle's edges, so exact agreement is not achievable); resize-shorter-side
+# plus a centre crop scores 0.54-0.67. Anything under this is a geometry change.
+TRANSFORM_PROBE_MIN_IOU = 0.90
+
+
+def check_eval_transform_geometry(transform=None) -> None:
+    """
+    Verify that _scale_boxes still describes what the eval transform does.
+
+    Every localization number rests on the box coordinates and the image being
+    put through the *same* geometry. Today they are: get_eval_transforms() is a
+    direct square resize, which is exactly the per-axis linear scale
+    _scale_boxes applies. But that agreement is a coincidence of two files
+    matching, and if it breaks it breaks silently — a centre crop or an
+    aspect-preserving resize offsets every box, degrades every metric, and
+    raises nothing. The failure would read as a model result.
+
+    So this checks behaviour rather than structure: push a synthetic image with
+    a known rectangle through the real transform and confirm the rectangle
+    lands where _scale_boxes predicts. A structural check ("is there a
+    CenterCrop?") only catches the geometry changes someone thought to list;
+    this catches any of them.
+
+    The probe is deliberately non-square. A square probe cannot distinguish a
+    direct resize from a resize-shorter-side, because on square input they
+    agree — and NIH images being square is what would make that mistake
+    survive.
+
+    Raises:
+        RuntimeError: if the transform no longer matches the box scaling.
+    """
+    if transform is None:
+        transform = get_eval_transforms()
+
+    width, height = 300, 200
+    box = np.array([[60.0, 40.0, 90.0, 60.0]])
+
+    probe = np.zeros((height, width, 3), dtype=np.uint8)
+    x, y, w, h = box[0].astype(int)
+    probe[y : y + h, x : x + w] = 255
+
+    seen = denormalize(transform(Image.fromarray(probe))).max(axis=2) > 127
+    expected = _box_mask(_scale_boxes(box, width, height), config.IMAGE_SIZE)
+
+    union = float(np.logical_or(seen, expected).sum())
+    iou = float(np.logical_and(seen, expected).sum()) / union if union > 0 else 0.0
+
+    if iou < TRANSFORM_PROBE_MIN_IOU:
+        raise RuntimeError(
+            "The evaluation transform no longer matches the box scaling in "
+            f"_scale_boxes (probe IoU {iou:.3f} < {TRANSFORM_PROBE_MIN_IOU}). "
+            "_scale_boxes maps original pixels to IMAGE_SIZE with an independent "
+            "linear scale per axis, which is only correct for a direct square "
+            "resize. A centre crop or an aspect-preserving resize needs the same "
+            "change applied there, or every localization metric is scored "
+            "against misplaced boxes."
+        )
+
+
+def _is_degenerate(heatmap: np.ndarray) -> bool:
+    """
+    True when a heatmap carries no signal at all.
+
+    Both explainers normalize each map to [0, 1] by min-max, so a map that was
+    constant before normalization — Grad-CAM's ReLU zeroing one out entirely is
+    the usual cause — comes out uniformly zero rather than uniformly anything
+    else. That is worth naming: such a map still has an argmax, at index 0, and
+    would otherwise be scored as though the model had pointed at the top-left
+    corner.
+    """
+    return float(heatmap.max()) <= 0.0
 
 
 def _box_mask(boxes: np.ndarray, size: int) -> np.ndarray:
@@ -336,6 +431,12 @@ def _summarize(records: list[dict]) -> dict:
             "mean_iou": round(float(np.mean([r["iou"] for r in items])), 4),
             "mean_iobb": round(float(np.mean([r["iobb"] for r in items])), 4),
             "detected_fraction": round(float(np.mean([r["has_detection"] for r in items])), 4),
+            # Share of instances where the explainer returned nothing at all.
+            # These are counted as misses above, which is honest, but a model
+            # scoring 0.2 because it points in the wrong place and one scoring
+            # 0.2 because a fifth of its maps are blank are different failures
+            # and should not read the same.
+            "degenerate_fraction": round(float(np.mean([r["degenerate"] for r in items])), 4),
         }
         for threshold in config.LOCALIZATION_THRESHOLDS:
             key = f"{threshold:g}"
@@ -386,8 +487,23 @@ def _print_summary(summary: dict, model_name: str, method_label: str) -> None:
     print(row)
     print(
         "  'Point' vs 'Rand': pointing-game accuracy against a uniform-heatmap "
-        "baseline (the box's share of the image)."
+        "baseline (the box's share of the image).\n"
+        "  'Energy' is measured on the un-normalized map, so it shares that baseline."
     )
+
+    blank = {
+        name: entry["degenerate_fraction"]
+        for name, entry in summary["per_class"].items()
+        if entry["degenerate_fraction"] > 0
+    }
+    if blank:
+        print(
+            "  WARNING: this explainer returned a blank map for some instances, "
+            "counted as misses:\n"
+            + "".join(f"    {name}: {share:.1%}\n" for name, share in sorted(blank.items()))
+            + "  Those rows are scoring an absent explanation, not a wrong one."
+        )
+
     if summary.get("settings", {}).get("class_agnostic"):
         print(
             "  NOTE: this method is class-agnostic - one map per image, reused for "
@@ -408,6 +524,7 @@ def _score_method(
     method_label: str,
     explainer,
     pairs: list[dict],
+    dataset: "_AnnotatedPairs",
     loader: DataLoader,
     thresholds: np.ndarray,
     device: torch.device,
@@ -419,7 +536,6 @@ def _score_method(
     )
 
     records: list[dict] = []
-    figure_cache: dict[int, tuple] = {}
 
     for batch in loader:
         images = batch["image"].to(device, non_blocking=True)
@@ -429,6 +545,19 @@ def _score_method(
         # point is to test the explanation for the finding that is there.
         # Class-agnostic methods ignore the index and return one map per image.
         heatmaps = explainer.generate_batch(images, class_indices)
+
+        # The energy fraction is measured on the un-normalized map. See
+        # explainability._normalize_per_sample: min-subtraction removes any
+        # uniform component, which is exactly what the random baseline printed
+        # beside this metric is defined as.
+        raw_maps = explainer.last_raw_maps
+        if raw_maps is None:
+            raise RuntimeError(
+                f"{method_label} did not expose last_raw_maps. The energy "
+                "fraction has to be measured before per-sample normalization; "
+                "scoring the normalized map instead would make the metric "
+                "incomparable to its own random baseline."
+            )
 
         # Reuse that forward pass rather than running the model again — a second
         # pass doubles the work and the peak memory for no new information.
@@ -450,11 +579,23 @@ def _score_method(
             )
             truth_mask = _box_mask(boxes, config.IMAGE_SIZE)
             heatmap = heatmaps[position]
+            raw_map = raw_maps[position]
 
-            peak = np.unravel_index(int(np.argmax(heatmap)), heatmap.shape)
-            total = float(heatmap.sum())
+            degenerate = _is_degenerate(heatmap)
             predicted = _predicted_box(heatmap)
             iou, iobb = _overlap_scores(predicted, truth_mask)
+
+            # A map with no signal has an argmax all the same, at index 0. Left
+            # to itself the pointing game would score it as a deliberate point
+            # at the top-left corner — a miss in almost every case, but a *hit*
+            # for any box that happens to reach the corner. Say it is a miss.
+            if degenerate:
+                hit = False
+            else:
+                peak = np.unravel_index(int(np.argmax(heatmap)), heatmap.shape)
+                hit = bool(truth_mask[peak])
+
+            total = float(raw_map.sum())
 
             # A class the image does not have, ranked highest - used to pick
             # illustrative false positives
@@ -465,10 +606,14 @@ def _score_method(
             records.append(
                 {
                     "image": record["image"],
+                    "pair_index": index,
                     "class_name": record["class_name"],
                     "class_idx": class_idx,
-                    "hit": bool(truth_mask[peak]),
-                    "energy_fraction": float(heatmap[truth_mask].sum() / total) if total > 0 else 0.0,
+                    "hit": hit,
+                    "degenerate": degenerate,
+                    "energy_fraction": (
+                        float(raw_map[truth_mask].sum() / total) if total > 0 else 0.0
+                    ),
                     "box_area_fraction": float(truth_mask.mean()),
                     "iou": float(iou),
                     "iobb": float(iobb),
@@ -483,9 +628,6 @@ def _score_method(
                     ),
                 }
             )
-            figure_cache[len(records) - 1] = (
-                images[position].detach().cpu(), heatmap, boxes, predicted,
-            )
 
     summary = _summarize(records)
     summary["settings"] = {
@@ -496,6 +638,9 @@ def _score_method(
         "overlap_thresholds": list(config.LOCALIZATION_THRESHOLDS),
         "iobb_definition": "intersection / predicted box area (Wang et al., 2017)",
         "scored_on": "all annotated instances, regardless of classification outcome",
+        "energy_measured_on": "un-normalized heatmap (min-max removes the uniform "
+                              "component the random baseline is defined as)",
+        "blank_maps_counted_as": "pointing-game misses, reported as degenerate_fraction",
     }
 
     # Same numbers restricted to instances the classifier got right - "when it
@@ -513,52 +658,90 @@ def _score_method(
         json.dump(summary, handle, indent=2)
     print(f"[localization] Metrics saved -> {path}")
 
-    # Qualitative figures: a few per category, not 880 overlays
-    for index, record in enumerate(records):
-        record["_index"] = index
+    # Qualitative figures: a few per category, not 984 overlays
+    saved = _render_cases(
+        _select_cases(records), model_name, method_key, method_label,
+        explainer, dataset, pairs, thresholds, device,
+    )
+    figure_dir = config.XAI_DIR / model_name / "localization" / method_key
+    print(f"[localization] Saved {saved} qualitative figures -> {figure_dir}")
+    return summary
+
+
+def _render_cases(
+    selected: dict[str, list[dict]],
+    model_name: str,
+    method_key: str,
+    method_label: str,
+    explainer,
+    dataset: "_AnnotatedPairs",
+    pairs: list[dict],
+    thresholds: np.ndarray,
+    device: torch.device,
+) -> int:
+    """
+    Draw the chosen examples, re-running the explainer on each one.
+
+    Deliberately re-explains rather than keeping the maps from the scoring pass.
+    Caching them costs ~790 MB — 984 instances of a 3x224x224 image plus its
+    heatmap — to serve at most a couple of dozen figures, and every scored
+    method pays it again. Re-running the explainer on the handful that are
+    actually drawn is a few seconds, and the explainers are deterministic in
+    eval mode, so the redrawn map is the one that was scored.
+
+    The false-positive category was already re-explaining, because its figure
+    has to target the over-predicted class rather than the annotated one. Doing
+    it for every category makes that the ordinary path instead of a special
+    case: the only thing that varies is which class index gets explained.
+    """
     figure_dir = config.XAI_DIR / model_name / "localization" / method_key
     figure_dir.mkdir(parents=True, exist_ok=True)
+    agnostic = bool(getattr(explainer, "class_agnostic", False))
 
     saved = 0
-    for category, chosen in _select_cases(records).items():
+    for category, chosen in selected.items():
         for rank, record in enumerate(chosen):
-            image_tensor, heatmap, boxes, predicted = figure_cache[record["_index"]]
+            sample = dataset[record["pair_index"]]
+            image_tensor = sample["image"]
+            boxes = _scale_boxes(
+                pairs[record["pair_index"]]["boxes"], sample["width"], sample["height"]
+            )
 
             if category == "false_positive":
-                # Re-explain for the over-predicted class; the cached map targets
-                # the annotated class and would not show why this fired.
-                absent_idx = record["top_absent_idx"]
-                heatmap = explainer.generate_batch(
-                    image_tensor.unsqueeze(0).to(device), [absent_idx]
-                )[0]
-                predicted = _predicted_box(heatmap)
-                agnostic = getattr(explainer, "class_agnostic", False)
+                # The over-predicted class: a map for the annotated class would
+                # not show why this fired.
+                target_idx = record["top_absent_idx"]
                 title = (
                     f"false positive - {model_name} / {method_label}\n"
                     f"predicted {record['top_absent_class']} "
                     f"p={record['top_absent_prob']:.2f} "
-                    f"(thr={thresholds[absent_idx]:.2f}) but that class is absent  |  "
+                    f"(thr={thresholds[target_idx]:.2f}) but that class is absent  |  "
                     f"green boxes = true {record['class_name']}"
                     + ("  |  map is class-agnostic" if agnostic else "")
                 )
             else:
+                target_idx = record["class_idx"]
                 title = (
                     f"{category.replace('_', ' ')} - {model_name} / {method_label}\n"
                     f"{record['class_name']}: p={record['probability']:.2f} "
-                    f"(thr={thresholds[record['class_idx']]:.2f})  |  "
+                    f"(thr={thresholds[target_idx]:.2f})  |  "
                     f"hit={record['hit']}  energy={record['energy_fraction']:.2f}  "
                     f"IoBB={record['iobb']:.2f}"
+                    + ("  |  no signal in this map" if record["degenerate"] else "")
                 )
 
+            heatmap = explainer.generate_batch(
+                image_tensor.unsqueeze(0).to(device), [target_idx]
+            )[0]
+
             _save_figure(
-                image_tensor, heatmap, boxes, predicted, title,
+                image_tensor, heatmap, boxes, _predicted_box(heatmap), title,
                 figure_dir / f"{category}_{rank}_{record['image']}",
                 method_label=method_label,
             )
             saved += 1
 
-    print(f"[localization] Saved {saved} qualitative figures -> {figure_dir}")
-    return summary
+    return saved
 
 
 def evaluate_localization(
@@ -579,10 +762,15 @@ def evaluate_localization(
         print(f"[localization] {config.BBOX_CSV} not found - skipping.")
         return {}
 
-    explainers = build_explainers(model, model_name)
-    if not explainers:
+    methods = available_explainers(model_name)
+    if not methods:
         print(f"[localization] No explainer available for '{model_name}' - skipping.")
         return {}
+
+    # Before anything is scored: the box coordinates and the images have to go
+    # through the same geometry, and nothing else in the pipeline would notice
+    # if they stopped doing so.
+    check_eval_transform_geometry()
 
     device = next(model.parameters()).device
     model.eval()
@@ -599,21 +787,28 @@ def evaluate_localization(
 
     # Deliberately not config.BATCH_SIZE — see LOCALIZATION_BATCH_SIZE
     batch_size = max(1, int(config.LOCALIZATION_BATCH_SIZE))
+    dataset = _AnnotatedPairs(pairs, get_eval_transforms())
     loader = DataLoader(
-        _AnnotatedPairs(pairs, get_eval_transforms()),
+        dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=config.NUM_WORKERS,
     )
 
+    # One explainer alive at a time. Grad-CAM's hook is inert outside its own
+    # generate_batch, so holding both would be safe — but a method's pass has no
+    # business keeping another method's hooks and captured activations attached
+    # to the model, and the shorter lifetime is what makes that true by
+    # construction rather than by a flag.
     summaries: dict[str, dict] = {}
-    try:
-        for method_key, method_label, explainer in explainers:
+    for method_key, method_label in methods:
+        explainer = build_explainer(model, model_name, method_key)
+        try:
             summaries[method_key] = _score_method(
                 model, model_name, method_key, method_label,
-                explainer, pairs, loader, thresholds, device,
+                explainer, pairs, dataset, loader, thresholds, device,
             )
-    finally:
-        release_explainers(explainers)
+        finally:
+            release_explainers([(method_key, method_label, explainer)])
 
     return summaries

@@ -22,9 +22,11 @@ from evaluate import THRESHOLD_METRICS, calibrate_thresholds, evaluate_model
 from explainability import generate_explanations
 from localization import evaluate_localization
 from models import build_model
+from sanity_checks import run_sanity_checks
 from train import train_model
 from utils import (
     compare_experiments,
+    compare_localization,
     compare_models,
     plot_training_curves,
     seed_everything,
@@ -104,6 +106,13 @@ def run_pipeline(
     # Weakly-supervised localization against the ground-truth boxes
     print(f"[main] Step 5/5 - Scoring localization against ground-truth boxes ...")
     evaluate_localization(model, model_name, thresholds=thresholds)
+
+    # Whether those localization numbers mean anything: an explanation that
+    # survives having the model's weights randomized was never explaining the
+    # model, and would have scored above the random baseline all the same.
+    if config.SANITY_CHECK_ENABLED:
+        print("[main] Running explanation sanity checks ...")
+        run_sanity_checks(model, model_name)
 
     return results
 
@@ -391,6 +400,7 @@ def main():
     if len(model_names) > 1:
         print("\n[main] Comparing models ...")
         compare_models()
+        compare_localization()
 
     print("\n[main] All done! Check outputs/ for results, thresholds, curves, and XAI visualizations.")
 

@@ -270,6 +270,28 @@ LOCALIZATION_THRESHOLDS = [0.1, 0.25, 0.5, 0.75, 0.9]
 # Qualitative figures saved per category (TP / FN / FP / best / worst)
 LOCALIZATION_NUM_FIGURES = 3
 
+# =============================================================================
+# Explanation sanity checks (Adebayo et al., 2018)
+# =============================================================================
+# Cascading model-parameter randomization: re-explain the same images after
+# progressively destroying the network's weights, and check that the
+# explanation degrades. A method whose maps survive weight randomization is
+# reading the input, not the model — and would still score above the random
+# baseline in localization.py, which is exactly why the check is worth running.
+SANITY_CHECK_ENABLED = True
+
+# Annotated instances the check runs on. The set is re-explained once per stage
+# per method (6 stages x up to 2 methods), so this is the dominant cost;
+# the shape of the falloff is unambiguous well before the standard error on any
+# single row matters.
+SANITY_CHECK_SAMPLES = 64
+
+# Rank correlation against the trained model's own maps, after every parameter
+# in the network has been re-drawn, above which the run is flagged. A heuristic
+# for reading the table, not a threshold from the paper — Adebayo et al. report
+# the falloff and leave the judgement to the reader.
+SANITY_CHECK_ALARM_CORRELATION = 0.5
+
 # Batch size for localization scoring, independent of the training batch size.
 # Grad-CAM needs gradients, which cost several times more memory than plain
 # inference, and MPS degrades sharply past a threshold rather than raising:

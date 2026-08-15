@@ -96,6 +96,7 @@ them would silently decalibrate every reported number.
 5. **Evaluation**: Calibrated models are evaluated on the held-out test set to produce detailed final metrics (`evaluate.py`).
 6. **Explainability (XAI)**: Heatmaps are generated for the predictions — Grad-CAM for every architecture, plus Attention Rollout for ViT (`explainability.py`). Off by default; enable with `--xai-samples N`.
 7. **Weakly-supervised localization**: The heatmaps are scored against the 984 hand-drawn boxes shipped with ChestX-ray14, asking whether a classifier trained only on image-level labels looks in the right place (`localization.py`).
+8. **Sanity checks**: The same explanations are recomputed with the model's weights progressively randomized, to establish that step 7 measured the model at all (`sanity_checks.py`).
 
 The entire workflow is orchestrated natively via the `main.py` entry point.
 
@@ -111,6 +112,7 @@ The entire workflow is orchestrated natively via the `main.py` entry point.
 - `threshold_analysis.py`: Post-hoc comparison of thresholding schemes over those saved probabilities — fits F1 / Youden / fixed-sensitivity operating points, puts a confidence interval on each threshold, and scores them on test. Runs no model.
 - `explainability.py`: Implements the XAI methods — Grad-CAM for all five architectures (each with its own reshape transform), plus Attention Rollout for ViT — and renders heatmap overlays.
 - `localization.py`: Scores those heatmaps against the ground-truth boxes (pointing game, energy fraction, IoU/IoBB) and saves the diagnostic figures.
+- `sanity_checks.py`: Runs the cascading model-parameter randomization test (Adebayo et al., 2018) over every explainer, checking that the explanations degrade as the weights they claim to explain are destroyed.
 - `utils.py`: Provides helper functions for reproducible seeding, run logging, plotting training curves, and building model/experiment comparison tables.
 - `main.py`: The primary command-line interface and orchestrator for running the training, evaluation, and XAI pipelines.
 
@@ -179,6 +181,28 @@ feature maps, so each architecture registers a reshape transform in
 back into a grid; MaxViT ends in grid attention but still emits NCHW, so the
 hybrid needs no special handling).
 
+**The rule for picking those layers: explain each model at the tensor its
+classifier pools.** Choosing by eye invites a different notion of "evidence" per
+architecture, which is the thing the comparison is trying to hold fixed.
+DenseNet-121 is the one deliberate exception. torchvision runs
+`F.relu(features, inplace=True)` between `features` and the pool, so hooking
+`features` — the obvious choice, and the one pytorch-grad-cam's DenseNet example
+uses — captures a tensor the in-place ReLU then overwrites, silently pairing
+post-ReLU activations with pre-ReLU gradients. `denseblock4` is the last tensor
+before that trap; stopping one block short costs little (CAM correlation
+0.80–0.99 on 7 of 8 real radiographs, peak unchanged on 5 of 8) and the
+alternative's failure mode is silent.
+
+**A second asymmetry, alongside the grid size below: what the pooled tensor has
+been normalized by.** SwinV2 and ViT-S both pool straight out of a LayerNorm, so
+their CAMs are computed on features that have been channel-normalized *per
+spatial position*, while DenseNet, ConvNeXtV2 and MaxViT keep raw activation
+magnitudes. This is not a detail with a small effect: moving SwinV2's target
+from `norm` to the pre-norm stage output drops the CAM correlation to 0.25–0.69
+and moves the peak on 8 of 8 images. Both targets are defensible in isolation —
+the rule above is what picks one — but the honest reading is that the two
+transformers measure a slightly different quantity from the three others.
+
 Note the **CAM grid** column. ViT-S/16 produces a 14×14 map where the
 hierarchical models produce 7×7, because a patch-16 transformer keeps one token
 per 16×16 patch while the others have downsampled four times. Upsampled to 224
@@ -206,13 +230,52 @@ method meeting the architecture, not a defect in the implementation. Report it
 as a property of Attention Rollout; do not compare it against Grad-CAM's
 localization as though the two were interchangeable measurements.
 
+### Do the explanations explain the model?
+
+A heatmap that lands on the lungs is not evidence that the method is reading the
+classifier. Adebayo et al., *Sanity Checks for Saliency Maps* (2018), showed that
+several widely used methods produce essentially the same map after the network's
+weights have been randomized — they were tracing edges in the input, and the
+model was decoration. Such a method would pass straight through the localization
+stage above: it would point at anatomy, beat the random baseline, and support a
+completely unearned claim about what the model learned.
+
+`sanity_checks.py` runs the **cascading model-parameter randomization test**.
+Starting from the trained network it randomizes one stage at a time, from the
+classifier down to the stem, re-explains the same images after each step, and
+reports two things per stage:
+
+- **rank correlation** — Spearman correlation against the trained model's own
+  map. Should fall toward zero as randomization cascades; a method whose maps
+  survive intact is not a function of the weights.
+- **pointing game vs random baseline** — the same metric localization reports,
+  recomputed at each step. Localization should collapse to baseline once the
+  layers that produced it are noise.
+
+Both are run for every explainer the architecture supports, because the question
+is asked of the *method*, not the model. Two things are worth knowing before
+reading the table:
+
+- For a **class-agnostic** method the first randomized row cannot move by
+  construction — Attention Rollout never reads the classifier, so randomizing
+  the head is a no-op for it. Read its falloff from the rows below.
+- The headline number is `stages_until_decorrelated`, not just the final row. A
+  method can decorrelate eventually and still be nearly untouched by randomizing
+  the layers it is nominally built from, and that is the interesting failure.
+
+Enabled by default (`config.SANITY_CHECK_ENABLED`); runs on a seeded subsample
+of the annotated instances (`config.SANITY_CHECK_SAMPLES`, default 64), since it
+re-explains the set once per stage per method. Nothing is mutated: every
+randomization is applied to a deep copy, and the global RNG state is saved and
+restored around the run.
+
 ## Tests
 
 ```bash
 pytest
 ```
 
-176 tests, no dataset required — everything is synthetic, so the suite
+266 tests, no dataset required — everything is synthetic, so the suite
 runs with the drive unmounted, no GPU, and no checkpoint on disk. Backbones are
 built with `pretrained=False`, so nothing downloads weights either. It covers
 the pure functions behind the reported numbers:
@@ -222,17 +285,21 @@ the pure functions behind the reported numbers:
 | `metrics.py` | NaN-vs-zero handling for unscorable classes; that training's per-epoch AUROC and evaluation's macro AUROC agree on identical input |
 | `dataset.py` | train/val patient-disjointness; nested subsets (5k ⊂ 15k ⊂ 30k); that a stratified prefix tracks the pool's label distribution better than the best of 20 random draws |
 | preprocessing | bicubic resampling in both pipelines; that train and eval share one geometry; that no centre crop and no horizontal flip creep in; grayscale→3-channel replication |
-| `localization.py` | box scaling, mask union and clipping, largest-connected-component detection, and the IoBB denominator (intersection over the *predicted* box, per Wang et al.) |
+| `localization.py` | box scaling, mask union and clipping, largest-connected-component detection, and the IoBB denominator (intersection over the *predicted* box, per Wang et al.); that the eval transform still matches the box scaling, probed behaviourally with a non-square image rather than by inspecting the transform list; that a signal-free heatmap is a pointing-game miss rather than a point at the top-left corner |
+| `sanity_checks.py` | that every architecture's randomization stages cover the model exactly once, top-down; that randomization re-initializes weights *and* BatchNorm running statistics, reaches bare parameters with no `reset_parameters`, and changes the model's output; that a blank map is excluded from the rank correlation rather than scored as decorrelated |
 | `evaluate.py` | confusion-sweep counts against a brute-force scan; that a class scored entirely below the old grid floor still tunes and still predicts positives; the low-support and degenerate fallbacks; that fixed-sensitivity mode reaches its target and pays for it in specificity; ECE under both binning strategies and that no prediction is dropped from either; that samples-F1 credits a correctly-predicted normal study; that bootstrap intervals contain their own point estimate, widen for rare classes, widen again under patient grouping, and are withheld entirely for unscorable classes; prediction round-trips |
 | `train.py` | asymmetric loss under fp16 and saturating logits; head/backbone split for all five architectures; that freezing also stops BatchNorm statistics drifting |
 | `models.py` | that the factory and `SUPPORTED_MODELS` describe the same roster; that neither timm tag pulls in 21k pretraining; ViT's prefix-token count; that MaxViT is what fixes `IMAGE_SIZE` at 224 |
-| `explainability.py` | ViT token→grid and Swin NHWC reshapes; that every architecture's Grad-CAM target layer still resolves; the 14×14-vs-7×7 CAM grid asymmetry; that Attention Rollout actually captures attention and restores the model afterwards; Grad-CAM under a frozen backbone; hook cleanup |
+| `explainability.py` | ViT token→grid and Swin NHWC reshapes; that every architecture's Grad-CAM target layer still resolves; the 14×14-vs-7×7 CAM grid asymmetry; that Attention Rollout actually captures attention and restores the model afterwards; Grad-CAM under a frozen backbone; hook cleanup; that both explainers expose the pre-normalization map the energy metric needs, and that rollout's floor is what makes that distinction real; that a live Grad-CAM hook stays inert outside its own `generate_batch`, including under `torch.inference_mode()` |
 
 The suite was checked by mutation: deliberately switching the IoBB denominator
 to the union, dropping the loss's fp32 cast, moving the ViT Grad-CAM target to
 the final norm, leaving timm's fused attention enabled so rollout silently
 captures nothing, leaving a stale architecture in the Grad-CAM target table,
 hardcoding the wrong prefix-token count, falling back to bilinear resampling,
+inserting a centre crop into the eval pipeline without updating the box scaling,
+scoring the energy fraction on the normalized instead of the raw heatmap,
+leaving a randomization stage out of the coverage,
 bootstrapping images instead of patients,
 letting frozen BatchNorm keep updating, removing the low-support threshold
 fallback, breaking patient grouping, and replacing stratified subsetting with a
@@ -421,7 +488,8 @@ outputs/<experiment>/
 ├── checkpoints/   # best model weights per architecture
 ├── results/       # metrics JSON, tuned thresholds, raw val/test predictions (.npz),
 │                  # training curves, split summary, threshold analysis,
-│                  # and <model>_localization_<method>.json
+│                  # <model>_localization_<method>.json,
+│                  # and <model>_sanity_checks.json
 ├── logs/          # full console output per run, timestamped
 └── xai/<model>/
     ├── localization/<method>/   # figures with ground-truth boxes drawn

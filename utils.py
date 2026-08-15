@@ -237,6 +237,96 @@ def compare_models(results_dir: Path | None = None) -> None:
     print(f"{'=' * 70}\n")
 
 
+def compare_localization(results_dir: Path | None = None) -> None:
+    """
+    Side-by-side localization for every model scored in results_dir.
+
+    Without this the localization stage writes one JSON per model per method and
+    nothing ever reads them together, so the central XAI question — which
+    architecture actually looks in the right place — has to be answered by
+    opening five files by hand.
+
+    **Deliberately omits IoU and IoBB.** Both depend on the size of the
+    predicted box, and ViT-S/16's CAM grid is 14x14 where the other four are
+    7x7, so ViT gets finer boxes for free (see explainability.py). A caveat
+    printed under a number does not survive the number being quoted, so the
+    overlap metrics stay in the per-model JSONs where they are read next to
+    their own settings block. The pointing game and the energy fraction are far
+    less sensitive to grid size, and both are printed beside the random
+    baseline they have to beat.
+    """
+    results_dir = results_dir or config.RESULTS_DIR
+
+    result_files = sorted(results_dir.glob("*_localization_*.json"))
+    if not result_files:
+        print("[compare] No localization results found.")
+        return
+
+    rows = []
+    for result_file in result_files:
+        # <model>_localization_<method>.json
+        stem = result_file.stem
+        model_name, _, method_key = stem.partition("_localization_")
+        with open(result_file, encoding="utf-8") as handle:
+            summary = json.load(handle)
+
+        macro = summary.get("macro", {})
+        if not macro:
+            continue
+        rows.append({
+            "model": model_name,
+            "method": summary.get("settings", {}).get("method_label", method_key),
+            "instances": summary.get("num_instances", 0),
+            "pointing_game": macro.get("pointing_game"),
+            "random_baseline": macro.get("random_baseline"),
+            "energy_fraction": macro.get("energy_fraction"),
+            "detected_fraction": macro.get("detected_fraction"),
+            "degenerate_fraction": macro.get("degenerate_fraction"),
+            "class_agnostic": summary.get("settings", {}).get("class_agnostic", False),
+        })
+
+    if not rows:
+        print("[compare] No localization summaries could be read.")
+        return
+
+    header = (
+        f"{'Model':<16}{'Method':<20}{'N':>6}{'Point':>8}{'Rand':>8}"
+        f"{'Energy':>8}{'Detect':>8}{'Blank':>8}"
+    )
+    print(f"\n{'=' * len(header)}")
+    print("  Weakly-supervised localization - macro averages across models")
+    print(f"{'=' * len(header)}")
+    print(header)
+    print("-" * len(header))
+
+    def _format(value):
+        return f"{value:>8.3f}" if isinstance(value, (int, float)) else f"{'N/A':>8}"
+
+    for row in sorted(rows, key=lambda r: (r["method"], -(r["pointing_game"] or 0))):
+        marker = " *" if row["class_agnostic"] else ""
+        print(
+            f"{row['model']:<16}{row['method'] + marker:<20}{row['instances']:>6}"
+            + _format(row["pointing_game"]) + _format(row["random_baseline"])
+            + _format(row["energy_fraction"]) + _format(row["detected_fraction"])
+            + _format(row["degenerate_fraction"])
+        )
+
+    print("-" * len(header))
+    print(
+        "  Point vs Rand: pointing-game accuracy against a uniform-heatmap baseline.\n"
+        "  Blank: share of instances where the explainer produced no signal at all,\n"
+        "  counted as misses in Point. IoU/IoBB are omitted here on purpose - they\n"
+        "  favour the finer CAM grid; read them per model, in the localization JSONs."
+    )
+    if any(row["class_agnostic"] for row in rows):
+        print(
+            "  * class-agnostic: one map per image whatever the annotated class, so\n"
+            "    these rows measure where the model attends overall. Not comparable\n"
+            "    to the class-discriminative rows as though they measured the same thing."
+        )
+    print(f"{'=' * len(header)}\n")
+
+
 def _check_comparable(experiments: dict) -> None:
     """
     Warn when runs are not directly comparable.

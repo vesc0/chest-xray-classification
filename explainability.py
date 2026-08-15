@@ -16,13 +16,36 @@ Explainability module
        MaxViT-T       blocks[-1]              NCHW already        7x7
        ViT-S/16       blocks[-1].norm1        tokens -> grid    14x14
 
-     Note the resolution in the last column. ViT-S produces a 14x14 CAM where
-     the other four produce 7x7, because a patch-16 transformer keeps one token
-     per 16x16 patch while the hierarchical models have downsampled four times.
-     Upsampled to 224 this gives ViT finer predicted boxes for free, which
-     inflates the IoU/IoBB numbers in localization.py relative to the rest. The
-     pointing game is far less sensitive to it; interpret the overlap metrics
-     with the grid size in mind.
+     **The rule these follow: explain each model at the tensor its classifier
+     pools.** Picking layers by eye invites a different notion of "evidence"
+     per architecture, which is exactly what the comparison is trying to hold
+     fixed. Four of the five obey it directly — ConvNeXtV2, MaxViT and SwinV2
+     all pool their registered layer's output, and ViT's final norm is
+     unusable for a separate reason given at its registry entry. DenseNet is
+     the deliberate exception, documented there.
+
+     Two consequences of the rule are worth carrying into any reading of the
+     results, because both are asymmetries between architectures rather than
+     between models:
+
+     **Grid size.** ViT-S produces a 14x14 CAM where the other four produce
+     7x7, because a patch-16 transformer keeps one token per 16x16 patch while
+     the hierarchical models have downsampled four times. Upsampled to 224 this
+     gives ViT finer predicted boxes for free, which inflates the IoU/IoBB
+     numbers in localization.py relative to the rest. The pointing game is far
+     less sensitive to it; interpret the overlap metrics with the grid size in
+     mind.
+
+     **What the pooled tensor has been normalized by.** SwinV2 and ViT-S both
+     pool straight out of a LayerNorm, so their CAMs are computed on features
+     that have been channel-normalized *per spatial position*; DenseNet,
+     ConvNeXtV2 and MaxViT keep raw activation magnitudes. That is not a free
+     choice with a small effect: moving SwinV2's target from `norm` to the
+     pre-norm stage output, measured on eight real radiographs, drops the CAM
+     correlation to 0.25-0.69 and moves the peak on 8 of 8 images. Both targets
+     are defensible in isolation — the rule above is what picks one, and the
+     alternative reading is that the two transformers are measuring a slightly
+     different quantity from the three others.
 
   2. Attention Rollout — ViT-S/16 only, as an architecture-native second view
      Recursively multiplies attention matrices across all transformer layers
@@ -96,6 +119,28 @@ def _tokens_to_grid(tensor: torch.Tensor, num_prefix_tokens: int = 1) -> torch.T
     return tokens.reshape(batch, grid_size, grid_size, channels).permute(0, 3, 1, 2).contiguous()
 
 
+def _normalize_per_sample(maps: torch.Tensor) -> torch.Tensor:
+    """
+    Min-max each (H, W) map in a batch to [0, 1], independently.
+
+    This is a *display and thresholding* normalization: it puts every heatmap on
+    the same scale so overlays are readable and so localization's
+    binarize-at-half-the-maximum step means the same thing for every method.
+
+    It is not the right input to an energy-style metric. Subtracting the minimum
+    removes any uniform component the map has, and localization.py's random
+    baseline is defined as precisely the score a uniform map achieves. Measure
+    energy on a min-subtracted map and the metric is no longer on the same
+    footing as the baseline it is printed next to. Both explainers therefore
+    keep the pre-normalization map in `last_raw_maps`, and that is what the
+    energy fraction reads.
+    """
+    flat = maps.flatten(1)
+    minimum = flat.min(dim=1).values.view(-1, 1, 1)
+    maximum = flat.max(dim=1).values.view(-1, 1, 1)
+    return (maps - minimum) / (maximum - minimum + 1e-8)
+
+
 def _fixed(transform):
     """
     Wrap a model-independent reshape as a factory.
@@ -112,6 +157,15 @@ def _fixed(transform):
 # quiet rather than loud: a transformer layout fed straight into the CNN maths
 # produces a plausible-looking but meaningless heatmap.
 GRADCAM_TARGETS: dict = {
+    # The one architecture NOT hooked at the tensor its classifier pools, and
+    # deliberately: torchvision's DenseNet runs `F.relu(features, inplace=True)`
+    # between `features` and the pool. Hooking `features` — the obvious choice,
+    # and the one pytorch-grad-cam's DenseNet example uses — captures a tensor
+    # that the in-place ReLU then overwrites, silently pairing post-ReLU
+    # activations with pre-ReLU gradients. denseblock4 is the last tensor before
+    # that trap. Measured cost of stopping one block short, on real
+    # radiographs: CAM correlation 0.80-0.99 on 7 of 8 images, peak unchanged on
+    # 5 of 8. Cheaper than the alternative's failure mode, which is silent.
     "densenet121": (
         lambda model: model.backbone.features.denseblock4,
         _fixed(_identity_transform),
@@ -120,6 +174,10 @@ GRADCAM_TARGETS: dict = {
         lambda model: model.backbone.stages[-1],
         _fixed(_identity_transform),
     ),
+    # The final LayerNorm, whose output is what torchvision pools. See the
+    # module docstring on what LayerNorm does to a CAM: this is the rule being
+    # applied, not an oversight, and the pre-norm alternative gives a
+    # substantially different map.
     "swin_v2_t": (
         lambda model: model.backbone.norm,
         _fixed(_nhwc_to_nchw),
@@ -158,6 +216,11 @@ class GradCAM:
     # Logits from the most recent generate_batch forward pass
     last_logits: torch.Tensor | None = None
 
+    # Heatmaps from the most recent generate_batch, BEFORE per-sample min-max
+    # normalization. localization.py's energy fraction needs these; see
+    # generate_batch for why the normalized map is the wrong input to it.
+    last_raw_maps: np.ndarray | None = None
+
     def __init__(self, model: nn.Module, model_name: str = "densenet121"):
         self.model = model
         self.model.eval()
@@ -165,6 +228,14 @@ class GradCAM:
         # Store intermediate activations and gradients
         self.activations: torch.Tensor | None = None
         self.gradients: torch.Tensor | None = None
+
+        # The hook is live for the object's whole lifetime but only *captures*
+        # between these two points, set by generate_batch. Without the gate, an
+        # instance built alongside another explainer (build_explainers returns
+        # both for ViT) would fire on that explainer's forward passes too:
+        # harmless today, but it calls requires_grad_() on the captured tensor,
+        # which raises the moment any caller switches to torch.inference_mode().
+        self._capturing = False
 
         if model_name not in GRADCAM_TARGETS:
             raise ValueError(
@@ -192,6 +263,7 @@ class GradCAM:
         self.activations = None
         self.gradients = None
         self._captured = None
+        self._capturing = False
 
     def __enter__(self) -> "GradCAM":
         return self
@@ -216,7 +288,11 @@ class GradCAM:
 
         requires_grad_ is only valid on a leaf; when the backbone *is* trainable
         the output already carries a grad_fn and needs no help.
+
+        Does nothing outside a generate_batch call — see self._capturing.
         """
+        if not self._capturing:
+            return
         if not output.requires_grad:
             output.requires_grad_(True)
         self._captured = output
@@ -246,26 +322,30 @@ class GradCAM:
         self._captured = None
 
         # Gradients are needed even under an outer torch.no_grad()
-        with torch.enable_grad():
-            logits = self.model(images.detach())
+        self._capturing = True
+        try:
+            with torch.enable_grad():
+                logits = self.model(images.detach())
 
-            if self._captured is None:
-                raise RuntimeError(
-                    "Target layer produced no activation — the registered layer "
-                    "was not executed during the forward pass."
-                )
+                if self._captured is None:
+                    raise RuntimeError(
+                        "Target layer produced no activation — the registered layer "
+                        "was not executed during the forward pass."
+                    )
 
-            if not isinstance(class_indices, torch.Tensor):
-                class_indices = torch.tensor(class_indices, device=logits.device)
-            class_indices = class_indices.to(logits.device).long()
+                if not isinstance(class_indices, torch.Tensor):
+                    class_indices = torch.tensor(class_indices, device=logits.device)
+                class_indices = class_indices.to(logits.device).long()
 
-            rows = torch.arange(logits.size(0), device=logits.device)
-            selected = logits[rows, class_indices].sum()
+                rows = torch.arange(logits.size(0), device=logits.device)
+                selected = logits[rows, class_indices].sum()
 
-            # Only the target layer's gradient is required. autograd.grad walks
-            # back just that far and leaves parameter .grad untouched, so this
-            # is safe to call on a model mid-training.
-            (raw_gradients,) = torch.autograd.grad(selected, self._captured)
+                # Only the target layer's gradient is required. autograd.grad
+                # walks back just that far and leaves parameter .grad untouched,
+                # so this is safe to call on a model mid-training.
+                (raw_gradients,) = torch.autograd.grad(selected, self._captured)
+        finally:
+            self._capturing = False
 
         self.activations = self.reshape_transform(self._captured.detach())
         self.gradients = self.reshape_transform(raw_gradients.detach())
@@ -284,11 +364,13 @@ class GradCAM:
         cam = F.interpolate(cam, size=images.shape[2:], mode="bilinear", align_corners=False)
         cam = cam.squeeze(1)
 
-        # Normalize each sample independently
-        flat = cam.flatten(1)
-        minimum = flat.min(dim=1).values.view(-1, 1, 1)
-        maximum = flat.max(dim=1).values.view(-1, 1, 1)
-        cam = (cam - minimum) / (maximum - minimum + 1e-8)
+        # Kept before normalization. Grad-CAM's ReLU already floors these at 0,
+        # so min-max is a pure rescale here and the two agree — but the
+        # localization energy metric has to read the same attribute for every
+        # method, and for Attention Rollout the difference is real.
+        self.last_raw_maps = cam.detach().cpu().numpy()
+
+        cam = _normalize_per_sample(cam)
 
         return cam.detach().cpu().numpy()
 
@@ -348,6 +430,13 @@ class AttentionRollout:
 
     # Logits from the most recent generate_batch forward pass
     last_logits: torch.Tensor | None = None
+
+    # Heatmaps from the most recent generate_batch, BEFORE per-sample min-max
+    # normalization. Unlike Grad-CAM this is not a formality: rolled-up
+    # attention is strictly positive and carries a substantial uniform floor, so
+    # min-subtraction removes exactly the component localization's random
+    # baseline is defined against.
+    last_raw_maps: np.ndarray | None = None
 
     def __init__(self, model: nn.Module):
         self.model = model
@@ -476,13 +565,9 @@ class AttentionRollout:
             grid, size=(height, width), mode="bilinear", align_corners=False
         ).squeeze(1)
 
-        # Normalize each sample independently
-        flat = heatmaps.flatten(1)
-        minimum = flat.min(dim=1).values.view(-1, 1, 1)
-        maximum = flat.max(dim=1).values.view(-1, 1, 1)
-        heatmaps = (heatmaps - minimum) / (maximum - minimum + 1e-8)
+        self.last_raw_maps = heatmaps.cpu().numpy()
 
-        return heatmaps.cpu().numpy()
+        return _normalize_per_sample(heatmaps).cpu().numpy()
 
     def generate(self, image: torch.Tensor, class_idx: int | None = None) -> np.ndarray:
         """
@@ -562,24 +647,63 @@ def overlay_heatmap(
 # =============================================================================
 # Explainer selection
 # =============================================================================
-def build_explainers(model: nn.Module, model_name: str) -> list[tuple[str, str, object]]:
+def available_explainers(model_name: str) -> list[tuple[str, str]]:
     """
-    Explainers available for an architecture, as (key, label, instance).
+    Methods defined for an architecture, as (key, label) — nothing instantiated.
 
     Grad-CAM for every model so results are comparable across architectures;
     Attention Rollout additionally for ViT-S/16 as a native second view — it is
-    not defined for SwinV2 or MaxViT, see the module docstring. Shared by the
-    qualitative sampler and the localization scorer so the two can never
-    disagree about which methods exist.
+    not defined for SwinV2 or MaxViT, see the module docstring.
 
-    Grad-CAM instances attach hooks — call remove_hooks() when finished.
+    Separate from build_explainer so a caller can plan a run over the methods
+    without holding a live explainer, which is what lets localization.py keep
+    exactly one attached at a time.
     """
-    explainers: list[tuple[str, str, object]] = []
+    methods: list[tuple[str, str]] = []
     if model_name in GRADCAM_TARGETS:
-        explainers.append(("gradcam", "Grad-CAM", GradCAM(model, model_name=model_name)))
+        methods.append(("gradcam", "Grad-CAM"))
     if model_name == "vit_s_16":
-        explainers.append(("rollout", "Attention Rollout", AttentionRollout(model)))
-    return explainers
+        methods.append(("rollout", "Attention Rollout"))
+    return methods
+
+
+def build_explainer(model: nn.Module, model_name: str, method_key: str) -> object:
+    """
+    Instantiate one explainer by key. Grad-CAM attaches a hook — release it with
+    release_explainers, or use it as a context manager.
+
+    Checked against what the architecture actually supports, not just against
+    the set of implemented methods: an AttentionRollout over a CNN would build
+    without complaint and fail later looking for transformer blocks, several
+    layers away from the mistake.
+    """
+    available = [key for key, _ in available_explainers(model_name)]
+    if method_key not in available:
+        raise ValueError(
+            f"Unknown explainer '{method_key}' for '{model_name}'. "
+            f"Available: {available}"
+        )
+    if method_key == "gradcam":
+        return GradCAM(model, model_name=model_name)
+    return AttentionRollout(model)
+
+
+def build_explainers(model: nn.Module, model_name: str) -> list[tuple[str, str, object]]:
+    """
+    Every explainer for an architecture at once, as (key, label, instance).
+
+    For callers that genuinely need all methods live together —
+    generate_explanations runs each one over the same image before moving on,
+    so it would otherwise re-read the loader once per method. Callers that
+    process a method at a time should use available_explainers +
+    build_explainer instead and keep each instance's lifetime to its own pass.
+
+    Grad-CAM instances attach hooks — call release_explainers() when finished.
+    """
+    return [
+        (key, label, build_explainer(model, model_name, key))
+        for key, label in available_explainers(model_name)
+    ]
 
 
 def release_explainers(explainers: list[tuple[str, str, object]]) -> None:
@@ -645,67 +769,71 @@ def generate_explanations(
     method_list = ", ".join(label for _, label, _ in explainers)
     print(f"[xai] Generating {method_list} visualizations for {model_name} …")
 
-    # Iterate over test dataset
+    # Iterate over test dataset. Explaining runs a batch at a time rather than
+    # an image at a time: the target class has to be picked from the
+    # probabilities before any explainer runs, so the cost per group of images
+    # is one plain forward plus one per method, whatever the group size.
     count = 0
     try:
         for batch in test_loader:
-            images = batch["image"]
-            labels = batch["label"]
-            filenames = batch["filename"]
+            take = min(batch["image"].size(0), num_samples - count)
+            if take <= 0:
+                break
 
-            for i in range(images.size(0)):
-                if count >= num_samples:
-                    break
+            images = batch["image"][:take]
+            labels = batch["label"][:take]
+            filenames = batch["filename"][:take]
+            device_images = images.to(device)
 
-                img = images[i].unsqueeze(0).to(device)
-                label_vec = labels[i].numpy()
+            with torch.no_grad():
+                probs = torch.sigmoid(model(device_images)).cpu().numpy()
 
-                # Find the predicted (or ground-truth) top class for visualization - Forward pass
-                with torch.no_grad():
-                    logits = model(img)
-                    probs = torch.sigmoid(logits).cpu().numpy().flatten()
-
-                # Select class using calibrated thresholds
-                positive_indices = np.where(probs >= thresholds)[0]
+            # Select one class per image using the calibrated thresholds
+            target_classes: list[int] = []
+            selection_notes: list[str] = []
+            for row in probs:
+                positive_indices = np.where(row >= thresholds)[0]
                 if positive_indices.size > 0:
-                    top_class_idx = int(positive_indices[probs[positive_indices].argmax()])
-                    selection_note = "Calibrated positive"
+                    target_classes.append(
+                        int(positive_indices[row[positive_indices].argmax()])
+                    )
+                    selection_notes.append("Calibrated positive")
                 else:
-                    top_class_idx = int(probs.argmax())
-                    selection_note = "No calibrated positive; showing top score"
+                    target_classes.append(int(row.argmax()))
+                    selection_notes.append("No calibrated positive; showing top score")
 
-                top_class_name = config.CLASS_NAMES[top_class_idx]
-                top_prob = probs[top_class_idx]
-                top_threshold = thresholds[top_class_idx]
+            # Same images and same target classes through every explainer
+            for method_key, method_label, explainer in explainers:
+                heatmaps = explainer.generate_batch(device_images, target_classes)
 
-                # Ground truth labels
-                gt_classes = [config.CLASS_NAMES[j] for j, v in enumerate(label_vec) if v > 0.5]
-                gt_str = ", ".join(gt_classes) if gt_classes else "No Finding"
+                for i in range(take):
+                    top_class_idx = target_classes[i]
+                    gt_classes = [
+                        config.CLASS_NAMES[j]
+                        for j, value in enumerate(labels[i].numpy())
+                        if value > 0.5
+                    ]
 
-                # Same image and same target class through every explainer
-                stem = filenames[i].replace(".png", "")
-                for method_key, method_label, explainer in explainers:
-                    heatmap = explainer.generate(img, top_class_idx)
-
-                    note = selection_note
+                    note = selection_notes[i]
                     if method_key == "rollout":
-                        note = f"{selection_note} (rollout is class-agnostic)"
+                        note = f"{note} (rollout is class-agnostic)"
 
                     title = (
                         f"{method_label} — {model_name}\n"
-                        f"{note}: {top_class_name} "
-                        f"({top_prob:.2f}, thr={top_threshold:.2f})"
-                        f"  |  GT: {gt_str}"
+                        f"{note}: {config.CLASS_NAMES[top_class_idx]} "
+                        f"({probs[i, top_class_idx]:.2f}, "
+                        f"thr={thresholds[top_class_idx]:.2f})"
+                        f"  |  GT: {', '.join(gt_classes) if gt_classes else 'No Finding'}"
                     )
-                    save_path = str(
-                        xai_dir / method_key / f"sample_{count:03d}_{stem}.png"
+                    stem = filenames[i].replace(".png", "")
+                    overlay_heatmap(
+                        images[i],
+                        heatmaps[i],
+                        title,
+                        str(xai_dir / method_key / f"sample_{count + i:03d}_{stem}.png"),
                     )
-                    overlay_heatmap(images[i], heatmap, title, save_path)
 
-                count += 1
-
-            if count >= num_samples:
-                break
+            count += take
     finally:
         # Grad-CAM leaves hooks on the model; always take them off again
         release_explainers(explainers)

@@ -9,9 +9,20 @@ left to whoever reads the code next.
 
 import numpy as np
 import pytest
+import torch
+from torchvision import transforms
 
 import config
-from localization import _box_mask, _overlap_scores, _predicted_box, _scale_boxes
+from dataset import RESIZE_INTERPOLATION, get_eval_transforms
+from localization import (
+    TRANSFORM_PROBE_MIN_IOU,
+    _box_mask,
+    _is_degenerate,
+    _overlap_scores,
+    _predicted_box,
+    _scale_boxes,
+    check_eval_transform_geometry,
+)
 
 
 class TestScaleBoxes:
@@ -38,6 +49,75 @@ class TestScaleBoxes:
         original = boxes.copy()
         _scale_boxes(boxes, width=1024, height=1024)
         assert np.array_equal(boxes, original)
+
+
+class TestEvalTransformGeometry:
+    """
+    The probe that ties _scale_boxes to the transform the images actually go
+    through. Every localization number depends on those two agreeing, and if
+    they stop agreeing nothing else in the pipeline notices.
+    """
+
+    def test_the_real_eval_pipeline_passes(self):
+        check_eval_transform_geometry()
+
+    def test_a_centre_crop_is_rejected(self):
+        """
+        Resize-shorter-side plus a centre crop is the most likely thing for
+        someone to reach for, and it offsets every box while raising nothing.
+        """
+        cropping = transforms.Compose([
+            transforms.Resize(256, interpolation=RESIZE_INTERPOLATION),
+            transforms.CenterCrop(config.IMAGE_SIZE),
+            transforms.ToTensor(),
+            transforms.Normalize(config.IMAGENET_MEAN, config.IMAGENET_STD),
+        ])
+        with pytest.raises(RuntimeError, match="no longer matches the box scaling"):
+            check_eval_transform_geometry(cropping)
+
+    def test_an_aspect_preserving_resize_is_rejected(self):
+        """
+        Resize(224) on its own is square-in, square-out — which is why the probe
+        is not square. On a non-square image it letterboxes relative to what
+        _scale_boxes assumes.
+        """
+        aspect = transforms.Compose([
+            transforms.Resize(config.IMAGE_SIZE, interpolation=RESIZE_INTERPOLATION),
+            transforms.CenterCrop(config.IMAGE_SIZE),
+            transforms.ToTensor(),
+            transforms.Normalize(config.IMAGENET_MEAN, config.IMAGENET_STD),
+        ])
+        with pytest.raises(RuntimeError, match="no longer matches the box scaling"):
+            check_eval_transform_geometry(aspect)
+
+    def test_the_threshold_leaves_room_for_resampling_softness(self):
+        """
+        Bicubic softens the probe rectangle's edges, so a correct pipeline
+        cannot score 1.0. The gap between what it does score and what a wrong
+        pipeline scores is the margin this threshold sits in; if it ever
+        narrows, the check starts either missing changes or failing spuriously.
+        """
+        assert 0.5 < TRANSFORM_PROBE_MIN_IOU < 0.97
+
+
+class TestIsDegenerate:
+    def test_an_all_zero_map_is_degenerate(self):
+        assert _is_degenerate(np.zeros((224, 224)))
+
+    def test_a_map_with_a_peak_is_not(self):
+        heatmap = np.zeros((224, 224))
+        heatmap[100, 100] = 1.0
+        assert not _is_degenerate(heatmap)
+
+    def test_a_constant_map_normalizes_to_zero_and_is_caught(self):
+        """
+        min-max on a constant map yields zeros, which is the form a signal-free
+        map actually reaches localization in — not a constant non-zero one.
+        """
+        from explainability import _normalize_per_sample
+
+        constant = _normalize_per_sample(torch.full((1, 8, 8), 0.7)).numpy()[0]
+        assert _is_degenerate(constant)
 
 
 class TestBoxMask:

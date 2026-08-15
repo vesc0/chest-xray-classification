@@ -16,7 +16,10 @@ from explainability import (
     AttentionRollout,
     GradCAM,
     _nhwc_to_nchw,
+    _normalize_per_sample,
     _tokens_to_grid,
+    available_explainers,
+    build_explainer,
     build_explainers,
     denormalize,
     release_explainers,
@@ -258,6 +261,117 @@ class TestAttentionRollout:
 
         with pytest.raises(RuntimeError, match="captured no attention"):
             rollout.generate_batch(torch.randn(1, 3, config.IMAGE_SIZE, config.IMAGE_SIZE))
+
+
+class TestNormalization:
+    def test_each_sample_is_normalized_independently(self):
+        maps = torch.stack([torch.tensor([[0.0, 1.0]]), torch.tensor([[5.0, 9.0]])])
+        result = _normalize_per_sample(maps)
+        assert result[0].flatten().tolist() == pytest.approx([0.0, 1.0])
+        assert result[1].flatten().tolist() == pytest.approx([0.0, 1.0])
+
+    def test_a_constant_map_collapses_to_zero(self):
+        """
+        The signature localization._is_degenerate looks for. A constant map has
+        no peak to point with, and this is the form it arrives in.
+        """
+        assert _normalize_per_sample(torch.full((1, 4, 4), 3.0)).max() == 0.0
+
+
+class TestRawMaps:
+    """
+    The energy fraction is measured before normalization, because min-max
+    subtracts away exactly the uniform component the random baseline is defined
+    as. Both explainers therefore have to expose the pre-normalization map.
+    """
+
+    @pytest.mark.parametrize("name", ["densenet121", "vit_s_16"])
+    def test_gradcam_exposes_maps_before_normalization(self, name, model_cache):
+        images = torch.randn(2, 3, config.IMAGE_SIZE, config.IMAGE_SIZE)
+        with GradCAM(model_cache(name), model_name=name) as cam:
+            cam.generate_batch(images, [0, 1])
+            raw = cam.last_raw_maps
+
+        assert raw.shape == (2, config.IMAGE_SIZE, config.IMAGE_SIZE)
+        assert (raw >= 0).all()  # Grad-CAM's ReLU floors these
+
+    def test_rollout_exposes_maps_before_normalization(self, model_cache):
+        rollout = AttentionRollout(model_cache("vit_s_16"))
+        rollout.generate_batch(torch.randn(2, 3, config.IMAGE_SIZE, config.IMAGE_SIZE))
+
+        assert rollout.last_raw_maps.shape == (2, config.IMAGE_SIZE, config.IMAGE_SIZE)
+        assert (rollout.last_raw_maps >= 0).all()
+
+    def test_rollouts_raw_map_has_the_floor_that_normalization_removes(self, model_cache):
+        """
+        The reason this matters. Rolled-up attention is strictly positive with a
+        substantial floor, so min-subtraction is not a rescale for it — measure
+        energy on the normalized map and the metric no longer shares a baseline
+        with the uniform-heatmap number printed beside it.
+        """
+        rollout = AttentionRollout(model_cache("vit_s_16"))
+        normalized = rollout.generate_batch(
+            torch.randn(1, 3, config.IMAGE_SIZE, config.IMAGE_SIZE)
+        )
+        raw = rollout.last_raw_maps
+
+        assert raw.min() > 0.0
+        assert normalized.min() == pytest.approx(0.0, abs=1e-6)
+        # The floor is a real share of the map, not a rounding artifact
+        assert raw.min() / raw.max() > 0.01
+
+
+class TestHookGating:
+    def test_the_hook_does_not_capture_outside_generate_batch(self, model_cache):
+        """
+        Grad-CAM and rollout are both live during ViT's XAI stage. An always-on
+        hook fires on the other explainer's forward passes, calling
+        requires_grad_() on a tensor inside no_grad — harmless now, and an
+        exception the moment any caller uses torch.inference_mode().
+        """
+        model = model_cache("densenet121")
+        with GradCAM(model, model_name="densenet121") as cam:
+            with torch.no_grad():
+                model(torch.randn(1, 3, config.IMAGE_SIZE, config.IMAGE_SIZE))
+            assert cam._captured is None
+
+    def test_a_live_explainer_survives_an_inference_mode_forward(self, model_cache):
+        model = model_cache("densenet121")
+        with GradCAM(model, model_name="densenet121"):
+            with torch.inference_mode():
+                model(torch.randn(1, 3, config.IMAGE_SIZE, config.IMAGE_SIZE))
+
+    def test_capturing_is_off_again_after_a_failed_generate(self, model_cache):
+        """The flag is cleared in a finally, so one bad call cannot arm it forever."""
+        cam = GradCAM(model_cache("densenet121"), model_name="densenet121")
+        try:
+            with pytest.raises(Exception):
+                cam.generate_batch(torch.randn(1, 3, 8, 8), [0])  # wrong input size
+            assert not cam._capturing
+        finally:
+            cam.remove_hooks()
+
+
+class TestExplainerConstruction:
+    @pytest.mark.parametrize("name", ARCHITECTURES)
+    def test_available_explainers_needs_no_model(self, name):
+        """
+        Localization plans its run over the methods before instantiating any of
+        them, which is what lets it keep one explainer attached at a time.
+        """
+        assert [key for key, _ in available_explainers(name)][0] == "gradcam"
+
+    def test_available_explainers_agrees_with_build_explainers(self, model_cache):
+        for name in ARCHITECTURES:
+            explainers = build_explainers(model_cache(name), name)
+            try:
+                assert [(k, l) for k, l, _ in explainers] == available_explainers(name)
+            finally:
+                release_explainers(explainers)
+
+    def test_build_explainer_rejects_a_method_the_model_does_not_have(self, model_cache):
+        with pytest.raises(ValueError, match="Unknown explainer"):
+            build_explainer(model_cache("densenet121"), "densenet121", "rollout")
 
 
 class TestBuildExplainers:
