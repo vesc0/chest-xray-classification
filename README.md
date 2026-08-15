@@ -125,7 +125,7 @@ pretraining data:
 | `--model`      | Architecture | Family        | Params | Source | Weights |
 | -------------- | ------------ | ------------- | ------ | ------ | ------- |
 | `densenet121`  | DenseNet-121 | CNN baseline  | 7.0M   | torchvision | `IMAGENET1K_V1` |
-| `vit_s_16`     | ViT-S/16     | pure ViT      | 21.7M  | timm   | `deit_small_patch16_224.fb_in1k` |
+| `vit_s_16`     | ViT-S/16     | pure ViT      | 21.7M  | timm   | `deit3_small_patch16_224.fb_in1k` |
 | `convnextv2_t` | ConvNeXtV2-T | modern CNN    | 27.9M  | timm   | `convnextv2_tiny.fcmae_ft_in1k` |
 | `swin_v2_t`    | SwinV2-T     | modern ViT    | 27.6M  | torchvision | `IMAGENET1K_V1` |
 | `maxvit_t`     | MaxViT-T     | hybrid CNN/ViT| 30.4M  | torchvision | `IMAGENET1K_V1` |
@@ -136,12 +136,42 @@ ImageNet figures usually quoted.
 
 **What is held constant.** The last four models sit in a 22–31M band, so
 "modern CNN vs modern ViT" is a comparison at matched capacity. Every model is
-pretrained on **ImageNet-1k only** — no IN21k/IN22k checkpoint is used even
-where one exists, because DenseNet, SwinV2 and MaxViT have no IN21k option
-here, and using 21k for the two that do would confound architecture with
-pretraining data while specifically flattering the pure ViT. Every model takes
-**224×224 input with ImageNet normalization**, so a single shared transform
-serves the whole roster.
+pretrained on **ImageNet-1k only** — no IN21k/IN22k checkpoint is used by
+default even where one exists, because DenseNet, SwinV2 and MaxViT have no
+IN21k option here, and using 21k for the two that do would confound
+architecture with pretraining data while specifically flattering the pure ViT.
+Every model takes **224×224 input with ImageNet normalization**, so a single
+shared transform serves the whole roster.
+
+### Overriding the checkpoint (`--weight-tag`)
+
+Holding pretraining data fixed is what makes the architecture comparison valid,
+but *how much pretraining data is worth* is a separate question worth asking on
+a fixed architecture. `--weight-tag` answers it without disturbing the roster:
+
+```bash
+python main.py --model vit_s_16 --weight-tag deit3_small_patch16_224.fb_in22k_ft_in1k --experiment vit_in22k
+```
+
+ViT-S is the model this is designed around. `deit3_small_patch16_224.fb_in1k`
+and `deit3_small_patch16_224.fb_in22k_ft_in1k` are the same architecture from
+the same authors under the same recipe and the same normalization, differing
+only in the pretraining corpus — so **the default ViT-S run is already the
+control** for the 22k run, and no extra baseline is needed. (The 22k checkpoint
+does carry an additional IN1k fine-tuning stage that the IN1k one does not;
+that is inherent to any 21k-vs-1k comparison, and worth stating alongside the
+result.)
+
+Two guards, because the failure mode here is a run that trains fine and reports
+a wrong number:
+
+- The flag is rejected for the three torchvision models, which resolve weights
+  through `.DEFAULT` enums and have no tag to override.
+- A tag whose checkpoint expects normalization other than ImageNet mean/std is
+  rejected outright. `vit_small_patch16_224.augreg_*` is the case that matters:
+  those are JAX ports expecting mean/std = 0.5, and silently feeding them
+  ImageNet-normalized input would de-normalize every image. Supporting them
+  means adding per-model normalization to `dataset.py` first.
 
 **What is deliberately not constant.** DenseNet-121 is not scale-matched: its
 value is being the exact backbone behind the CheXNet results, which a deeper

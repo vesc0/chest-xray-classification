@@ -19,14 +19,21 @@ produced with, which changing the depth would throw away.
 Two invariants hold across all five, and both are load-bearing for the
 comparison:
 
-  - **ImageNet-1k pretraining only.** No IN21k/IN22k checkpoints, even where
-    they exist (ConvNeXtV2 and ViT-S both ship them). DenseNet, SwinV2 and
-    MaxViT have no IN21k option here, so 21k anywhere would confound
+  - **ImageNet-1k pretraining only.** No IN21k/IN22k checkpoints by default,
+    even where they exist (ConvNeXtV2 and ViT-S both ship them). DenseNet,
+    SwinV2 and MaxViT have no IN21k option here, so 21k anywhere would confound
     architecture with pretraining data — and would specifically flatter the
     pure ViT, the architecture most dependent on pretraining scale.
   - **Identical preprocessing.** Every backbone below expects 224x224 input
     with ImageNet mean/std, so dataset.py can apply one shared transform.
-    This is why ViT-S uses DeiT weights (see ViTSmallClassifier).
+    This is why ViT-S uses DeiT III weights (see ViTSmallClassifier).
+
+`--weight-tag` is the one sanctioned way out of the first invariant, for the
+separate question of how much pretraining *data* is worth on a fixed
+architecture. It is opt-in per run, applies only to the two timm-backed models,
+and `build_model` rejects any tag whose normalization statistics differ from
+config.IMAGENET_MEAN/STD — so it can relax the pretraining invariant without
+silently breaking the preprocessing one.
 
 Three come from torchvision; ViT-S and ConvNeXtV2 come from timm, which is the
 only source for them. The timm tags are pinned below rather than resolved by
@@ -47,8 +54,14 @@ import config
 # Pinned timm weight tags. Unlike torchvision's `.DEFAULT`, a timm model name
 # maps to several checkpoints that differ in pretraining data, so the tag is
 # part of the experiment definition and belongs in version control.
-VIT_S_WEIGHT_TAG = "deit_small_patch16_224.fb_in1k"
+VIT_S_WEIGHT_TAG = "deit3_small_patch16_224.fb_in1k"
 CONVNEXTV2_T_WEIGHT_TAG = "convnextv2_tiny.fcmae_ft_in1k"
+
+# Models whose checkpoint is selected by a timm tag, and can therefore accept a
+# `--weight-tag` override. The torchvision three resolve weights through
+# `.DEFAULT` enums and have no equivalent, so overriding them is an error
+# rather than a silent no-op.
+TIMM_BACKED_MODELS = ("vit_s_16", "convnextv2_t")
 
 # Dropout before every classification head, so the five heads differ only in
 # their input width.
@@ -106,29 +119,45 @@ class ViTSmallClassifier(nn.Module):
       - ViT-S/16 backbone, 12 blocks of global self-attention, width 384
       - [CLS] token → Dropout → Linear(384, NUM_CLASSES)
 
-    **Why DeiT weights on a ViT.** `deit_small_patch16_224` *is* ViT-S/16 —
+    **Why DeiT III weights on a ViT.** `deit3_small_patch16_224` *is* ViT-S/16 —
     same blocks, same patch size, same width — differing only in the recipe
-    that produced the ImageNet weights. Two reasons it is the right checkpoint
-    here over `vit_small_patch16_224.augreg_in1k`:
+    that produced the ImageNet weights. Three reasons it is the right checkpoint
+    here over `vit_small_patch16_224.augreg_in1k` and over the original DeiT:
 
-      - DeiT is the canonical answer to "train ViT-S on ImageNet-1k alone",
-        which is the pretraining budget every other model in this roster gets.
+      - DeiT III is the current canonical answer to "train ViT-S on ImageNet-1k
+        alone", which is the pretraining budget every other model in this
+        roster gets, and it is stronger than DeiT-S at identical capacity
+        (~81.4% vs ~79.8% top-1). Using the weaker one would handicap the pure
+        ViT in the very comparison this roster exists to make.
+      - It has a matched IN22k sibling, `deit3_small_patch16_224.fb_in22k_ft_in1k`
+        — same authors, same recipe, same normalization, differing only in the
+        pretraining corpus. That makes the pretraining-data ablation a clean
+        swap of one tag rather than a change of recipe, checkpoint family and
+        preprocessing at once. The IN1k run here *is* the control for it.
       - The augreg weights are ports of the original JAX checkpoints and expect
         mean/std = 0.5, not ImageNet statistics. Using them would force
         per-model normalization and a separate DataLoader per architecture;
-        with DeiT the whole roster shares one transform.
+        both DeiT III tags keep the whole roster on one transform.
 
     Expect this model to be the weakest of the five under ImageNet-1k-only
     pretraining. That is a result, not a misconfiguration: pure ViTs are the
-    architecture most dependent on pretraining scale.
+    architecture most dependent on pretraining scale — which is what the IN22k
+    tag is there to measure.
     """
 
-    def __init__(self, num_classes: int = config.NUM_CLASSES, pretrained: bool = True):
+    def __init__(
+        self,
+        num_classes: int = config.NUM_CLASSES,
+        pretrained: bool = True,
+        weight_tag: str | None = None,
+    ):
         super().__init__()
 
         # Load pretrained ViT-S/16 backbone
         self.backbone = timm.create_model(
-            VIT_S_WEIGHT_TAG, pretrained=pretrained, num_classes=num_classes
+            weight_tag or VIT_S_WEIGHT_TAG,
+            pretrained=pretrained,
+            num_classes=num_classes,
         )
 
         # Replace classification head
@@ -164,12 +193,19 @@ class ConvNeXtV2TinyClassifier(nn.Module):
     train.py's head/backbone split still counts them as head parameters.
     """
 
-    def __init__(self, num_classes: int = config.NUM_CLASSES, pretrained: bool = True):
+    def __init__(
+        self,
+        num_classes: int = config.NUM_CLASSES,
+        pretrained: bool = True,
+        weight_tag: str | None = None,
+    ):
         super().__init__()
 
         # Load pretrained ConvNeXtV2-T backbone
         self.backbone = timm.create_model(
-            CONVNEXTV2_T_WEIGHT_TAG, pretrained=pretrained, num_classes=num_classes
+            weight_tag or CONVNEXTV2_T_WEIGHT_TAG,
+            pretrained=pretrained,
+            num_classes=num_classes,
         )
 
         # Replace the final projection, keeping timm's pooling and norm
@@ -299,7 +335,42 @@ MODEL_BUILDERS: dict[str, type[nn.Module]] = {
 }
 
 
-def build_model(model_name: str, pretrained: bool = True) -> nn.Module:
+def _check_weight_tag_normalization(weight_tag: str) -> None:
+    """
+    Reject a weight tag whose checkpoint expects different input statistics.
+
+    dataset.py builds one transform from config.IMAGENET_MEAN/STD and shares it
+    across every loader, so a checkpoint trained under other statistics is not
+    a configuration this pipeline can express. The failure mode if unchecked is
+    the bad kind: the run trains, converges, and reports a plausible number that
+    is simply wrong. `vit_small_patch16_224.augreg_*` is the live example — the
+    JAX ports expect mean/std = 0.5, and swapping one in for the DeiT III tag
+    would silently de-normalize every image.
+    """
+    # Returns None rather than raising when the tag is not registered, so a
+    # typo would otherwise surface as an AttributeError several frames away.
+    cfg = timm.get_pretrained_cfg(weight_tag, allow_unregistered=True)
+    if cfg is None:
+        raise ValueError(
+            f"Unknown timm weight tag '{weight_tag}'. List the candidates with "
+            f"timm.list_models('<name>*', pretrained=True)."
+        )
+
+    expected = (tuple(config.IMAGENET_MEAN), tuple(config.IMAGENET_STD))
+    actual = (tuple(cfg.mean), tuple(cfg.std))
+    if actual != expected:
+        raise ValueError(
+            f"Weight tag '{weight_tag}' expects mean/std {actual}, but the shared "
+            f"transform normalizes with {expected}. Using it would train under "
+            f"different statistics than the checkpoint was pretrained with. "
+            f"Pick a tag with ImageNet statistics, or add per-model "
+            f"normalization to dataset.py first."
+        )
+
+
+def build_model(
+    model_name: str, pretrained: bool = True, weight_tag: str | None = None
+) -> nn.Module:
     """
     Instantiate a model by name.
 
@@ -307,6 +378,10 @@ def build_model(model_name: str, pretrained: bool = True) -> nn.Module:
         model_name: One of config.SUPPORTED_MODELS.
         pretrained: Whether to load ImageNet-pretrained weights. False keeps
             construction offline, which is what the test suite relies on.
+        weight_tag: Optional timm tag overriding the pinned checkpoint, for the
+            pretraining-data ablation (e.g. `deit3_small_patch16_224.fb_in22k_ft_in1k`
+            in place of the IN1k default). Only the timm-backed models accept
+            one, and the tag's normalization must match the shared transform.
 
     Returns:
         nn.Module ready for training.
@@ -315,4 +390,16 @@ def build_model(model_name: str, pretrained: bool = True) -> nn.Module:
         raise ValueError(
             f"Unknown model '{model_name}'. Supported: {config.SUPPORTED_MODELS}"
         )
-    return MODEL_BUILDERS[model_name](pretrained=pretrained)
+
+    if weight_tag is None:
+        return MODEL_BUILDERS[model_name](pretrained=pretrained)
+
+    if model_name not in TIMM_BACKED_MODELS:
+        raise ValueError(
+            f"--weight-tag is only supported for {list(TIMM_BACKED_MODELS)}; "
+            f"'{model_name}' resolves its weights through torchvision and has no "
+            f"tag to override. Drop the flag, or select a timm-backed model."
+        )
+
+    _check_weight_tag_normalization(weight_tag)
+    return MODEL_BUILDERS[model_name](pretrained=pretrained, weight_tag=weight_tag)

@@ -57,7 +57,9 @@ def run_pipeline(
     # Model initialization
     print(f"[main] Step 1/5 - Building model: {model_name} ...")
     device = get_device()
-    model = build_model(model_name, pretrained=True).to(device)
+    model = build_model(model_name, pretrained=True, weight_tag=config.WEIGHT_TAG).to(device)
+    if config.WEIGHT_TAG:
+        print(f"  Weight tag:           {config.WEIGHT_TAG} (override)")
 
     # Trainable count is only meaningful once the tuning mode has been applied,
     # which happens inside train_model — so report it after training, not here.
@@ -135,6 +137,18 @@ def main():
         default=None,
         choices=[*config.SUPPORTED_MODELS, "all"],
         help="Which model to train/evaluate, or 'all' for every supported architecture",
+    )
+
+    parser.add_argument(
+        "--weight-tag",
+        type=str,
+        default=None,
+        help=(
+            "Override the pinned timm checkpoint (timm-backed models only). Used "
+            "for the pretraining-data ablation, e.g. "
+            "deit3_small_patch16_224.fb_in22k_ft_in1k for ViT-S. Rejected if the "
+            "tag expects normalization other than config.IMAGENET_MEAN/STD"
+        ),
     )
 
     parser.add_argument(
@@ -330,6 +344,8 @@ def main():
         config.SAVE_PREDICTIONS = False
     if args.xai_samples is not None:
         config.XAI_NUM_SAMPLES = args.xai_samples
+    if args.weight_tag is not None:
+        config.WEIGHT_TAG = args.weight_tag
 
     # Experiment naming/tracking
     if args.experiment:
@@ -356,6 +372,8 @@ def main():
     print(f"  Dataset root:       {config.DATASET_ROOT}")
     print(f"  Train subset:       {config.SUBSET_SIZE or 'FULL TRAINING POOL'}")
     print(f"  Classes:            {config.NUM_CLASSES} pathologies (No Finding = all-zero)")
+    if config.WEIGHT_TAG:
+        print(f"  Weight tag:         {config.WEIGHT_TAG} (overrides the pinned checkpoint)")
     print(f"  Image size:         {config.IMAGE_SIZE}")
     print(f"  Batch size:         {config.BATCH_SIZE}")
     print(f"  Epochs:             {config.NUM_EPOCHS}")

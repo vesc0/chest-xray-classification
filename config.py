@@ -119,12 +119,16 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 # =============================================================================
 BATCH_SIZE = 32
 NUM_WORKERS = 4 # DataLoader workers
-NUM_EPOCHS = 60
+NUM_EPOCHS = 20
 LEARNING_RATE = 1e-4
 MIN_LEARNING_RATE = 1e-6
-WEIGHT_DECAY = 1e-5
+WEIGHT_DECAY = 1e-4
 WARMUP_EPOCHS = 1
-EARLY_STOPPING_PATIENCE = 20
+# A runaway guard, not a budget saver. With NUM_EPOCHS = 20 and cosine decay to
+# MIN_LEARNING_RATE, val AUPRC usually keeps improving into the final epochs, so
+# this rarely fires — plan for every run to use its full epoch budget, which is
+# also what keeps runs comparable to each other.
+EARLY_STOPPING_PATIENCE = 5
 CHECKPOINT_METRIC = "val_auprc" # val_loss, val_auroc, val_auprc
 
 # Long-tail aware loss choices: "asymmetric", "weighted_bce", "bce"
@@ -142,6 +146,14 @@ ASL_CLIP = 0.05
 #   swin_v2_t    (27.6M)  modern ViT          torchvision
 #   maxvit_t     (30.4M)  hybrid CNN/ViT      torchvision
 SUPPORTED_MODELS = ["densenet121", "vit_s_16", "convnextv2_t", "swin_v2_t", "maxvit_t"]
+
+# Optional timm tag overriding the checkpoint pinned in models.py, set per run
+# with `--weight-tag`. None keeps the roster's ImageNet-1k-only invariant; the
+# override exists for the pretraining-data ablation, where ViT-S is rerun with
+# `deit3_small_patch16_224.fb_in22k_ft_in1k` against the IN1k run as its
+# control. Only the timm-backed models accept one, and models.py rejects any
+# tag whose normalization differs from IMAGENET_MEAN/STD above.
+WEIGHT_TAG = None
 
 # Fine-tuning strategy:
 #   - "full": train all parameters for all epochs

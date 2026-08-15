@@ -53,6 +53,80 @@ class TestWeightTags:
             assert "in21k" not in tag and "in22k" not in tag, tag
 
 
+class TestWeightTagOverride:
+    """
+    `--weight-tag` is the one sanctioned way past the IN1k-only invariant, for
+    the pretraining-data ablation. Every guard below exists because its failure
+    mode is silent: the run trains, converges, and reports a number that is
+    simply wrong about what it measured.
+    """
+
+    def test_override_builds_a_working_model(self):
+        model = build_model(
+            "vit_s_16",
+            pretrained=False,
+            weight_tag="deit3_small_patch16_224.fb_in22k_ft_in1k",
+        )
+        images = torch.randn(2, 3, config.IMAGE_SIZE, config.IMAGE_SIZE)
+        with torch.no_grad():
+            assert model(images).shape == (2, config.NUM_CLASSES)
+
+    def test_the_in22k_tag_keeps_the_structure_the_xai_code_assumes(self):
+        """
+        The ablation swaps checkpoints, not architectures — so the Grad-CAM
+        reshape and rollout must still find one prefix token and 12 blocks.
+        """
+        model = build_model(
+            "vit_s_16",
+            pretrained=False,
+            weight_tag="deit3_small_patch16_224.fb_in22k_ft_in1k",
+        )
+        assert model.backbone.num_prefix_tokens == 1
+        assert len(model.backbone.blocks) == 12
+
+    def test_the_ablation_pair_differs_only_in_pretraining_data(self):
+        """
+        What makes the default ViT-S run a valid control for the 22k run: same
+        architecture, same recipe family, same input statistics. If a timm
+        release ever repoints either tag, this failing is the signal.
+        """
+        import timm
+
+        in1k = timm.get_pretrained_cfg(VIT_S_WEIGHT_TAG)
+        in22k = timm.get_pretrained_cfg("deit3_small_patch16_224.fb_in22k_ft_in1k")
+        assert in1k.mean == in22k.mean == tuple(config.IMAGENET_MEAN)
+        assert in1k.std == in22k.std == tuple(config.IMAGENET_STD)
+        assert in1k.input_size == in22k.input_size
+
+    def test_rejects_a_tag_whose_normalization_differs(self):
+        """
+        The augreg checkpoints are JAX ports expecting mean/std = 0.5. Feeding
+        them ImageNet-normalized input de-normalizes every image, and nothing
+        downstream would notice.
+        """
+        with pytest.raises(ValueError, match="expects mean/std"):
+            build_model(
+                "vit_s_16",
+                pretrained=False,
+                weight_tag="vit_small_patch16_224.augreg_in21k_ft_in1k",
+            )
+
+    @pytest.mark.parametrize("name", ["densenet121", "swin_v2_t", "maxvit_t"])
+    def test_rejects_an_override_on_the_torchvision_models(self, name):
+        """
+        Those three resolve weights through `.DEFAULT` enums. Accepting a tag
+        and ignoring it would report an ablation that never happened.
+        """
+        with pytest.raises(ValueError, match="only supported for"):
+            build_model(
+                name, pretrained=False, weight_tag="deit3_small_patch16_224.fb_in1k"
+            )
+
+    def test_rejects_an_unknown_tag(self):
+        with pytest.raises(ValueError, match="Unknown timm weight tag"):
+            build_model("vit_s_16", pretrained=False, weight_tag="not_a_real_tag")
+
+
 class TestArchitectureAssumptions:
     def test_vit_has_exactly_one_prefix_token(self, model_cache):
         """
