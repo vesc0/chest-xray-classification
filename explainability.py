@@ -178,6 +178,10 @@ GRADCAM_TARGETS: dict = {
     # module docstring on what LayerNorm does to a CAM: this is the rule being
     # applied, not an oversight, and the pre-norm alternative gives a
     # substantially different map.
+    "swin_t": (
+        lambda model: model.backbone.norm,
+        _fixed(_nhwc_to_nchw),
+    ),
     "swin_v2_t": (
         lambda model: model.backbone.norm,
         _fixed(_nhwc_to_nchw),

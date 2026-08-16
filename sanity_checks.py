@@ -102,6 +102,16 @@ RANDOMIZATION_STAGES: dict[str, list[tuple[str, list[str]]]] = {
     ],
     # torchvision interleaves stages and patch-merging layers in `features`:
     # 0 = patch embed, 1/3/5/7 = stages, 2/4/6 = the merge before each.
+    # Swin V1 and V2 share a module layout: 8 feature stages under `features`,
+    # then norm/permute/avgpool/flatten/head. The two entries are identical.
+    "swin_t": [
+        ("head", ["backbone.head"]),
+        ("stage 4", ["backbone.norm", "backbone.features.7", "backbone.features.6"]),
+        ("stage 3", ["backbone.features.5", "backbone.features.4"]),
+        ("stage 2", ["backbone.features.3", "backbone.features.2"]),
+        ("stage 1", ["backbone.features.1"]),
+        ("patch embed", ["backbone.features.0"]),
+    ],
     "swin_v2_t": [
         ("head", ["backbone.head"]),
         ("stage 4", ["backbone.norm", "backbone.features.7", "backbone.features.6"]),

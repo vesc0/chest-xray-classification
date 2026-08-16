@@ -127,71 +127,63 @@ pretraining data:
 | `densenet121`  | DenseNet-121 | CNN baseline  | 7.0M   | torchvision | `IMAGENET1K_V1` |
 | `vit_s_16`     | ViT-S/16     | pure ViT      | 21.7M  | timm   | `deit3_small_patch16_224.fb_in1k` |
 | `convnextv2_t` | ConvNeXtV2-T | modern CNN    | 27.9M  | timm   | `convnextv2_tiny.fcmae_ft_in1k` |
-| `swin_v2_t`    | SwinV2-T     | modern ViT    | 27.6M  | torchvision | `IMAGENET1K_V1` |
+| `swin_t`       | Swin-T       | modern ViT    | 27.5M  | torchvision | `IMAGENET1K_V1` |
 | `maxvit_t`     | MaxViT-T     | hybrid CNN/ViT| 30.4M  | torchvision | `IMAGENET1K_V1` |
 
-`--model all` runs every architecture in the table. Parameter counts are as
-built here, with the 14-class head — a few percent below the 1000-class
-ImageNet figures usually quoted.
+`swin_v2_t` (SwinV2-T, 27.6M) is also buildable but is **not** part of the
+roster — see below. `--model all` runs everything in `SUPPORTED_MODELS`.
+Parameter counts are as built here, with the 14-class head.
 
 **What is held constant.** The last four models sit in a 22–31M band, so
 "modern CNN vs modern ViT" is a comparison at matched capacity. Every model is
-pretrained on **ImageNet-1k only** — no IN21k/IN22k checkpoint is used by
-default even where one exists, because DenseNet, SwinV2 and MaxViT have no
-IN21k option here, and using 21k for the two that do would confound
-architecture with pretraining data while specifically flattering the pure ViT.
-Every model takes **224×224 input with ImageNet normalization**, so a single
-shared transform serves the whole roster.
+pretrained on **ImageNet-1k only** by default, and takes **224×224 input with
+ImageNet normalization**, so one shared transform serves the whole roster.
+
+**What is deliberately not constant.** DenseNet-121 is not scale-matched: its
+value is being the exact backbone behind the CheXNet results. Its ImageNet
+weights also come from torchvision's original recipe (74.4% top-1) rather than
+the modern recipes behind Swin-T (81.5%) and MaxViT-T (83.7%), so the
+comparison is between architectures *as they are normally obtained*.
+
+**Why Swin-T and not SwinV2-T.** SwinV2-T held this slot first. Its torchvision
+weights are 256-native, and at 224 the final stage is a 7×7 map against a
+window size of 8; SwinV2's log-spaced continuous position bias is meant to
+absorb that transfer and measurably does not. Full fine-tuning reached train
+AUROC 0.656 after 20 epochs against 0.79–0.81 for every other backbone, with
+localization at 1.19× the random baseline. Swin-T is pretrained at 224 and
+replaces it. SwinV2-T stays buildable so the failure can be reproduced, and so
+it can be re-run at `--image-size 256` as a resolution study.
 
 ### Overriding the checkpoint (`--weight-tag`)
-
-Holding pretraining data fixed is what makes the architecture comparison valid,
-but *how much pretraining data is worth* is a separate question worth asking on
-a fixed architecture. `--weight-tag` answers it without disturbing the roster:
 
 ```bash
 python main.py --model vit_s_16 --weight-tag deit3_small_patch16_224.fb_in22k_ft_in1k --experiment vit_in22k
 ```
 
-ViT-S is the model this is designed around. `deit3_small_patch16_224.fb_in1k`
-and `deit3_small_patch16_224.fb_in22k_ft_in1k` are the same architecture from
-the same authors under the same recipe and the same normalization, differing
-only in the pretraining corpus — so **the default ViT-S run is already the
-control** for the 22k run, and no extra baseline is needed. (The 22k checkpoint
-does carry an additional IN1k fine-tuning stage that the IN1k one does not;
-that is inherent to any 21k-vs-1k comparison, and worth stating alongside the
+For asking what pretraining *data* is worth on a fixed architecture.
+`deit3_small_patch16_224.fb_in1k` and `.fb_in22k_ft_in1k` share architecture,
+authors, recipe and normalization, so **the default ViT-S run is already the
+control**. (The 22k checkpoint carries an extra IN1k fine-tuning stage the IN1k
+one does not — inherent to any 21k-vs-1k comparison, worth stating with the
 result.)
 
-Two guards, because the failure mode here is a run that trains fine and reports
-a wrong number:
+Two guards, because the failure mode is a run that trains fine and reports a
+wrong number: the flag is rejected for the torchvision models, which have no
+tag to override; and a tag whose checkpoint expects normalization other than
+ImageNet mean/std is rejected outright (`vit_small_patch16_224.augreg_*` are
+JAX ports expecting mean/std = 0.5).
 
-- The flag is rejected for the three torchvision models, which resolve weights
-  through `.DEFAULT` enums and have no tag to override.
-- A tag whose checkpoint expects normalization other than ImageNet mean/std is
-  rejected outright. `vit_small_patch16_224.augreg_*` is the case that matters:
-  those are JAX ports expecting mean/std = 0.5, and silently feeding them
-  ImageNet-normalized input would de-normalize every image. Supporting them
-  means adding per-model normalization to `dataset.py` first.
+### Resolution (`--image-size`)
 
-**What is deliberately not constant.** DenseNet-121 is not scale-matched: its
-value is being the exact backbone behind the CheXNet results, which a deeper
-variant chosen to close the parameter gap would throw away. Its ImageNet
-weights also come from torchvision's original recipe (74.4% top-1) rather than
-the modern recipes behind SwinV2-T (82.1%) and MaxViT-T (83.7%), so the
-comparison is between architectures *as they are normally obtained*, not
-between architectures pretrained identically.
+Default 224. The images must already be sourced at the target resolution — see
+the resize recipe below. Support differs per model:
 
-Two constraints are worth knowing before changing `IMAGE_SIZE`:
-
-- **MaxViT-T fixes the resolution at 224.** torchvision builds its attention
-  partition sizes from a declared input size and reshapes against them, so any
-  other resolution raises inside the partitioning rather than adapting.
-- **SwinV2 is therefore used slightly off-resolution.** torchvision's SwinV2
-  weights — every size — were trained at 256. At 224 the final stage is a 7×7
-  map against a window size of 8. SwinV2's log-spaced continuous position bias
-  is designed for exactly this transfer (it is the headline change from
-  SwinV1), so the effect is a soft degradation, but it is a real limitation of
-  this comparison.
+| Model | Non-224 |
+| ----- | ------- |
+| `densenet121`, `convnextv2_t`, `swin_t` | yes |
+| `vit_s_16` | yes — timm interpolates the position embeddings |
+| `swin_v2_t` | yes, and 256 is its native resolution |
+| `maxvit_t` | **no** — torchvision fixes its attention partitions at 224, so it raises |
 
 ### Explainability per architecture
 
@@ -200,6 +192,7 @@ Two constraints are worth knowing before changing `IMAGE_SIZE`:
 | `densenet121`  | `features.denseblock4` | NCHW         | 7×7      | —                 |
 | `vit_s_16`     | `blocks[-1].norm1`     | tokens→grid  | 14×14    | Attention Rollout |
 | `convnextv2_t` | `stages[-1]`           | NCHW         | 7×7      | —                 |
+| `swin_t`       | `norm`                 | NHWC→NCHW    | 7×7      | —                 |
 | `swin_v2_t`    | `norm`                 | NHWC→NCHW    | 7×7      | —                 |
 | `maxvit_t`     | `blocks[-1]`           | NCHW         | 7×7      | —                 |
 

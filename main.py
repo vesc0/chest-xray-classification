@@ -152,6 +152,16 @@ def main():
     )
 
     parser.add_argument(
+        "--image-size",
+        type=int,
+        default=None,
+        help=(
+            "Override config.IMAGE_SIZE. The dataset must already be sourced at "
+            "this resolution. maxvit_t is fixed at 224 and rejects anything else"
+        ),
+    )
+
+    parser.add_argument(
         "--eval-only",
         action="store_true",
         help="Skip training; load from checkpoint and run calibration/evaluation/XAI only",
@@ -346,6 +356,9 @@ def main():
         config.XAI_NUM_SAMPLES = args.xai_samples
     if args.weight_tag is not None:
         config.WEIGHT_TAG = args.weight_tag
+    # Must precede get_dataloaders(): the transform reads IMAGE_SIZE at build time.
+    if args.image_size is not None:
+        config.IMAGE_SIZE = args.image_size
 
     # Experiment naming/tracking
     if args.experiment:

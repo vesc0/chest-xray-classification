@@ -11,10 +11,10 @@ from pathlib import Path
 # Paths
 # =============================================================================
 # Root of the NIH Chest X-ray dataset.
-# Defaults to the external SSD used for development; override for any other
-# machine with the XRAY_DATASET_ROOT environment variable:
+# Defaults to the Mac mini's local copy; override for any other machine
+# with the XRAY_DATASET_ROOT environment variable:
 #   export XRAY_DATASET_ROOT=/path/to/archive-chest-xrays-nih
-DEFAULT_DATASET_ROOT = "/Volumes/PM961/archive-chest-xrays-nih"
+DEFAULT_DATASET_ROOT = os.path.expanduser("~/Desktop/nih-224")
 DATASET_ROOT = Path(os.environ.get("XRAY_DATASET_ROOT", DEFAULT_DATASET_ROOT))
 DATA_ENTRY_CSV = DATASET_ROOT / "Data_Entry_2017.csv"
 TRAIN_VAL_LIST = DATASET_ROOT / "train_val_list.txt"
@@ -98,17 +98,15 @@ SEED = 42
 # Input resolution, shared by every architecture so that resolution is a
 # controlled variable rather than a per-model choice.
 #
-# 224 is not free to change. torchvision's MaxViT-T builds its attention
-# partition sizes from a declared input size and raises on anything else, so
-# 224 is a hard floor and ceiling for that model. In the other direction,
-# torchvision's SwinV2 weights were trained at 256 and are therefore being used
-# slightly off-resolution here; SwinV2's log-spaced continuous position bias is
-# built for that transfer, and the trade is documented in models.py. Raising
-# this (e.g. for a resolution study) means re-sourcing both models.
+# Override per run with `--image-size`; the images must be sourced at that
+# resolution too (see the resize notebook in README). densenet121, convnextv2_t
+# and swin_t follow it; vit_s_16 follows it by interpolating its position
+# embeddings; maxvit_t cannot and raises, because torchvision fixes its
+# attention partitions at 224.
 IMAGE_SIZE = 224
 # ImageNet normalization. Every backbone in SUPPORTED_MODELS expects these
 # statistics — including the two timm models, which is why the ViT slot uses
-# DeiT weights rather than the augreg checkpoints that expect mean/std = 0.5.
+# DeiT III weights rather than the augreg checkpoints that expect mean/std = 0.5.
 # A backbone with different statistics would need its own transform, and
 # main.py could no longer build the loaders once and share them.
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -141,11 +139,21 @@ ASL_CLIP = 0.05
 # Parameter counts are as built here, with the 14-class head.
 #
 #   densenet121   (7.0M)  CNN baseline        torchvision
-#   vit_s_16     (21.7M)  pure ViT            timm (DeiT-S weights)
+#   vit_s_16     (21.7M)  pure ViT            timm (DeiT III-S weights)
 #   convnextv2_t (27.9M)  modern CNN          timm
-#   swin_v2_t    (27.6M)  modern ViT          torchvision
+#   swin_t       (27.5M)  modern ViT          torchvision
 #   maxvit_t     (30.4M)  hybrid CNN/ViT      torchvision
-SUPPORTED_MODELS = ["densenet121", "vit_s_16", "convnextv2_t", "swin_v2_t", "maxvit_t"]
+#
+# swin_v2_t (27.6M) is buildable but not part of the roster: its weights are
+# 256-native and it fails to fit at 224. Kept so that result stays reproducible.
+SUPPORTED_MODELS = [
+    "densenet121",
+    "vit_s_16",
+    "convnextv2_t",
+    "swin_t",
+    "swin_v2_t",
+    "maxvit_t",
+]
 
 # Optional timm tag overriding the checkpoint pinned in models.py, set per run
 # with `--weight-tag`. None keeps the roster's ImageNet-1k-only invariant; the

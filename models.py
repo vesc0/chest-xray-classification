@@ -63,6 +63,10 @@ CONVNEXTV2_T_WEIGHT_TAG = "convnextv2_tiny.fcmae_ft_in1k"
 # rather than a silent no-op.
 TIMM_BACKED_MODELS = ("vit_s_16", "convnextv2_t")
 
+# torchvision builds MaxViT's attention partitions from a declared input size,
+# so this one model cannot follow config.IMAGE_SIZE.
+MAXVIT_FIXED_IMAGE_SIZE = 224
+
 # Dropout before every classification head, so the five heads differ only in
 # their input width.
 HEAD_DROPOUT = 0.3
@@ -153,11 +157,13 @@ class ViTSmallClassifier(nn.Module):
     ):
         super().__init__()
 
-        # Load pretrained ViT-S/16 backbone
+        # img_size is passed explicitly so timm interpolates the position
+        # embeddings when IMAGE_SIZE is not the checkpoint's 224.
         self.backbone = timm.create_model(
             weight_tag or VIT_S_WEIGHT_TAG,
             pretrained=pretrained,
             num_classes=num_classes,
+            img_size=config.IMAGE_SIZE,
         )
 
         # Replace classification head
@@ -221,25 +227,51 @@ class ConvNeXtV2TinyClassifier(nn.Module):
 
 
 # =============================================================================
-# 4. SwinV2-T (modern Vision Transformer)
+# 4. Swin-T (modern hierarchical Vision Transformer)
+# =============================================================================
+class SwinTinyClassifier(nn.Module):
+    """
+    Swin Transformer V1-Tiny with a custom classification head.
+
+    Architecture:
+      - Swin-T backbone (hierarchical, shifted-window attention)
+      - Dropout → Linear(768, NUM_CLASSES)
+
+    Holds the windowed-transformer slot because it is pretrained at 224, the
+    resolution the rest of the roster runs at. SwinV2-T was the original choice
+    and failed here — see SwinV2TinyClassifier below.
+    """
+
+    def __init__(self, num_classes: int = config.NUM_CLASSES, pretrained: bool = True):
+        super().__init__()
+
+        weights = models.Swin_T_Weights.DEFAULT if pretrained else None
+        self.backbone = models.swin_t(weights=weights)
+
+        in_features = self.backbone.head.in_features  # 768
+        self.backbone.head = nn.Sequential(
+            nn.Dropout(p=HEAD_DROPOUT),
+            nn.Linear(in_features, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.backbone(x)
+
+
+# =============================================================================
+# 4b. SwinV2-T (retained for reproducibility, not part of the roster)
 # =============================================================================
 class SwinV2TinyClassifier(nn.Module):
     """
     Swin Transformer V2-Tiny with a custom classification head.
 
-    Architecture:
-      - SwinV2-T backbone (hierarchical, shifted-window attention)
-      - Dropout → Linear(768, NUM_CLASSES)
-
-    **Resolution caveat.** torchvision's SwinV2 weights — every size, not just
-    Tiny — were trained at 256x256, and this pipeline runs at 224 because
-    MaxViT-T cannot run at anything else (see MaxViTTinyClassifier). At 224 the
-    final stage is a 7x7 map against a window size of 8, so its windowed
-    attention covers the whole map rather than a shifted window. SwinV2's
-    log-spaced continuous position bias is designed for exactly this kind of
-    cross-resolution transfer — it is the headline change from SwinV1 — so the
-    effect is a soft degradation rather than a break, but it is a real
-    limitation of this comparison and is reported as one.
+    **Kept only so the documented failure stays reproducible.** torchvision's
+    SwinV2 weights are 256-native; at 224 the final stage is a 7x7 map against
+    a window size of 8. SwinV2's log-spaced continuous position bias is meant
+    to absorb exactly this transfer, and measurably does not: full fine-tuning
+    reached train AUROC 0.656 after 20 epochs against 0.79-0.81 for every other
+    backbone, with localization at 1.19x the random baseline. Swin-T replaced
+    it in the roster; run this one at 256 to reproduce the resolution finding.
     """
 
     def __init__(self, num_classes: int = config.NUM_CLASSES, pretrained: bool = True):
@@ -303,6 +335,15 @@ class MaxViTTinyClassifier(nn.Module):
     def __init__(self, num_classes: int = config.NUM_CLASSES, pretrained: bool = True):
         super().__init__()
 
+        # Checked here rather than left to torchvision, which fails deep inside
+        # the attention partitioning with an uninterpretable shape error.
+        if config.IMAGE_SIZE != MAXVIT_FIXED_IMAGE_SIZE:
+            raise ValueError(
+                f"MaxViT-T only runs at {MAXVIT_FIXED_IMAGE_SIZE}x{MAXVIT_FIXED_IMAGE_SIZE}, "
+                f"but config.IMAGE_SIZE is {config.IMAGE_SIZE}. Pick another model for a "
+                f"resolution study; densenet121, convnextv2_t and swin_t all resize."
+            )
+
         # Load pretrained MaxViT-T backbone
         weights = models.MaxVit_T_Weights.DEFAULT if pretrained else None
         self.backbone = models.maxvit_t(weights=weights)
@@ -330,6 +371,7 @@ MODEL_BUILDERS: dict[str, type[nn.Module]] = {
     "densenet121": DenseNet121Classifier,
     "vit_s_16": ViTSmallClassifier,
     "convnextv2_t": ConvNeXtV2TinyClassifier,
+    "swin_t": SwinTinyClassifier,
     "swin_v2_t": SwinV2TinyClassifier,
     "maxvit_t": MaxViTTinyClassifier,
 }
