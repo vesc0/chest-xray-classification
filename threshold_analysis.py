@@ -390,7 +390,7 @@ def main():
     if args.bootstrap_samples is not None:
         config.BOOTSTRAP_SAMPLES = args.bootstrap_samples
 
-    model_names = list(config.SUPPORTED_MODELS) if args.model == "all" else [args.model]
+    model_names = list(config.SWEEP_MODELS) if args.model == "all" else [args.model]
 
     for model_name in model_names:
         try:

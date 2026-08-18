@@ -26,7 +26,9 @@ the results were never produced under. Regenerate the lock file with
 
 The first run of each architecture downloads its ImageNet weights: the three
 torchvision backbones from `download.pytorch.org`, and ViT-S/ConvNeXtV2 from
-the HuggingFace Hub via `timm`. Both are cached afterwards. The test suite
+the HuggingFace Hub via `timm`. `densenet121_xrv` additionally pulls its
+chest-X-ray checkpoint (~30 MB) from the TorchXRayVision GitHub release into
+`~/.torchxrayvision/models_data/`. All are cached afterwards. The test suite
 never downloads anything.
 
 The pipeline expects the NIH dataset directory (containing `Data_Entry_2017.csv`,
@@ -106,11 +108,11 @@ The entire workflow is orchestrated natively via the `main.py` entry point.
 - `device.py`: Accelerator selection (CUDA > MPS > CPU) and synchronization around timed regions.
 - `metrics.py`: Threshold-free ranking metrics (per-class and macro AUROC/AUPRC) shared by training and evaluation, so the per-epoch validation curve and the reported test numbers are computed identically.
 - `dataset.py`: Handles metadata parsing, image augmentations, multi-hot label encoding, and group-aware data splitting.
-- `models.py`: Defines the five supported architectures — one per family, with the pinned pretrained-weight tags and the reasoning behind each choice.
+- `models.py`: Defines the five roster architectures — one per family, with the pinned pretrained-weight tags and the reasoning behind each choice — plus the two off-roster models and the guards on overriding a checkpoint.
 - `train.py`: Contains the training loop, optimizer, mixed precision setup, and asymmetric loss implementation.
 - `evaluate.py`: Responsible for inference, computing metrics (AUROC, AUPRC, F1, Brier, ECE) with bootstrap intervals, determining class-specific decision thresholds on validation, and saving the raw probabilities behind every reported number.
 - `threshold_analysis.py`: Post-hoc comparison of thresholding schemes over those saved probabilities — fits F1 / Youden / fixed-sensitivity operating points, puts a confidence interval on each threshold, and scores them on test. Runs no model.
-- `explainability.py`: Implements the XAI methods — Grad-CAM for all five architectures (each with its own reshape transform), plus Attention Rollout for ViT — and renders heatmap overlays.
+- `explainability.py`: Implements the XAI methods — Grad-CAM for every architecture (each with its own reshape transform), plus Attention Rollout for ViT — and renders heatmap overlays.
 - `localization.py`: Scores those heatmaps against the ground-truth boxes (pointing game, energy fraction, IoU/IoBB) and saves the diagnostic figures.
 - `sanity_checks.py`: Runs the cascading model-parameter randomization test (Adebayo et al., 2018) over every explainer, checking that the explanations degrade as the weights they claim to explain are destroyed.
 - `utils.py`: Provides helper functions for reproducible seeding, run logging, plotting training curves, and building model/experiment comparison tables.
@@ -130,14 +132,18 @@ pretraining data:
 | `swin_t`       | Swin-T       | modern ViT    | 27.5M  | torchvision | `IMAGENET1K_V1` |
 | `maxvit_t`     | MaxViT-T     | hybrid CNN/ViT| 30.4M  | torchvision | `IMAGENET1K_V1` |
 
-`swin_v2_t` (SwinV2-T, 27.6M) is also buildable but is **not** part of the
-roster — see below. `--model all` runs everything in `SUPPORTED_MODELS`.
-Parameter counts are as built here, with the 14-class head.
+Two further models are buildable but **not** part of the roster:
+`swin_v2_t` (SwinV2-T, 27.6M) and `densenet121_xrv` (7.0M) — both below.
+`--model all` runs `SWEEP_MODELS`, which is everything in `SUPPORTED_MODELS`
+except `densenet121_xrv`; run that one by name. Parameter counts are as built
+here, with the 14-class head.
 
 **What is held constant.** The last four models sit in a 22–31M band, so
-"modern CNN vs modern ViT" is a comparison at matched capacity. Every model is
-pretrained on **ImageNet-1k only** by default, and takes **224×224 input with
-ImageNet normalization**, so one shared transform serves the whole roster.
+"modern CNN vs modern ViT" is a comparison at matched capacity. Every roster
+model is pretrained on **ImageNet-1k only** by default, and takes **224×224
+input with ImageNet normalization**, so one shared transform serves the whole
+roster. `--weight-tag` and `densenet121_xrv` are the two sanctioned ways past
+the first of those, and both keep the second.
 
 **What is deliberately not constant.** DenseNet-121 is not scale-matched: its
 value is being the exact backbone behind the CheXNet results. Its ImageNet
@@ -153,6 +159,65 @@ AUROC 0.656 after 20 epochs against 0.79–0.81 for every other backbone, with
 localization at 1.19× the random baseline. Swin-T is pretrained at 224 and
 replaces it. SwinV2-T stays buildable so the failure can be reproduced, and so
 it can be re-run at `--image-size 256` as a resolution study.
+
+### Medical pretraining (`densenet121_xrv`)
+
+```bash
+python main.py --model densenet121_xrv --experiment densenet_xrv_chex
+```
+
+The roster answers "which architecture". This answers a question it cannot:
+**how much of that spread is architecture at all, and how much is pretraining
+domain?** It is the same DenseNet-121 graph as the baseline — same 7.0M
+parameters, same Grad-CAM target, same head, same loss and schedule —
+initialized from [TorchXRayVision](https://github.com/mlmed/torchxrayvision)
+chest-radiograph weights instead of ImageNet. **The `densenet121` run is its
+control**, and the two differ in exactly one thing.
+
+Default corpus is CheXpert (`densenet121-res224-chex`, 224k images, Stanford).
+Swap it with `--weight-tag`:
+
+| Tag | Corpus | |
+| --- | ------ | - |
+| `densenet121-res224-chex` | CheXpert (Stanford), 224k | default |
+| `densenet121-res224-pc` | PadChest (Spain), 160k | |
+| `densenet121-res224-mimic_ch`, `..._nb` | MIMIC-CXR (BIDMC), 377k | |
+| `densenet121-res224-all` | nih-pc-chex-mimic_ch-google-openi-rsna | **blocked** |
+| `densenet121-res224-nih` | ChestX-ray14 | **blocked** |
+| `densenet121-res224-rsna` | RSNA Pneumonia Challenge | **blocked** |
+
+**Why three are blocked.** Each was trained on ChestX-ray14 or on a dataset
+derived from it (the RSNA challenge images are drawn from ChestX-ray8), so it
+has already seen the 25,596 images this pipeline reports as held out. The
+result would not be "medical pretraining wins" — it would be a model
+recognizing its own training set, arriving as a plausible number several points
+above every other row, with nothing downstream able to detect it. `models.py`
+rejects them at construction. Note this rules out XRV's strongest checkpoint,
+`-all`, on purpose.
+
+**Preprocessing.** XRV checkpoints expect 1-channel input scaled to
+[−1024, 1024], not 3-channel ImageNet-normalized tensors. Rather than fork the
+shared transform, `DenseNet121XRVClassifier.forward` de-normalizes and rescales
+inside the model. Both are affine maps over the same 8-bit pixel, so the
+composition is exact — it reproduces `xrv.utils.normalize` to float32 rounding,
+which `tests/test_models.py` pins against xrv's own function. Verified
+end-to-end too: the untuned CheXpert checkpoint scores 0.53–0.84 AUROC
+zero-shot on NIH test images through this path, where a broken normalization
+would sit at chance across every column.
+
+XRV's own `forward` silently resizes non-224 input back to 224, which would
+override `--image-size`; the attribute driving that is removed at construction,
+so this model follows the same resolution rule as the rest.
+
+**One import guard.** torchxrayvision's vendored baseline models each run
+`sys.path.insert(0, <own folder>)` when imported, and one of those folders
+contains a package named `config` — ahead of the project root, so `import
+config` resolves to theirs in any interpreter that has not already imported
+ours. This process is unaffected; spawned DataLoader workers are not, and they
+die on `module 'config' has no attribute 'SEED'` while the parent reports a
+`BrokenPipeError` several frames from the cause. `models._import_torchxrayvision`
+restores `sys.path` around the import, and a test asserts nothing from the
+package is left on it.
 
 ### Overriding the checkpoint (`--weight-tag`)
 
@@ -173,6 +238,10 @@ tag to override; and a tag whose checkpoint expects normalization other than
 ImageNet mean/std is rejected outright (`vit_small_patch16_224.augreg_*` are
 JAX ports expecting mean/std = 0.5).
 
+The same flag selects the pretraining corpus for `densenet121_xrv`, where it
+takes a TorchXRayVision weight name and is guarded against test-set leakage
+instead — see above.
+
 ### Resolution (`--image-size`)
 
 Default 224. The images must already be sourced at the target resolution — see
@@ -180,7 +249,7 @@ the resize recipe below. Support differs per model:
 
 | Model | Non-224 |
 | ----- | ------- |
-| `densenet121`, `convnextv2_t`, `swin_t` | yes |
+| `densenet121`, `convnextv2_t`, `swin_t`, `densenet121_xrv` | yes |
 | `vit_s_16` | yes — timm interpolates the position embeddings |
 | `swin_v2_t` | yes, and 256 is its native resolution |
 | `maxvit_t` | **no** — torchvision fixes its attention partitions at 224, so it raises |
@@ -190,13 +259,14 @@ the resize recipe below. Support differs per model:
 | `--model`      | Grad-CAM target layer  | Layout       | CAM grid | Extra XAI         |
 | -------------- | ---------------------- | ------------ | -------- | ----------------- |
 | `densenet121`  | `features.denseblock4` | NCHW         | 7×7      | —                 |
+| `densenet121_xrv` | `features.denseblock4` | NCHW      | 7×7      | —                 |
 | `vit_s_16`     | `blocks[-1].norm1`     | tokens→grid  | 14×14    | Attention Rollout |
 | `convnextv2_t` | `stages[-1]`           | NCHW         | 7×7      | —                 |
 | `swin_t`       | `norm`                 | NHWC→NCHW    | 7×7      | —                 |
 | `swin_v2_t`    | `norm`                 | NHWC→NCHW    | 7×7      | —                 |
 | `maxvit_t`     | `blocks[-1]`           | NCHW         | 7×7      | —                 |
 
-**Grad-CAM runs for all five models** so heatmaps are comparable across
+**Grad-CAM runs for every model** so heatmaps are comparable across
 architectures — comparing localization is meaningless if the CNNs and the
 transformers are explained by different methods. Transformers do not emit NCHW
 feature maps, so each architecture registers a reshape transform in
@@ -312,7 +382,7 @@ the pure functions behind the reported numbers:
 | `sanity_checks.py` | that every architecture's randomization stages cover the model exactly once, top-down; that randomization re-initializes weights *and* BatchNorm running statistics, reaches bare parameters with no `reset_parameters`, and changes the model's output; that a blank map is excluded from the rank correlation rather than scored as decorrelated |
 | `evaluate.py` | confusion-sweep counts against a brute-force scan; that a class scored entirely below the old grid floor still tunes and still predicts positives; the low-support and degenerate fallbacks; that fixed-sensitivity mode reaches its target and pays for it in specificity; ECE under both binning strategies and that no prediction is dropped from either; that samples-F1 credits a correctly-predicted normal study; that bootstrap intervals contain their own point estimate, widen for rare classes, widen again under patient grouping, and are withheld entirely for unscorable classes; prediction round-trips |
 | `train.py` | asymmetric loss under fp16 and saturating logits; head/backbone split for all five architectures; that freezing also stops BatchNorm statistics drifting |
-| `models.py` | that the factory and `SUPPORTED_MODELS` describe the same roster; that neither timm tag pulls in 21k pretraining; ViT's prefix-token count; that MaxViT is what fixes `IMAGE_SIZE` at 224 |
+| `models.py` | that the factory and `SUPPORTED_MODELS` describe the same roster; that neither timm tag pulls in 21k pretraining; ViT's prefix-token count; that MaxViT is what fixes `IMAGE_SIZE` at 224; that the XRV adapter reproduces `xrv.utils.normalize` exactly, that no XRV checkpoint trained on ChestX-ray14 can be selected, and that a newly released XRV tag fails the suite rather than defaulting to allowed |
 | `explainability.py` | ViT token→grid and Swin NHWC reshapes; that every architecture's Grad-CAM target layer still resolves; the 14×14-vs-7×7 CAM grid asymmetry; that Attention Rollout actually captures attention and restores the model afterwards; Grad-CAM under a frozen backbone; hook cleanup; that both explainers expose the pre-normalization map the energy metric needs, and that rollout's floor is what makes that distinction real; that a live Grad-CAM hook stays inert outside its own `generate_batch`, including under `torch.inference_mode()` |
 
 The suite was checked by mutation: deliberately switching the IoBB denominator
@@ -490,9 +560,13 @@ Timings are recorded together with the conditions that produced them (device,
 batch size, workers, AMP, parameter count) — they mean nothing without those.
 The `run.versions` block additionally stamps Python and the packages that can
 move a number — `torchvision` decides which pretrained weights `.DEFAULT`
-resolves to, `scikit-learn` implements every metric, `Pillow` decodes the
-images — so two results files written months apart can be checked for
-comparability rather than assumed to be comparable.
+resolves to, `torchxrayvision` pins the URL each XRV tag points at,
+`scikit-learn` implements every metric, `Pillow` decodes the images — so two
+results files written months apart can be checked for comparability rather than
+assumed to be comparable. `run.weight_tag` records the checkpoint fine-tuning
+started from, resolved to the real tag rather than echoing `--weight-tag`, so an
+un-overridden run still identifies its own starting point (`null` for the
+torchvision-backed models, which the `torchvision` version already pins).
 `device.synchronize()` is called around every timed region, because CUDA and MPS
 queue kernels asynchronously and a timer stopped without it measures dispatch
 rather than execution (understating GPU time by ~3× on MPS here).

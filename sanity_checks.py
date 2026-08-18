@@ -83,6 +83,16 @@ RANDOMIZATION_STAGES: dict[str, list[tuple[str, list[str]]]] = {
         ("denseblock1", ["backbone.features.transition1", "backbone.features.denseblock1"]),
         ("stem", ["backbone.features.conv0", "backbone.features.norm0"]),
     ],
+    # Identical module layout to densenet121 — XRV's DenseNet is a copy of
+    # torchvision's with a 1-channel stem — so the stage list is the same.
+    "densenet121_xrv": [
+        ("classifier", ["backbone.classifier"]),
+        ("denseblock4", ["backbone.features.norm5", "backbone.features.denseblock4"]),
+        ("denseblock3", ["backbone.features.transition3", "backbone.features.denseblock3"]),
+        ("denseblock2", ["backbone.features.transition2", "backbone.features.denseblock2"]),
+        ("denseblock1", ["backbone.features.transition1", "backbone.features.denseblock1"]),
+        ("stem", ["backbone.features.conv0", "backbone.features.norm0"]),
+    ],
     "vit_s_16": [
         ("head", ["backbone.head"]),
         ("blocks 9-11", ["backbone.norm", "backbone.blocks.9", "backbone.blocks.10",

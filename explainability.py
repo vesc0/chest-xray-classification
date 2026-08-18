@@ -170,6 +170,13 @@ GRADCAM_TARGETS: dict = {
         lambda model: model.backbone.features.denseblock4,
         _fixed(_identity_transform),
     ),
+    # Same graph as densenet121, so the same trap and the same answer: XRV's
+    # DenseNet is a copy of torchvision's and runs the identical in-place ReLU
+    # between `features` and the pool.
+    "densenet121_xrv": (
+        lambda model: model.backbone.features.denseblock4,
+        _fixed(_identity_transform),
+    ),
     "convnextv2_t": (
         lambda model: model.backbone.stages[-1],
         _fixed(_identity_transform),

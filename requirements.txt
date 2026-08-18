@@ -22,6 +22,10 @@ torchvision>=0.16.0,<1.0.0
 # ships. The exact weight tags are pinned in models.py, because a timm model
 # name maps to several checkpoints that differ in pretraining data.
 timm>=1.0.0,<2.0.0
+# Chest-X-ray-pretrained DenseNet-121 weights for the off-roster
+# pretraining-domain arm (`--model densenet121_xrv`). Only that model imports
+# it, and the import is lazy, so the other five build without it installed.
+torchxrayvision>=1.5.0,<2.0.0
 
 # Data & metrics
 numpy>=1.24.0,<3.0.0

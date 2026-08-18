@@ -1132,6 +1132,9 @@ _PROVENANCE_PACKAGES = (
     "torch",
     "torchvision",
     "timm",
+    # Pins the weight URLs behind densenet121_xrv, so a release that repoints
+    # a tag is visible in the results file rather than only in the lock file.
+    "torchxrayvision",
     "numpy",
     "scipy",
     "scikit-learn",
@@ -1247,6 +1250,12 @@ def evaluate_model(
         "checkpoint_metric": config.CHECKPOINT_METRIC,
         "seed": config.SEED,
         "trainable_params": trainable_params,
+        # The checkpoint fine-tuning started from, resolved rather than echoed
+        # from config.WEIGHT_TAG: an un-overridden run would otherwise record
+        # None, which does not identify anything. Absent (None) for the
+        # torchvision-backed models, whose weights are pinned by the
+        # torchvision version already recorded under `versions`.
+        "weight_tag": getattr(model, "weight_tag", None),
     }
 
     carried_over = False

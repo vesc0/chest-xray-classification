@@ -19,6 +19,10 @@ from models import (
     CONVNEXTV2_T_WEIGHT_TAG,
     MODEL_BUILDERS,
     VIT_S_WEIGHT_TAG,
+    XRV_DEFAULT_WEIGHT_TAG,
+    XRV_LEAKY_WEIGHTS,
+    _import_torchxrayvision,
+    _xrv_densenet_tags,
     build_model,
 )
 
@@ -125,6 +129,112 @@ class TestWeightTagOverride:
     def test_rejects_an_unknown_tag(self):
         with pytest.raises(ValueError, match="Unknown timm weight tag"):
             build_model("vit_s_16", pretrained=False, weight_tag="not_a_real_tag")
+
+
+class TestXRVWeights:
+    """
+    The medical-pretraining arm. Two things need pinning: that the input
+    adapter reproduces XRV's own normalization exactly, and that no checkpoint
+    trained on ChestX-ray14 can be selected. Both fail silently otherwise — the
+    first as a converged run trained on de-normalized images, the second as a
+    test score that is really a training score.
+    """
+
+    def test_the_adapter_reproduces_xrv_normalization(self):
+        """
+        The load-bearing claim of DenseNet121XRVClassifier: the shared
+        ImageNet-normalized transform can feed an XRV checkpoint without a
+        second DataLoader, because undoing one affine map and applying another
+        is exact. Compared against xrv's own function rather than against a
+        re-derivation of the same arithmetic.
+        """
+        import numpy as np
+        from PIL import Image
+        from torchvision import transforms
+
+        # Through the project's guarded importer, not a bare `import`: a bare
+        # one here would leave torchxrayvision's folders on sys.path and fail
+        # test_importing_it_does_not_shadow_the_project_modules below, for a
+        # reason that has nothing to do with the code under test.
+        xrv = _import_torchxrayvision()
+
+        pixels = np.random.default_rng(0).integers(0, 256, (32, 32), dtype=np.uint8)
+        # convert("RGB") is what dataset.py does to these grayscale radiographs
+        image = Image.fromarray(pixels, mode="L").convert("RGB")
+        shared_transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize(config.IMAGENET_MEAN, config.IMAGENET_STD),
+            ]
+        )
+
+        model = build_model("densenet121_xrv", pretrained=False)
+        ours = model._to_xrv_scale(shared_transform(image).unsqueeze(0))
+        theirs = torch.from_numpy(xrv.utils.normalize(pixels.astype("float32"), 255))
+
+        assert ours.shape == (1, 1, 32, 32)
+        # Tolerance is float32 rounding on a [-1024, 1024] scale, not slack.
+        assert torch.allclose(ours[0, 0], theirs, atol=1e-3)
+
+    @pytest.mark.parametrize("tag", sorted(XRV_LEAKY_WEIGHTS))
+    def test_rejects_weights_that_saw_the_test_split(self, tag):
+        """
+        Every blocked tag was trained on ChestX-ray14 or on a dataset derived
+        from it, so it has already seen images this pipeline reports as held
+        out. Nothing downstream can detect that, which is why it is blocked at
+        construction.
+        """
+        with pytest.raises(ValueError, match="leaks the evaluation set"):
+            build_model("densenet121_xrv", pretrained=False, weight_tag=tag)
+
+    def test_importing_it_does_not_shadow_the_project_modules(self):
+        """
+        torchxrayvision's vendored baseline models `sys.path.insert(0, ...)`
+        their own folders, one of which holds a package named `config`. Ahead
+        of the project root, that makes `import config` resolve to theirs in
+        any interpreter that has not already imported ours — which is every
+        spawned DataLoader worker. The symptom lands nowhere near the cause:
+        workers die on `module 'config' has no attribute 'SEED'` and the parent
+        reports BrokenPipeError.
+        """
+        import sys
+
+        build_model("densenet121_xrv", pretrained=False)
+
+        intruders = [entry for entry in sys.path if "torchxrayvision" in entry]
+        assert not intruders, f"torchxrayvision left {intruders} on sys.path"
+        assert sys.modules["config"].__file__ == config.__file__
+
+    def test_the_default_corpus_is_leakage_free(self):
+        assert XRV_DEFAULT_WEIGHT_TAG not in XRV_LEAKY_WEIGHTS
+
+    def test_every_available_tag_is_classified(self):
+        """
+        A new XRV release adding a checkpoint should not default to "allowed".
+        Each tag is either on the blocklist or asserted disjoint from NIH here,
+        so an unreviewed one fails this test instead of quietly training.
+        """
+        reviewed_clean = {
+            "densenet121-res224-chex",  # CheXpert, Stanford
+            "densenet121-res224-pc",  # PadChest, Spain
+            "densenet121-res224-mimic_ch",  # MIMIC-CXR, BIDMC
+            "densenet121-res224-mimic_nb",  # MIMIC-CXR, BIDMC
+        }
+        assert set(_xrv_densenet_tags()) == reviewed_clean | set(XRV_LEAKY_WEIGHTS)
+
+    def test_rejects_an_unknown_tag(self):
+        with pytest.raises(ValueError, match="Unknown TorchXRayVision weight tag"):
+            build_model("densenet121_xrv", pretrained=False, weight_tag="not_a_real_tag")
+
+    def test_it_stays_out_of_the_architecture_sweep(self):
+        """
+        `--model all` compares architectures. This is DenseNet-121 again with
+        different weights, so sweeping it would put the same architecture in
+        the comparison table twice.
+        """
+        assert "densenet121_xrv" in config.SUPPORTED_MODELS
+        assert "densenet121_xrv" not in config.SWEEP_MODELS
+        assert set(config.SWEEP_MODELS) < set(config.SUPPORTED_MODELS)
 
 
 class TestArchitectureAssumptions:

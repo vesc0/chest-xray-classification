@@ -116,7 +116,7 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 # Training
 # =============================================================================
 BATCH_SIZE = 32
-NUM_WORKERS = 4 # DataLoader workers
+NUM_WORKERS = 10 # DataLoader workers
 NUM_EPOCHS = 20
 LEARNING_RATE = 1e-4
 MIN_LEARNING_RATE = 1e-6
@@ -136,16 +136,7 @@ ASL_GAMMA_NEG = 4.0
 ASL_GAMMA_POS = 1.0
 ASL_CLIP = 0.05
 
-# Parameter counts are as built here, with the 14-class head.
-#
-#   densenet121   (7.0M)  CNN baseline        torchvision
-#   vit_s_16     (21.7M)  pure ViT            timm (DeiT III-S weights)
-#   convnextv2_t (27.9M)  modern CNN          timm
-#   swin_t       (27.5M)  modern ViT          torchvision
-#   maxvit_t     (30.4M)  hybrid CNN/ViT      torchvision
-#
-# swin_v2_t (27.6M) is buildable but not part of the roster: its weights are
-# 256-native and it fails to fit at 224. Kept so that result stays reproducible.
+# See models.py for details
 SUPPORTED_MODELS = [
     "densenet121",
     "vit_s_16",
@@ -153,7 +144,16 @@ SUPPORTED_MODELS = [
     "swin_t",
     "swin_v2_t",
     "maxvit_t",
+    "densenet121_xrv",
 ]
+
+# What `--model all` expands to. Everything above except densenet121_xrv, which
+# is excluded for two reasons: it is the only entry that needs a checkpoint
+# downloaded from outside torch/timm, and it is not a distinct architecture —
+# sweeping it would enter DenseNet-121 into compare_models() twice, once per
+# pretraining corpus, in a table whose rows are meant to be architectures.
+# Run it by name, against the densenet121 run as its control.
+SWEEP_MODELS = [name for name in SUPPORTED_MODELS if name != "densenet121_xrv"]
 
 # Optional timm tag overriding the checkpoint pinned in models.py, set per run
 # with `--weight-tag`. None keeps the roster's ImageNet-1k-only invariant; the

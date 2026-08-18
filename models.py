@@ -30,10 +30,17 @@ comparison:
 
 `--weight-tag` is the one sanctioned way out of the first invariant, for the
 separate question of how much pretraining *data* is worth on a fixed
-architecture. It is opt-in per run, applies only to the two timm-backed models,
-and `build_model` rejects any tag whose normalization statistics differ from
-config.IMAGENET_MEAN/STD — so it can relax the pretraining invariant without
-silently breaking the preprocessing one.
+architecture. It is opt-in per run and `build_model` rejects any timm tag whose
+normalization statistics differ from config.IMAGENET_MEAN/STD — so it can relax
+the pretraining invariant without silently breaking the preprocessing one.
+
+A sixth model, `densenet121_xrv`, sits outside the roster and outside both
+invariants by construction: same DenseNet-121 graph, but initialized from
+TorchXRayVision chest-X-ray weights instead of ImageNet, with the input
+converted to XRV's scale inside `forward` so the shared transform still holds.
+Its control is the densenet121 run, and it exists to put a number on how much
+of the roster's spread is architecture and how much is pretraining domain.
+It is excluded from `--model all`; see config.SUPPORTED_MODELS.
 
 Three come from torchvision; ViT-S and ConvNeXtV2 come from timm, which is the
 only source for them. The timm tags are pinned below rather than resolved by
@@ -43,12 +50,47 @@ means.
 All output NUM_CLASSES logits (one per pathology) for multi-label classification.
 """
 
+import sys
+
 import timm
 import torch
 import torch.nn as nn
 from torchvision import models
 
 import config
+
+
+def _import_torchxrayvision():
+    """
+    Import torchxrayvision without letting it shadow this project's modules.
+
+    Its vendored baseline models each run `sys.path.insert(0, <own folder>)` at
+    import time, and one of those folders contains a package named `config`.
+    Position 0 puts it *ahead* of the project root, so in any interpreter that
+    has not already imported our config, `import config` resolves to
+    torchxrayvision's.
+
+    This process is fine, because config is in sys.modules long before the
+    first XRV model is built. The DataLoader workers are where it bites: spawn
+    hands each worker a copy of this sys.path and no preloaded modules, so
+    every worker dies on `module 'config' has no attribute 'SEED'` and the
+    parent reports a BrokenPipeError several frames away from the cause.
+
+    sys.path is restored to exactly what it was. Whatever torchxrayvision
+    imported for itself is already in sys.modules and keeps working.
+    """
+    saved_path = list(sys.path)
+    try:
+        import torchxrayvision
+    except ImportError as error:
+        raise ImportError(
+            "densenet121_xrv needs torchxrayvision. Install it with "
+            "`pip install torchxrayvision`, or pick another model."
+        ) from error
+    finally:
+        sys.path[:] = saved_path
+
+    return torchxrayvision
 
 
 # Pinned timm weight tags. Unlike torchvision's `.DEFAULT`, a timm model name
@@ -62,6 +104,29 @@ CONVNEXTV2_T_WEIGHT_TAG = "convnextv2_tiny.fcmae_ft_in1k"
 # `.DEFAULT` enums and have no equivalent, so overriding them is an error
 # rather than a silent no-op.
 TIMM_BACKED_MODELS = ("vit_s_16", "convnextv2_t")
+
+# TorchXRayVision weights for the off-roster medical-pretraining arm. CheXpert
+# is the default of the leakage-free options: at 224k images it is the largest,
+# its labels were produced by a rule-based report labeler much like NIH's, and
+# it is the closest match to this pipeline's frontal-radiograph setting.
+XRV_DEFAULT_WEIGHT_TAG = "densenet121-res224-chex"
+
+# XRV checkpoints whose training data overlaps ChestX-ray14, keyed to why.
+# These are not merely suboptimal — using one makes the reported test AUROC a
+# measurement of memorization. The NIH test split is 25,596 images this project
+# never trains on; a checkpoint that already saw them turns Step 4 of the
+# pipeline into a training-set evaluation with no error raised anywhere.
+XRV_LEAKY_WEIGHTS = {
+    "densenet121-res224-all": (
+        "trained on nih-pc-chex-mimic_ch-google-openi-rsna, which includes "
+        "ChestX-ray14 itself"
+    ),
+    "densenet121-res224-nih": "trained on ChestX-ray14, this project's own dataset",
+    "densenet121-res224-rsna": (
+        "trained on the RSNA Pneumonia Detection Challenge, whose images are "
+        "drawn from ChestX-ray8/14"
+    ),
+}
 
 # torchvision builds MaxViT's attention partitions from a declared input size,
 # so this one model cannot follow config.IMAGE_SIZE.
@@ -157,10 +222,15 @@ class ViTSmallClassifier(nn.Module):
     ):
         super().__init__()
 
+        # Recorded rather than recomputed downstream: `weight_tag=None` means
+        # the pinned default, and a results file that says "None" does not
+        # identify the checkpoint the numbers came from.
+        self.weight_tag = weight_tag or VIT_S_WEIGHT_TAG
+
         # img_size is passed explicitly so timm interpolates the position
         # embeddings when IMAGE_SIZE is not the checkpoint's 224.
         self.backbone = timm.create_model(
-            weight_tag or VIT_S_WEIGHT_TAG,
+            self.weight_tag,
             pretrained=pretrained,
             num_classes=num_classes,
             img_size=config.IMAGE_SIZE,
@@ -208,8 +278,9 @@ class ConvNeXtV2TinyClassifier(nn.Module):
         super().__init__()
 
         # Load pretrained ConvNeXtV2-T backbone
+        self.weight_tag = weight_tag or CONVNEXTV2_T_WEIGHT_TAG
         self.backbone = timm.create_model(
-            weight_tag or CONVNEXTV2_T_WEIGHT_TAG,
+            self.weight_tag,
             pretrained=pretrained,
             num_classes=num_classes,
         )
@@ -361,6 +432,119 @@ class MaxViTTinyClassifier(nn.Module):
 
 
 # =============================================================================
+# 6. DenseNet-121 / TorchXRayVision (chest-X-ray pretraining, off-roster)
+# =============================================================================
+class DenseNet121XRVClassifier(nn.Module):
+    """
+    DenseNet-121 initialized from TorchXRayVision chest-X-ray weights.
+
+    Architecture: byte-for-byte the same graph as DenseNet121Classifier —
+    `features.conv0 … features.norm5`, then `classifier` — with two differences
+    that come from the checkpoint rather than from a design choice here:
+
+      - `features.conv0` takes 1 channel, not 3.
+      - the weights come from radiographs, not from ImageNet.
+
+    Because the module layout is identical, the Grad-CAM target
+    (`features.denseblock4`), the randomization stage list, and train.py's
+    head/backbone split all reuse the densenet121 entries unchanged. That is the
+    point of pairing this model with the baseline: everything downstream is held
+    fixed and *only the pretraining corpus* moves.
+
+    **This model is deliberately outside the five-architecture roster.** It
+    breaks the ImageNet-1k-only invariant on purpose, so it answers a different
+    question than the roster does: not "which architecture", but "how much of
+    the architecture comparison is really a statement about pretraining domain".
+    Its control is the densenet121 run, at the same capacity, resolution, loss
+    and schedule.
+
+    **Input adapter.** XRV checkpoints were trained on single-channel images
+    scaled to roughly [-1024, 1024], not on 3-channel ImageNet-normalized
+    tensors. Rather than give this one model its own DataLoader — which would
+    fork the shared transform that the whole pipeline is built on — the
+    conversion happens in `forward` as an exact affine map. See `_to_xrv_scale`.
+
+    **Leakage.** The corpus this is pretrained on must not contain
+    ChestX-ray14, or the NIH test split is partly training data and every number
+    downstream is inflated. `XRV_LEAKY_WEIGHTS` blocks the tags that do; the
+    default is CheXpert, which does not.
+    """
+
+    def __init__(
+        self,
+        num_classes: int = config.NUM_CLASSES,
+        pretrained: bool = True,
+        weight_tag: str | None = None,
+    ):
+        super().__init__()
+
+        # Imported here rather than at module scope so that the other five
+        # models stay buildable without torchxrayvision installed.
+        xrv = _import_torchxrayvision()
+
+        self.weight_tag = weight_tag or XRV_DEFAULT_WEIGHT_TAG
+        _check_xrv_weight_tag(self.weight_tag)
+
+        # `weights=` fixes the output width at the checkpoint's own pathology
+        # count, so num_classes cannot be passed alongside it. The head is
+        # replaced below in both branches, which makes that moot.
+        self.backbone = xrv.models.DenseNet(
+            weights=self.weight_tag if pretrained else None
+        )
+
+        # An operating-point buffer fitted to the source corpus, which
+        # `xrv.models.DenseNet.forward` applies as a sigmoid plus a per-class
+        # rescale when it is set. This pipeline needs raw logits — evaluate.py
+        # and the loss both apply their own sigmoid — and the buffer's 18
+        # entries are indexed by the checkpoint's pathology list, not ours.
+        self.backbone.op_threshs = None
+
+        # XRV resizes any non-native input back to 224 inside `forward`, which
+        # would quietly override `--image-size`. DenseNet is fully
+        # convolutional and does not need it; dropping the attribute puts this
+        # model under the same resolution rule as the rest of the roster.
+        if hasattr(self.backbone, "input_resolution"):
+            del self.backbone.input_resolution
+
+        in_features = self.backbone.classifier.in_features  # 1024
+        self.backbone.classifier = nn.Sequential(
+            nn.Dropout(p=HEAD_DROPOUT),
+            nn.Linear(in_features, num_classes),
+        )
+
+        # Buffers, not constants, so `.to(device)` carries them and the maths
+        # below never forces a host/device sync mid-batch.
+        self.register_buffer(
+            "_imagenet_mean", torch.tensor(config.IMAGENET_MEAN).view(1, 3, 1, 1)
+        )
+        self.register_buffer(
+            "_imagenet_std", torch.tensor(config.IMAGENET_STD).view(1, 3, 1, 1)
+        )
+
+    def _to_xrv_scale(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Map one ImageNet-normalized 3-channel batch onto XRV's input scale.
+
+        Exact, not approximate. dataset.py produces
+        `x[:, c] = (p / 255 - mean[c]) / std[c]` from an 8-bit pixel p, and
+        `xrv.utils.normalize` wants `(2 * p / 255 - 1) * 1024`. Undoing the
+        first and applying the second is a composition of two affine maps, so
+        no information is lost and gradients flow through unchanged.
+
+        The three channels are averaged after de-normalization rather than
+        taking channel 0. `Image.convert("RGB")` on a grayscale radiograph
+        makes them identical, so for this dataset the two are the same number;
+        averaging simply degrades gracefully instead of silently discarding two
+        thirds of a genuinely colored input.
+        """
+        gray = (x * self._imagenet_std + self._imagenet_mean).mean(dim=1, keepdim=True)
+        return (2.0 * gray - 1.0) * 1024.0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.backbone(self._to_xrv_scale(x))
+
+
+# =============================================================================
 # Model factory
 # =============================================================================
 # Keyed by the `--model` value. Kept as a table rather than a branch chain so
@@ -374,7 +558,43 @@ MODEL_BUILDERS: dict[str, type[nn.Module]] = {
     "swin_t": SwinTinyClassifier,
     "swin_v2_t": SwinV2TinyClassifier,
     "maxvit_t": MaxViTTinyClassifier,
+    "densenet121_xrv": DenseNet121XRVClassifier,
 }
+
+
+def _check_xrv_weight_tag(weight_tag: str) -> None:
+    """
+    Reject an XRV checkpoint that has already seen the NIH test split.
+
+    The failure this prevents is the worst kind available in this pipeline: the
+    run completes, the curves look ordinary, and the test AUROC comes back
+    several points above every other model — a result that reads as "medical
+    pretraining wins" and is actually the model recognizing images it was
+    trained on. Nothing downstream can detect it, so it is blocked here.
+    """
+    xrv = _import_torchxrayvision()
+
+    if weight_tag in XRV_LEAKY_WEIGHTS:
+        clean = sorted(set(_xrv_densenet_tags()) - set(XRV_LEAKY_WEIGHTS))
+        raise ValueError(
+            f"Weight tag '{weight_tag}' leaks the evaluation set: "
+            f"{XRV_LEAKY_WEIGHTS[weight_tag]}. Test scores from it would measure "
+            f"memorization of images this pipeline reports as held out. "
+            f"Leakage-free alternatives: {clean}."
+        )
+
+    if weight_tag not in xrv.models.model_urls:
+        raise ValueError(
+            f"Unknown TorchXRayVision weight tag '{weight_tag}'. "
+            f"Available DenseNet-121 tags: {sorted(_xrv_densenet_tags())}."
+        )
+
+
+def _xrv_densenet_tags() -> list[str]:
+    """The DenseNet-121 entries of XRV's weight registry, long-form names only."""
+    xrv = _import_torchxrayvision()
+
+    return [name for name in xrv.models.model_urls if name.startswith("densenet121-")]
 
 
 def _check_weight_tag_normalization(weight_tag: str) -> None:
@@ -420,10 +640,13 @@ def build_model(
         model_name: One of config.SUPPORTED_MODELS.
         pretrained: Whether to load ImageNet-pretrained weights. False keeps
             construction offline, which is what the test suite relies on.
-        weight_tag: Optional timm tag overriding the pinned checkpoint, for the
-            pretraining-data ablation (e.g. `deit3_small_patch16_224.fb_in22k_ft_in1k`
-            in place of the IN1k default). Only the timm-backed models accept
-            one, and the tag's normalization must match the shared transform.
+        weight_tag: Optional tag overriding the pinned checkpoint, for the
+            pretraining-data ablation. For the timm-backed models this is a timm
+            tag (e.g. `deit3_small_patch16_224.fb_in22k_ft_in1k` in place of the
+            IN1k default) and must match the shared transform's normalization.
+            For densenet121_xrv it is a TorchXRayVision weight name selecting
+            the pretraining corpus, and must not be one that saw ChestX-ray14.
+            The torchvision-backed models accept no tag at all.
 
     Returns:
         nn.Module ready for training.
@@ -436,11 +659,17 @@ def build_model(
     if weight_tag is None:
         return MODEL_BUILDERS[model_name](pretrained=pretrained)
 
+    # Validated inside the class instead: the check needs torchxrayvision, and
+    # importing it here would make it a hard dependency of every model.
+    if model_name == "densenet121_xrv":
+        return MODEL_BUILDERS[model_name](pretrained=pretrained, weight_tag=weight_tag)
+
     if model_name not in TIMM_BACKED_MODELS:
         raise ValueError(
-            f"--weight-tag is only supported for {list(TIMM_BACKED_MODELS)}; "
+            f"--weight-tag is only supported for "
+            f"{[*TIMM_BACKED_MODELS, 'densenet121_xrv']}; "
             f"'{model_name}' resolves its weights through torchvision and has no "
-            f"tag to override. Drop the flag, or select a timm-backed model."
+            f"tag to override. Drop the flag, or select a model that takes one."
         )
 
     _check_weight_tag_normalization(weight_tag)

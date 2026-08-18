@@ -144,10 +144,12 @@ def main():
         type=str,
         default=None,
         help=(
-            "Override the pinned timm checkpoint (timm-backed models only). Used "
-            "for the pretraining-data ablation, e.g. "
-            "deit3_small_patch16_224.fb_in22k_ft_in1k for ViT-S. Rejected if the "
-            "tag expects normalization other than config.IMAGENET_MEAN/STD"
+            "Override the pinned checkpoint, for the pretraining-data ablation. "
+            "A timm tag for vit_s_16/convnextv2_t, e.g. "
+            "deit3_small_patch16_224.fb_in22k_ft_in1k for ViT-S — rejected if it "
+            "expects normalization other than config.IMAGENET_MEAN/STD. A "
+            "TorchXRayVision weight name for densenet121_xrv, e.g. "
+            "densenet121-res224-pc — rejected if its corpus contains ChestX-ray14"
         ),
     )
 
@@ -409,7 +411,7 @@ def main():
 
     # Model selection logic
     if args.model == "all":
-        model_names = list(config.SUPPORTED_MODELS)
+        model_names = list(config.SWEEP_MODELS)
     else:
         model_names = [args.model]
 
