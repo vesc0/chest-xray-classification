@@ -279,6 +279,48 @@ class TestSavePredictions:
         assert list(restored["class_names"]) == list(config.CLASS_NAMES)
         assert (restored["groups"] == groups).all()
 
+    def test_patient_ids_off_a_dataframe_round_trip(self, rng, tmp_path):
+        """
+        The real caller passes patient_groups(), which is a pandas column.
+
+        That arrives as dtype=object, and np.savez stores it as an object array
+        — which np.load refuses to read back under allow_pickle=False. The
+        test above misses it because np.arange(...).astype(str) is already
+        fixed-width text, so the whole post-hoc path broke while the suite
+        stayed green.
+        """
+        config.RESULTS_DIR = tmp_path
+        labels, probs = self._arrays(rng)
+        frame = pd.DataFrame({config.PATIENT_ID_COLUMN: [str(i // 2) for i in range(40)]})
+        groups = frame[config.PATIENT_ID_COLUMN].to_numpy()
+        assert groups.dtype == object, "fixture no longer reproduces the pandas path"
+
+        save_predictions(labels, probs, "densenet121", "test", groups=groups)
+
+        with np.load(tmp_path / "densenet121_test_predictions.npz", allow_pickle=False) as stored:
+            assert stored["groups"].dtype != object
+        restored = load_predictions("densenet121", "test")
+        assert (restored["groups"] == groups.astype(str)).all()
+
+    def test_reads_predictions_written_before_patient_ids_were_text(self, rng, tmp_path):
+        """An existing outputs/ tree must stay readable without re-running inference."""
+        config.RESULTS_DIR = tmp_path
+        labels, probs = self._arrays(rng)
+        groups = np.array([str(i // 2) for i in range(40)], dtype=object)
+        np.savez_compressed(
+            tmp_path / "densenet121_test_predictions.npz",
+            labels=labels.astype(np.int8),
+            probs=probs.astype(np.float32),
+            class_names=np.asarray(config.CLASS_NAMES),
+            groups=groups,
+        )
+
+        restored = load_predictions("densenet121", "test")
+
+        assert restored["probs"] == pytest.approx(probs)
+        assert (restored["groups"] == groups.astype(str)).all()
+        assert restored["groups"].dtype != object
+
     def test_probabilities_survive_the_round_trip_exactly(self, rng, tmp_path):
         """Thresholds are compared against these values with >=, so a lossy
         round trip would shift which samples land on the positive side."""

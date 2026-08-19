@@ -336,8 +336,12 @@ def main():
         "--model",
         type=str,
         required=True,
-        choices=[*config.SUPPORTED_MODELS, "all"],
-        help="Which model's saved predictions to analyze",
+        help=(
+            "Which model's saved predictions to analyze, or 'all' for every "
+            f"architecture ({', '.join(config.SWEEP_MODELS)}). Not restricted to "
+            "those: this reads arrays by filename, and a valid run need not be a "
+            "single architecture — 'ensemble' is the standing example"
+        ),
     )
     parser.add_argument(
         "--experiment",
@@ -397,6 +401,17 @@ def main():
             analyze_model(model_name, args.metric, args.bootstrap_samples)
         except FileNotFoundError as error:
             print(f"[threshold-analysis] Skipping {model_name}: {error}")
+            # --model is unconstrained, so a typo lands here rather than at the
+            # argument parser. Say what this experiment actually holds.
+            available = sorted(
+                path.name[: -len("_val_predictions.npz")]
+                for path in config.RESULTS_DIR.glob("*_val_predictions.npz")
+            )
+            if available:
+                print(
+                    f"[threshold-analysis] {config.EXPERIMENT_NAME} has predictions "
+                    f"for: {', '.join(available)}"
+                )
 
 
 if __name__ == "__main__":

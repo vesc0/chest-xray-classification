@@ -424,23 +424,69 @@ def save_predictions(
         "class_names": np.asarray(config.CLASS_NAMES),
     }
     if groups is not None:
-        payload["groups"] = np.asarray(groups)
+        # Patient IDs arrive straight off a pandas column, so np.asarray gives
+        # dtype=object — and np.load refuses to read an object array back
+        # unless allow_pickle is on. Storing them as fixed-width text keeps the
+        # loader's safe default intact instead of trading it away to read this
+        # project's own output. They are identifiers, only ever compared for
+        # equality and grouped on, so text loses nothing.
+        groups = np.asarray(groups)
+        if groups.dtype == object:
+            groups = groups.astype(str)
+        payload["groups"] = groups
 
     np.savez_compressed(path, **payload)
     print(f"[evaluate] {split.capitalize()} predictions saved -> {path}")
     return path
 
 
+# Set once the first legacy-format prediction file is converted on read, so the
+# notice is printed once per process rather than once per file.
+_LEGACY_GROUPS_REPORTED = False
+
+
 def load_predictions(model_name: str, split: str) -> dict[str, np.ndarray]:
-    """Read back what save_predictions() wrote."""
+    """
+    Read back what save_predictions() wrote.
+
+    Files written before patient IDs were stored as text hold `groups` as an
+    object array, which np.load will not touch under allow_pickle=False. Those
+    are re-read permissively and converted on the way out, so an outputs/ tree
+    full of finished runs stays readable without re-running inference over every
+    one of them. The permissive path is deliberately narrow: it is entered only
+    after the safe read has failed for that specific reason.
+    """
     path = config.RESULTS_DIR / f"{model_name}_{split}_predictions.npz"
     if not path.exists():
         raise FileNotFoundError(
             f"No saved {split} predictions at {path}. Re-run evaluation with "
             "config.SAVE_PREDICTIONS enabled."
         )
-    with np.load(path, allow_pickle=False) as archive:
-        return {key: archive[key] for key in archive.files}
+
+    try:
+        with np.load(path, allow_pickle=False) as archive:
+            return {key: archive[key] for key in archive.files}
+    except ValueError as error:
+        if "allow_pickle" not in str(error):
+            raise
+
+    global _LEGACY_GROUPS_REPORTED
+    if not _LEGACY_GROUPS_REPORTED:
+        # Once per process, not once per file: ensemble.py's selection rule
+        # reads every run in outputs/, and one notice says everything twenty
+        # identical ones would. Re-running evaluation rewrites a file in the
+        # current format.
+        _LEGACY_GROUPS_REPORTED = True
+        print(
+            f"[evaluate] {path.name} stores patient IDs in the pre-text format; "
+            f"converting on read. Later files of this format convert silently."
+        )
+    with np.load(path, allow_pickle=True) as archive:
+        restored = {key: archive[key] for key in archive.files}
+
+    if "groups" in restored and restored["groups"].dtype == object:
+        restored["groups"] = restored["groups"].astype(str)
+    return restored
 
 
 def _loader_patient_groups(loader: DataLoader) -> np.ndarray | None:
@@ -1083,6 +1129,20 @@ def print_results(results: dict, model_name: str) -> None:
     inference = timing.get("inference") or {}
     if run or training or inference:
         print("-" * len(header))
+
+    # A post-hoc run scored saved arrays rather than a model, so it has no
+    # device, batch size or parameter count. Printing the block anyway reported
+    # "0 params" and "[recovered]", which read as a broken training run rather
+    # than as a combination of finished ones.
+    if run.get("source"):
+        print(f"  Source: {run['source']}")
+        members = (results.get("ensemble") or {}).get("members") or []
+        if members:
+            print(
+                "  Members: "
+                + ", ".join(f"{entry['experiment']}:{entry['model']}" for entry in members)
+            )
+    elif run or training or inference:
         trainable = run.get("trainable_params")
         trainable_str = (
             f"{trainable:,} trainable ({run.get('trainable_fraction') or 0:.2%})"
