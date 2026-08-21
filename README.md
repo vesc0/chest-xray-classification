@@ -12,6 +12,7 @@ intervals, and explainability that is itself sanity-checked.
 - [Pipeline](#pipeline)
 - [Modules](#modules)
 - [Evaluation](#evaluation)
+- [Subgroup analysis](#subgroup-analysis)
 - [Explainability](#explainability)
 - [Ensembling](#ensembling)
 - [Outputs](#outputs)
@@ -128,6 +129,7 @@ label-stratified, and training subsets are nested (5k ⊂ 15k ⊂ 30k).
 | `train.py` | Training loop, optimizer, mixed precision, asymmetric loss |
 | `evaluate.py` | Inference, metrics with bootstrap CIs, threshold tuning, saved probabilities |
 | `threshold_analysis.py` | Post-hoc comparison of thresholding schemes. Runs no model |
+| `bias_analysis.py` | Sex- and age-stratified AUROC and miss rates. Runs no model |
 | `ensemble.py` | Averages saved probabilities of finished runs. Runs no model |
 | `explainability.py` | Grad-CAM (all architectures) and Attention Rollout (ViT) |
 | `localization.py` | Pointing game, energy fraction, IoU/IoBB against the boxes |
@@ -162,6 +164,71 @@ resamples. On rare classes it is the wider of the two intervals.
 Every run additionally records wall-clock training and inference cost, together
 with the device, batch size, workers, AMP setting and package versions that
 produced it.
+
+## Subgroup analysis
+
+Macro AUROC hides who the errors land on. `bias_analysis.py` re-attaches the
+patient metadata behind every saved test prediction and asks the two questions
+separately:
+
+- **Stratified AUROC** — does the model *rank* worse for a group?
+- **Stratified FNR, and the share of abnormal studies where no class fires at
+  all** — does the group get *missed* more at the deployed threshold?
+
+They can disagree, and that is the useful part: equal AUROC with unequal FNR
+puts the disparity in the operating point rather than the features.
+
+```bash
+python bias_analysis.py --all
+```
+
+Thresholds stay global. Refitting them per subgroup would answer "could a
+group-aware model do better?", not "what does the single shipped threshold do
+to each group?" — and only the second question is about a deployable system.
+
+Every gap is reported against a reference group (the largest level on each axis)
+with a **patient-level bootstrap interval on the difference**, both levels scored
+inside the same resample. Two overlapping one-group intervals are not evidence of
+no difference; the paired interval is what settles it.
+
+One detail does most of the work. A macro taken over whichever classes happen to
+be scorable in each group compares different diseases and invents disparities
+that are not there: Hernia has a single positive among the 6,908 test images aged
+20-39, and that one case moves the band's 14-class macro AUROC by five points.
+Each pair is therefore restricted to the classes clearing ten positives **in both
+the group and the reference**, and the reported `cls` column says how many
+survived. Left uncorrected, this alone produced a spurious five-point deficit in
+the 20-39 band and a four-point one in the 80-100 band, both of which vanish
+under the shared class set.
+
+Across all 22 saved runs the result is one-sided. **Sex is a bounded null**: the
+median AUROC gap is -0.0014 and no run's interval excludes zero, with a median
+half-width of +/-0.014 — enough to rule out sex gaps larger than about one and a
+half AUROC points, not enough to call any smaller one. **The youngest band is
+not**: patients aged 0-19 carry a median +0.072 FNR gap, resolved in 21 of 22
+runs, while their AUROC gap stays indistinguishable from zero. The model ranks
+these patients as well as anyone and still misses more of their findings, which
+places the disparity squarely in the shared operating point.
+
+Nothing in the sweep closes it. Overall AUROC and the 0-19 FNR gap correlate at
+r = 0.11 across the 22 runs: the best model here (the stacked ensemble, 0.827
+macro AUROC) still misses +0.056 [+0.016, +0.112] more, and twelve points of
+macro AUROC bought across architecture family, pretraining source, input
+resolution, training-set size and ensembling buy no measurable fairness. The
+80-100 band is reported but underpowered — 31 patients and nine comparable
+classes — and resolves nothing.
+
+The framing follows Seyyed-Kalantari et al. (2021), narrowed to the two
+attributes ChestX-ray14 actually carries — sex and age. Race and insurance,
+which carry their largest disparities, are not in this dataset. Two limits
+belong with any reading of these numbers:
+
+- The labels are NLP-mined from reports. This measures disparity against *noisy*
+  labels, and label noise that itself tracks age cannot be separated from model
+  behaviour with this data alone.
+- Subgroup prevalence differs, so a shared threshold produces different FNRs
+  partly through calibration. That is a property of deploying one threshold, not
+  an artefact — which is exactly why it is the thing worth measuring.
 
 ## Explainability
 
@@ -281,8 +348,8 @@ Each run writes to `outputs/<experiment>/`, where `<experiment>` is
 outputs/<experiment>/
 ├── checkpoints/   # best model weights per architecture
 ├── results/       # metrics JSON, tuned thresholds, raw val/test predictions (.npz),
-│                  # training curves, split summary, threshold analysis,
-│                  # localization and sanity-check reports
+│                  # training curves, split summary, threshold and subgroup
+│                  # analyses, localization and sanity-check reports
 ├── logs/          # full console output per run, timestamped
 └── xai/<model>/
     ├── localization/<method>/   # figures with ground-truth boxes drawn
