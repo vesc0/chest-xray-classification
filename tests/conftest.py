@@ -1,9 +1,6 @@
 """
-Shared fixtures.
-
-Everything here is synthetic: the suite must pass with the dataset drive
-unmounted, no GPU, and no checkpoint on disk. Nothing in tests/ may read
-config.DATASET_ROOT or write into outputs/.
+Shared fixtures. Everything is synthetic: the suite must pass with the dataset
+unmounted, no GPU and no checkpoint, and may not write into outputs/.
 """
 
 import sys
@@ -13,7 +10,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-# Make the project modules importable regardless of pytest's rootdir inference
+# Importable regardless of pytest's rootdir inference.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config  # noqa: E402
@@ -22,11 +19,8 @@ import config  # noqa: E402
 @pytest.fixture(autouse=True)
 def restore_config():
     """
-    Undo config mutations after every test.
-
-    config is module-level mutable state that main.py rewrites from the CLI, so
-    a test that changes a threshold or a subset size would otherwise leak into
-    whichever test happens to run next.
+    Undo config mutations after every test — it is module-level mutable state
+    that main.py rewrites from the CLI, so changes leak between tests.
     """
     saved = {
         name: getattr(config, name)
@@ -41,14 +35,9 @@ def restore_config():
 @pytest.fixture(autouse=True)
 def disable_bootstrap(restore_config):
     """
-    Keep the bootstrap out of the tests that are not about it.
-
-    compute_metrics() otherwise runs config.BOOTSTRAP_SAMPLES resamples on every
-    call, which turns this suite from two seconds into forty. Tests that do
-    exercise it turn it back on with a small sample count.
-
-    Depends on restore_config so that it runs *after* the snapshot is taken, and
-    the real value is put back at teardown.
+    Keep the bootstrap out of the tests that are not about it, which otherwise
+    turns the suite from two seconds into forty. Depends on restore_config so
+    it runs after the snapshot and the real value comes back at teardown.
     """
     config.BOOTSTRAP_ENABLED = False
 
@@ -64,18 +53,16 @@ def make_label_frame(
     seed: int = 0,
 ) -> pd.DataFrame:
     """
-    A metadata frame shaped like load_metadata()'s output.
-
-    Prevalences deliberately span the real long tail — one class near 40% and
-    one near 0.5% — because the stratification code is only interesting when a
-    class is scarce enough to be lost by a naive split.
+    A metadata frame shaped like load_metadata()'s output, with prevalences
+    spanning the real long tail (40% down to 0.5%) — the stratification code is
+    only interesting when a class can be lost by a naive split.
     """
     generator = np.random.default_rng(seed)
     prevalence = np.linspace(0.40, 0.005, config.NUM_CLASSES)
 
     rows = []
     for patient in range(n_patients):
-        # One label vector per patient, so a patient is a coherent group
+        # One label vector per patient, so a patient is a coherent group.
         vector = (generator.random(config.NUM_CLASSES) < prevalence).astype(np.float32)
         for study in range(generator.integers(1, max_studies + 1)):
             rows.append(
@@ -100,9 +87,8 @@ def model_cache():
     """
     Lazily built, randomly initialized backbones, shared across the session.
 
-    pretrained=False keeps this offline and fast enough to be worth doing for
-    real: the architecture-specific wiring (head location, Grad-CAM target
-    layer) is exactly what silently breaks on a torchvision upgrade.
+    pretrained=False keeps it offline: the architecture-specific wiring (head
+    location, Grad-CAM target) is what breaks on a torchvision upgrade.
     """
     from models import build_model
 

@@ -1,42 +1,22 @@
 """
-Sanity checks for the explanations (Adebayo et al., 2018)
+Cascading model-parameter randomization (Adebayo et al., 2018).
 
-A heatmap that looks anatomically plausible is not evidence that the method is
-explaining the model. Adebayo et al., "Sanity Checks for Saliency Maps" (2018),
-showed that several widely used methods produce essentially the same map after
-the network's weights have been randomized — they were reading edges out of the
-input, and the model was decoration. Any such method would sail through
-localization.py: it would point at the lungs, score above the random baseline,
-and support a completely unearned claim about what the classifier learned.
+A plausible-looking heatmap is not evidence that the method explains the model.
+Adebayo et al. showed several widely used methods produce essentially the same
+map after the weights are randomized — they read edges out of the input. Such a
+method would sail through localization.py, pointing at the lungs and scoring
+above the random baseline on an entirely unearned claim.
 
-This module runs the **cascading model-parameter randomization test**. Starting
-from the trained network, it randomizes one stage at a time from the classifier
-down toward the stem, re-explains the same images after each step, and measures
-how far the explanation has moved:
+Randomizes one stage at a time from the classifier down toward the stem,
+re-explaining the same images after each step, and reports two things: the
+Spearman rank correlation against the original heatmap, which should fall off,
+and the pointing game against the ground-truth boxes, which should collapse to
+its random baseline once the layers that produced it are noise.
 
-  rank correlation   Spearman correlation between the original heatmap and the
-                     heatmap from the partially randomized model, per instance.
-                     Should fall off as randomization cascades. A method whose
-                     maps survive intact is not a function of the weights.
-  pointing game      the same metric localization.py reports, recomputed at each
-                     step against the ground-truth boxes, beside the random
-                     baseline it has to beat. This is the one that makes the
-                     result concrete: localization should collapse to baseline
-                     once the layers that produced it are noise.
-
-Both are reported for every explainer the architecture supports, because the
-question is asked of the *method*, not of the model. Attention Rollout is a
-particularly interesting subject: it is class-agnostic and built from attention
-matrices rather than gradients, so there is no reason to assume it behaves like
-Grad-CAM here.
-
-The test runs on a seeded subsample of the annotated instances (config
-.SANITY_CHECK_SAMPLES) rather than all 984, because it re-explains the set once
-per stage per method and the shape of the falloff is clear long before the
-standard error matters.
-
-Nothing here mutates the trained model: every randomization is applied to a deep
-copy, and the global RNG state is saved and restored around the whole run.
+Asked of every explainer, because the question is about the *method*. It runs
+on a seeded subsample (config.SANITY_CHECK_SAMPLES) since the set is
+re-explained once per stage per method. Nothing here mutates the trained model:
+randomization runs on deep copies and the global RNG state is restored.
 """
 
 import copy
@@ -60,20 +40,11 @@ from localization import (
 )
 
 
-# =============================================================================
-# What counts as a stage, per architecture
-# =============================================================================
-# Ordered top-down: the classifier first, then back toward the input. Each entry
-# is (label, parameter-name prefixes), and randomization is *cascading* — stage
-# k is randomized on top of stages 1..k-1, which is the version of the test in
-# the paper. The independent variant (restore between steps) answers a different
-# question and is not what is run here.
-#
-# Prefixes rather than module objects because the check is over parameters, and
-# a prefix list is something a test can verify covers the model exactly. Every
-# entry below is asserted to match at least one parameter, and the union is
-# asserted to be all of them — a stage list that silently skips a block would
-# understate how much the explanation survives.
+# --- What counts as a stage, per architecture ---------------------------------
+# Top-down, (label, parameter-name prefixes). Cascading: stage k is randomized
+# on top of 1..k-1, which is the paper's version. Prefixes rather than module
+# objects so a test can verify the union covers the model exactly — a stage list
+# that skipped a block would understate how much the explanation survives.
 RANDOMIZATION_STAGES: dict[str, list[tuple[str, list[str]]]] = {
     "densenet121": [
         ("classifier", ["backbone.classifier"]),
@@ -83,8 +54,7 @@ RANDOMIZATION_STAGES: dict[str, list[tuple[str, list[str]]]] = {
         ("denseblock1", ["backbone.features.transition1", "backbone.features.denseblock1"]),
         ("stem", ["backbone.features.conv0", "backbone.features.norm0"]),
     ],
-    # Identical module layout to densenet121 — XRV's DenseNet is a copy of
-    # torchvision's with a 1-channel stem — so the stage list is the same.
+    # Identical module layout to densenet121, so the same stage list.
     "densenet121_xrv": [
         ("classifier", ["backbone.classifier"]),
         ("denseblock4", ["backbone.features.norm5", "backbone.features.denseblock4"]),
@@ -110,10 +80,8 @@ RANDOMIZATION_STAGES: dict[str, list[tuple[str, list[str]]]] = {
         ("stage 1", ["backbone.stages.0"]),
         ("stem", ["backbone.stem"]),
     ],
-    # torchvision interleaves stages and patch-merging layers in `features`:
-    # 0 = patch embed, 1/3/5/7 = stages, 2/4/6 = the merge before each.
-    # Swin V1 and V2 share a module layout: 8 feature stages under `features`,
-    # then norm/permute/avgpool/flatten/head. The two entries are identical.
+    # torchvision interleaves stages and merges in `features`: 0 = patch embed,
+    # 1/3/5/7 = stages, 2/4/6 = the merge before each. V1 and V2 are identical.
     "swin_t": [
         ("head", ["backbone.head"]),
         ("stage 4", ["backbone.norm", "backbone.features.7", "backbone.features.6"]),
@@ -150,22 +118,15 @@ def randomize(model: torch.nn.Module, prefixes: list[str]) -> int:
     """
     Re-initialize every parameter under `prefixes`, in place.
 
-    Re-initializes rather than perturbing: the test asks what the explanation
-    looks like when a stage carries no learned information, and adding noise to
-    trained weights leaves most of that information in place.
+    Re-initialized rather than perturbed: the test asks what the explanation
+    looks like when a stage carries *no* learned information. Each module's own
+    `reset_parameters()` does the work where it exists, so layers are re-drawn
+    from their original distribution; BatchNorm running statistics go too,
+    since trained statistics on random weights are neither model. Bare
+    parameters (ViT's class token, position embedding) have no such method and
+    are re-drawn from a normal matched to their original scale.
 
-    Each module's own `reset_parameters()` does the work where it exists, so a
-    layer is re-drawn from the distribution it was originally initialized from
-    rather than from one this module picked. BatchNorm additionally has its
-    running statistics reset — leaving trained statistics behind on randomized
-    weights would be neither the trained model nor a random one.
-
-    Bare parameters have no `reset_parameters` (ViT's class token and position
-    embedding are the cases here), so anything still bit-identical afterwards is
-    re-drawn from a normal matched to its original scale.
-
-    Returns:
-        Number of parameter tensors re-initialized.
+    Returns how many parameter tensors were re-initialized.
     """
     before = {
         name: param.detach().clone()
@@ -196,9 +157,7 @@ def randomize(model: torch.nn.Module, prefixes: list[str]) -> int:
     return len(before)
 
 
-# =============================================================================
-# Running the test
-# =============================================================================
+# --- Running the test ---------------------------------------------------------
 def _explain_subset(explainer, loader, device) -> tuple[np.ndarray, list[int]]:
     """Heatmaps for every instance in the loader, plus their pair indices."""
     maps: list[np.ndarray] = []
@@ -214,11 +173,9 @@ def _rank_correlation(reference: np.ndarray, candidate: np.ndarray) -> float | N
     """
     Spearman correlation of two heatmaps, or None if either carries no signal.
 
-    A constant map has no ranking to correlate, and scipy returns NaN for it.
-    Averaging NaN in would poison the column; counting a blank map as
-    "uncorrelated" would be worse, because a method that collapses to blank
-    under randomization has in fact stopped tracking the original. Excluded and
-    counted separately instead.
+    A constant map has no ranking to correlate. Averaging its NaN in would
+    poison the column, and scoring it "uncorrelated" would be worse — a method
+    that collapses to blank *has* stopped tracking the original. Counted apart.
     """
     if _is_degenerate(reference) or _is_degenerate(candidate):
         return None
@@ -273,9 +230,8 @@ def _check_one_method(
         ),
     }]
 
-    # The deep copy is what keeps the trained model intact: every stage below
-    # randomizes cumulatively on top of the last, so this object degrades over
-    # the loop and the caller's model never does.
+    # Stages randomize cumulatively, so this copy degrades over the loop and
+    # the caller's model never does.
     scratch = copy.deepcopy(model)
 
     for label, prefixes in stages:
@@ -303,10 +259,9 @@ def _check_one_method(
         })
 
     # How much of the network has to be destroyed before the explanation stops
-    # tracking the trained one. The table shows the whole curve; this is the
-    # scalar worth quoting, and it is where the interesting failures live — a
-    # method can decorrelate eventually and still be almost untouched by
-    # randomizing the layers it is nominally reading.
+    # tracking the trained one — the scalar worth quoting off the curve. A
+    # method can decorrelate eventually and still be untouched by randomizing
+    # the layers it nominally reads.
     randomized = steps[1:]
     stages_until_decorrelated = next(
         (
@@ -328,10 +283,9 @@ def _check_one_method(
         "stages_until_decorrelated": stages_until_decorrelated,
         "total_stages": len(stages),
         "fully_randomized_correlation": final,
-        # A heuristic flag, not a standard: Adebayo et al. give no threshold.
-        # It marks the case the test exists to catch — a map that still tracks
-        # the trained one after every weight in the network has been re-drawn,
-        # which means it is a function of the input rather than of the model.
+        # Heuristic, not a standard — the paper gives no threshold. It marks
+        # the case the test exists to catch: a map that still tracks the trained
+        # one after every weight has been re-drawn is reading the input.
         "alarm": bool(final is not None and final > config.SANITY_CHECK_ALARM_CORRELATION),
     }
 
@@ -409,14 +363,8 @@ def run_sanity_checks(
     """
     Cascading parameter randomization for every explainer the model supports.
 
-    Args:
-        model: Trained model. Not modified — the test runs on deep copies.
-        model_name: One of config.SUPPORTED_MODELS.
-        num_samples: Annotated instances to test on. Defaults to
-            config.SANITY_CHECK_SAMPLES.
-
-    Returns:
-        {method_key: result}; empty if the check could not be run.
+    The model is not modified; the test runs on deep copies. Returns
+    {method_key: result}, empty if the check could not be run.
     """
     if num_samples is None:
         num_samples = config.SANITY_CHECK_SAMPLES
@@ -431,8 +379,8 @@ def run_sanity_checks(
         return {}
 
     if not config.BBOX_CSV.exists():
-        # The rank correlation alone would still work, but the pointing-game
-        # column is what makes the result legible next to localization.py.
+        # Rank correlation alone would work, but the pointing-game column is
+        # what makes the result legible next to localization.py.
         print(f"[sanity] {config.BBOX_CSV} not found - skipping.")
         return {}
 
@@ -444,9 +392,8 @@ def run_sanity_checks(
     device = next(model.parameters()).device
     model.eval()
 
-    # Seeded subsample, drawn across the whole annotated set: the pairs are
-    # sorted by image name, so any prefix of them is skewed toward a handful of
-    # classes.
+    # Across the whole annotated set: the pairs are sorted by image name, so
+    # any prefix is skewed toward a handful of classes.
     rng = np.random.default_rng(config.SEED)
     count = min(int(num_samples), len(pairs))
     chosen = sorted(rng.choice(len(pairs), size=count, replace=False).tolist())
@@ -472,8 +419,8 @@ def run_sanity_checks(
         f"stages on {count} annotated instances for {model_name} ..."
     )
 
-    # reset_parameters() draws from the global RNG. Restore it afterwards so a
-    # sanity check cannot change what any later step in the pipeline produces.
+    # reset_parameters() draws from the global RNG, so restore it: a sanity
+    # check must not change what any later pipeline step produces.
     rng_state = torch.get_rng_state()
     torch.manual_seed(config.SEED)
     try:

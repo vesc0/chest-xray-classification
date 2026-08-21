@@ -47,7 +47,7 @@ class TestClassAuroc:
 
     @pytest.mark.parametrize("targets", [np.zeros(4), np.ones(4)])
     def test_nan_when_only_one_outcome_present(self, targets):
-        # Not 0.0 and not 0.5 — undefined, so macro averaging must skip it
+        # Not 0.0 and not 0.5 — undefined, so macro averaging must skip it.
         assert np.isnan(class_auroc(targets, np.array([0.1, 0.4, 0.6, 0.9])))
 
 
@@ -56,8 +56,7 @@ class TestClassAuprc:
         assert np.isnan(class_auprc(np.zeros(4), np.array([0.1, 0.4, 0.6, 0.9])))
 
     def test_defined_when_no_negatives(self):
-        # AUROC is undefined here but average precision is not: everything is a
-        # positive, so any ranking retrieves them all.
+        # AUROC is undefined here but average precision is not.
         assert class_auprc(np.ones(4), np.array([0.1, 0.4, 0.6, 0.9])) == pytest.approx(1.0)
 
     def test_perfect_ranking_scores_one(self):
@@ -68,7 +67,7 @@ class TestClassAuprc:
 
 class TestMacroAverage:
     def test_skips_undefined_classes(self):
-        # The mean of the two real values, not of four with NaNs coerced to 0
+        # The mean of the two real values, not of four with NaNs as 0.
         assert macro_average(np.array([0.8, np.nan, 0.6, np.nan])) == pytest.approx(0.7)
 
     def test_none_when_nothing_scorable(self):
@@ -80,7 +79,7 @@ class TestMacroAverage:
 
 class TestEpochMetrics:
     def test_falls_back_to_zero_not_none(self, rng):
-        # Feeds the history arrays behind early stopping, which cannot take None
+        # Feeds the history arrays behind early stopping, which reject None.
         labels = np.zeros((10, config.NUM_CLASSES), dtype=np.float32)
         result = epoch_metrics(labels, rng.random((10, config.NUM_CLASSES)))
         assert result == {"auroc": 0.0, "auprc": 0.0}
@@ -92,11 +91,8 @@ class TestEpochMetrics:
 
 class TestTrainEvaluationAgreement:
     """
-    Regression guard for the duplication these helpers replaced.
-
-    train.py and evaluate.py each used to carry their own AUROC loop, so a fix
-    to one could silently leave the other behind and the validation curve would
-    stop predicting the reported test number.
+    Guards the duplication these helpers replaced: train.py and evaluate.py
+    each carried their own AUROC loop, so a fix to one left the other behind.
     """
 
     def test_epoch_auroc_matches_evaluate_macro_auroc(self, rng):

@@ -1,20 +1,13 @@
 """
-Post-hoc threshold analysis over saved predictions.
+Post-hoc threshold analysis over saved predictions. Nothing here runs a model.
 
-Nothing here runs a model. It reads the val/test probability arrays that
-evaluate.py writes and answers the questions that would otherwise cost a full
-inference pass over every architecture:
+Answers two questions that would otherwise cost a full inference pass per
+architecture: where each objective puts the threshold and how far that moves
+between validation resamples, and what F1, Youden and a fixed-sensitivity
+operating point cost side by side at the same frozen thresholds.
 
-  - What threshold does each objective pick, and how much does that threshold
-    move between validation resamples? A threshold fitted on 125 Fibrosis
-    positives is a point estimate like any other, and reporting it without an
-    interval overstates how determined it is.
-  - What do F1, Youden and a fixed-sensitivity operating point actually cost on
-    this data, side by side, at the same frozen thresholds?
-
-Thresholds are always fitted on validation and only then applied to test. The
-test split is read to score an already-frozen decision rule and for nothing
-else.
+Thresholds are fitted on validation and only then applied to test, which is
+read to score an already-frozen rule and for nothing else.
 
 Usage:
   python threshold_analysis.py --experiment full_dataset --model densenet121
@@ -45,9 +38,7 @@ from evaluate import (
 from metrics import has_both_labels
 
 
-# =============================================================================
-# Resampling
-# =============================================================================
+# --- Resampling ---------------------------------------------------------------
 def _resample_indices(
     rng: np.random.Generator,
     num_rows: int,
@@ -70,15 +61,13 @@ def bootstrap_thresholds(
     """
     Refit every class's threshold on resampled validation data.
 
-    This is the uncertainty the in-run bootstrap cannot see. evaluate.py
-    resamples the *test* set with the threshold held fixed, which answers "how
-    precisely did we measure this operating point?". Resampling *validation* and
-    refitting answers "how precisely did we locate it?" — and on the rare
-    classes the second interval is much the wider of the two.
+    The uncertainty the in-run bootstrap cannot see: evaluate.py resamples
+    *test* at a fixed threshold, answering how precisely the operating point
+    was measured, while this answers how precisely it was located. On the rare
+    classes the second interval is much the wider.
 
-    Draws where a class falls below THRESHOLD_MIN_SUPPORT, or where no candidate
-    separates anything, are recorded as NaN so they are dropped from the
-    interval rather than being counted as a threshold of zero.
+    Draws below THRESHOLD_MIN_SUPPORT, or where nothing separates, record NaN
+    so they drop out rather than counting as a threshold of zero.
     """
     num_samples = int(config.BOOTSTRAP_SAMPLES if num_samples is None else num_samples)
     num_rows, num_classes = labels.shape
@@ -125,9 +114,9 @@ def bootstrap_test_rates(
     """
     Precision/recall/F1 draws on the test set at a frozen operating point.
 
-    Deliberately narrower than evaluate.bootstrap_cis: the ranking metrics are
-    already intervalled in the results file, and recomputing 28,000 AUROCs to
-    reach the same answer would dominate the runtime of this script.
+    Narrower than evaluate.bootstrap_cis on purpose: the ranking metrics are
+    already intervalled in the results file, and recomputing 28,000 AUROCs
+    would dominate this script's runtime.
     """
     num_samples = int(config.BOOTSTRAP_SAMPLES if num_samples is None else num_samples)
     num_rows, num_classes = labels.shape
@@ -149,9 +138,7 @@ def bootstrap_test_rates(
     return draws
 
 
-# =============================================================================
-# One thresholding scheme, end to end
-# =============================================================================
+# --- One thresholding scheme, end to end --------------------------------------
 def analyze_scheme(
     val: dict[str, np.ndarray],
     test: dict[str, np.ndarray],
@@ -205,9 +192,7 @@ def analyze_scheme(
     }
 
 
-# =============================================================================
-# Reporting
-# =============================================================================
+# --- Reporting ----------------------------------------------------------------
 def _interval(bounds: list[float] | None, width: int = 16) -> str:
     text = f"[{bounds[0]:.3f}, {bounds[1]:.3f}]" if bounds else ""
     return f"{text:>{width}}"
@@ -281,9 +266,7 @@ def print_comparison(schemes: dict[str, dict]) -> None:
     print("-" * len(header))
 
 
-# =============================================================================
-# Entry point
-# =============================================================================
+# --- Entry point --------------------------------------------------------------
 def analyze_model(model_name: str, metrics: list[str], num_samples: int | None) -> Path:
     """Run every requested objective for one model and save the report."""
     val = load_predictions(model_name, "val")
@@ -401,8 +384,8 @@ def main():
             analyze_model(model_name, args.metric, args.bootstrap_samples)
         except FileNotFoundError as error:
             print(f"[threshold-analysis] Skipping {model_name}: {error}")
-            # --model is unconstrained, so a typo lands here rather than at the
-            # argument parser. Say what this experiment actually holds.
+            # --model is unconstrained, so a typo lands here rather than at
+            # the parser. Say what this experiment actually holds.
             available = sorted(
                 path.name[: -len("_val_predictions.npz")]
                 for path in config.RESULTS_DIR.glob("*_val_predictions.npz")

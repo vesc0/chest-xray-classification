@@ -34,9 +34,7 @@ from utils import (
 )
 
 
-# =============================================================================
-# Single-model pipeline execution
-# =============================================================================
+# --- Single-model pipeline execution ------------------------------------------
 def run_pipeline(
     model_name: str,
     train_loader,
@@ -45,24 +43,19 @@ def run_pipeline(
     *,
     eval_only: bool = False,
 ) -> dict:
-    """
-    Execute the full pipeline for a single model.
-
-    Returns the test-set evaluation results.
-    """
+    """Run the full pipeline for one model; returns the test results."""
     print(f"\n{'#' * 70}")
     print(f"  Pipeline: {model_name}")
     print(f"{'#' * 70}\n")
 
-    # Model initialization
     print(f"[main] Step 1/5 - Building model: {model_name} ...")
     device = get_device()
     model = build_model(model_name, pretrained=True, weight_tag=config.WEIGHT_TAG).to(device)
     if config.WEIGHT_TAG:
         print(f"  Weight tag:           {config.WEIGHT_TAG} (override)")
 
-    # Trainable count is only meaningful once the tuning mode has been applied,
-    # which happens inside train_model — so report it after training, not here.
+    # Only meaningful once the tuning mode has been applied, which happens
+    # inside train_model — so it is reported after training, not here.
     total_params = sum(param.numel() for param in model.parameters())
     print(f"  Total parameters:     {total_params:,}")
 
@@ -70,7 +63,6 @@ def run_pipeline(
     training_timing = None
     trainable_params = None
 
-    # Training or checkpoint loading
     if eval_only:
         if not ckpt_path.exists():
             print(f"[main] ERROR: Checkpoint not found at {ckpt_path}")
@@ -81,15 +73,13 @@ def run_pipeline(
     else:
         print(f"[main] Step 2/5 - Training {model_name} ...")
         history, training_timing = train_model(model, train_loader, val_loader, model_name)
-        # Read after training, when requires_grad reflects the tuning mode
+        # After training, when requires_grad reflects the tuning mode.
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         plot_training_curves(history, model_name)
 
-    # Threshold calibration (important for multi-label classification)
     print(f"[main] Step 3/5 - Calibrating thresholds for {model_name} ...")
     thresholds = calibrate_thresholds(model, val_loader, model_name)
 
-    # Final evaluation on held-out test set
     print(f"[main] Step 4/5 - Evaluating {model_name} on the test set ...")
     results = evaluate_model(
         model,
@@ -100,18 +90,16 @@ def run_pipeline(
         trainable_params=trainable_params,
     )
 
-    # Optional unselected heatmap samples; off unless config.XAI_NUM_SAMPLES > 0
+    # Unselected samples; off unless config.XAI_NUM_SAMPLES > 0.
     if config.XAI_NUM_SAMPLES > 0:
         print(f"[main] Generating {config.XAI_NUM_SAMPLES} qualitative XAI samples ...")
         generate_explanations(model, test_loader, model_name, thresholds=thresholds)
 
-    # Weakly-supervised localization against the ground-truth boxes
     print(f"[main] Step 5/5 - Scoring localization against ground-truth boxes ...")
     evaluate_localization(model, model_name, thresholds=thresholds)
 
     # Whether those localization numbers mean anything: an explanation that
-    # survives having the model's weights randomized was never explaining the
-    # model, and would have scored above the random baseline all the same.
+    # survives weight randomization scores above baseline regardless.
     if config.SANITY_CHECK_ENABLED:
         print("[main] Running explanation sanity checks ...")
         run_sanity_checks(model, model_name)
@@ -119,18 +107,14 @@ def run_pipeline(
     return results
 
 
-# =============================================================================
-# Entry point
-# =============================================================================
+# --- Entry point --------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
         description="Chest X-ray classification with calibrated multi-label evaluation"
     )
 
-    # Model selection
-    # No default: with the full dataset as the default, an implicit
-    # "train everything" would be a very expensive accident. Required unless
-    # --compare-all is given (enforced after parsing).
+    # No default: an implicit "train everything on the full dataset" would be
+    # an expensive accident. Required unless --compare-all (enforced below).
     parser.add_argument(
         "--model",
         type=str,
@@ -176,7 +160,6 @@ def main():
         help="Override config.NUM_WORKERS for DataLoader",
     )
 
-    # Experiment configuration overrides
     parser.add_argument(
         "--subset",
         type=int,
@@ -205,7 +188,6 @@ def main():
         help="Override config.LEARNING_RATE",
     )
 
-    # Training strategy controls (fine-tuning behavior)
     parser.add_argument(
         "--tuning-mode",
         type=str,
@@ -226,7 +208,6 @@ def main():
         help="Fraction of backbone params to unfreeze in partial mode",
     )
 
-    # Loss/optimization configuration
     parser.add_argument(
         "--loss",
         type=str,
@@ -242,7 +223,6 @@ def main():
         help="Override the validation metric used for checkpointing",
     )
 
-    # Threshold optimization configuration
     parser.add_argument(
         "--threshold-metric",
         type=str,
@@ -300,7 +280,6 @@ def main():
         ),
     )
 
-    # Experiment tracking/comparison
     parser.add_argument(
         "--experiment",
         type=str,
@@ -315,7 +294,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Experiment shortcuts
     if args.compare_all:
         compare_experiments()
         return
@@ -323,7 +301,6 @@ def main():
     if args.model is None:
         parser.error("--model is required (or use --compare-all)")
 
-    # Override config dynamically from CLI
     if args.subset is not None:
         config.SUBSET_SIZE = args.subset
     if args.epochs is not None:
@@ -358,11 +335,10 @@ def main():
         config.XAI_NUM_SAMPLES = args.xai_samples
     if args.weight_tag is not None:
         config.WEIGHT_TAG = args.weight_tag
-    # Must precede get_dataloaders(): the transform reads IMAGE_SIZE at build time.
+    # Must precede get_dataloaders(): the transform reads IMAGE_SIZE.
     if args.image_size is not None:
         config.IMAGE_SIZE = args.image_size
 
-    # Experiment naming/tracking
     if args.experiment:
         exp_name = args.experiment
     elif config.SUBSET_SIZE and config.SUBSET_SIZE > 0:
@@ -376,10 +352,9 @@ def main():
 
     seed_everything()
 
-    # Mirror everything below into outputs/<experiment>/logs/
+    # Mirror everything below into outputs/<experiment>/logs/.
     log_path = start_run_log("eval" if args.eval_only else "train")
 
-    # Print run configuration (reproducibility snapshot)
     print("[main] Configuration:")
     print(f"  Log file:           {log_path}")
     print(f"  Experiment:         {config.EXPERIMENT_NAME}")
@@ -409,17 +384,14 @@ def main():
     print(f"  Device:             {get_device()}")
     print(f"  Num workers:        {config.NUM_WORKERS}")
 
-    # Model selection logic
     if args.model == "all":
         model_names = list(config.SWEEP_MODELS)
     else:
         model_names = [args.model]
 
-    # Load dataset once for efficiency across models
     print("[main] Loading dataset once for all selected models ...")
     train_loader, val_loader, test_loader = get_dataloaders()
 
-    # Standard single/multi-model execution
     all_results = {}
     for model_name in model_names:
         all_results[model_name] = run_pipeline(

@@ -1,9 +1,7 @@
 """
-Explainer plumbing.
-
-The reshape transforms and target-layer lookups are the part of the XAI code
-that fails quietly: a wrong layer or a transposed axis still yields a
-plausible-looking heatmap, it just no longer means anything.
+Explainer plumbing: the reshape transforms and target-layer lookups, which fail
+quietly — a wrong layer or a transposed axis still yields a plausible-looking
+heatmap that no longer means anything.
 """
 
 import numpy as np
@@ -30,7 +28,7 @@ ARCHITECTURES = list(config.SUPPORTED_MODELS)
 
 class TestReshapeTransforms:
     def test_tokens_become_a_square_grid(self):
-        # ViT-S/16 at 224: 196 patch tokens plus [CLS], width 384
+        # ViT-S/16 at 224: 196 patch tokens plus [CLS], width 384.
         tokens = torch.randn(2, 197, 384)
         assert _tokens_to_grid(tokens).shape == (2, 384, 14, 14)
 
@@ -40,11 +38,8 @@ class TestReshapeTransforms:
         assert (_tokens_to_grid(tokens) != 99.0).all()
 
     def test_more_prefix_tokens_can_be_dropped(self):
-        """
-        Distilled and register-token checkpoints carry more than one. Dropping
-        the wrong count still reshapes cleanly whenever the remainder happens to
-        be square, so the count has to be passed in rather than assumed.
-        """
+        """Dropping the wrong count still reshapes cleanly whenever the
+        remainder is square, so it has to be passed in rather than assumed."""
         tokens = torch.zeros(1, 6, 3)
         tokens[:, :2, :] = 99.0
         assert (_tokens_to_grid(tokens, num_prefix_tokens=2) != 99.0).all()
@@ -84,37 +79,27 @@ class TestDenormalize:
 class TestGradcamTargets:
     @pytest.mark.parametrize("name", ARCHITECTURES)
     def test_the_target_layer_resolves_for_every_architecture(self, name, model_cache):
-        """
-        Catches a torchvision attribute rename, which would otherwise surface as
-        an AttributeError only after a full training run.
-        """
+        """A torchvision attribute rename would otherwise surface only after a
+        full training run."""
         resolve, _ = GRADCAM_TARGETS[name]
         assert isinstance(resolve(model_cache(name)), torch.nn.Module)
 
     def test_the_target_table_matches_the_roster_exactly(self):
-        """
-        Equality, not containment: a dropped architecture leaving a stale entry
-        behind is how a target table starts describing models that no longer
-        exist.
-        """
+        """Equality, not containment: a stale entry is how a target table
+        starts describing models that no longer exist."""
         assert set(GRADCAM_TARGETS) == set(config.SUPPORTED_MODELS)
 
     def test_the_vit_target_is_not_the_final_norm(self, model_cache):
-        """
-        The head reads only the [CLS] token, so gradients w.r.t. every patch
-        token at the final norm are exactly zero and the CAM comes out blank.
-        norm1 of the last block still routes through attention to all tokens.
-        """
+        """The head reads only [CLS], so gradients w.r.t. every patch token at
+        the final norm are zero and the CAM comes out blank."""
         model = model_cache("vit_s_16")
         resolve, _ = GRADCAM_TARGETS["vit_s_16"]
         assert resolve(model) is model.backbone.blocks[-1].norm1
         assert resolve(model) is not model.backbone.norm
 
     def test_the_vit_reshape_is_bound_to_the_backbone(self, model_cache):
-        """
-        The prefix-token count is read off the backbone rather than hardcoded,
-        so the registry entry has to actually consult the model it is given.
-        """
+        """The prefix-token count is read off the backbone, so the registry
+        entry has to consult the model it is given."""
         model = model_cache("vit_s_16")
         _, build_transform = GRADCAM_TARGETS["vit_s_16"]
 
@@ -127,10 +112,9 @@ class TestGradcamTargets:
 
     def test_the_vit_cam_grid_is_finer_than_the_hierarchical_models(self, model_cache):
         """
-        A patch-16 transformer keeps one token per 16x16 patch; the other four
-        have downsampled to 7x7 by their last stage. This asymmetry favours ViT
-        on IoU/IoBB in localization.py and is reported there, so it should be a
-        measured fact rather than a claim in a docstring.
+        A patch-16 transformer keeps one token per patch where the others have
+        downsampled to 7x7. The asymmetry favours ViT on IoU/IoBB, so it is
+        pinned as a measured fact rather than a claim in a docstring.
         """
         images = torch.randn(1, 3, config.IMAGE_SIZE, config.IMAGE_SIZE)
         grids = {}
@@ -171,10 +155,8 @@ class TestGradCAM:
             assert cam.last_logits.shape == (2, config.NUM_CLASSES)
 
     def test_works_with_a_fully_frozen_backbone(self, model_cache):
-        """
-        With head_only tuning nothing upstream requires grad, so without rooting
-        the graph at the target layer no gradient would be available at all.
-        """
+        """With head_only tuning nothing upstream requires grad, so without
+        rooting the graph at the target layer there is no gradient at all."""
         model = model_cache("densenet121")
         for param in model.parameters():
             param.requires_grad = False
@@ -217,22 +199,16 @@ class TestGradCAM:
 
 class TestAttentionRollout:
     def test_captures_attention_from_every_block(self, model_cache):
-        """
-        timm dispatches to fused SDPA by default, which never materializes an
-        attention matrix. Without forcing the unfused path there is nothing to
-        hook, and the rollout would come out empty rather than erroring — this
-        is the guard on that.
-        """
+        """timm's default fused SDPA never materializes an attention matrix, so
+        without the unfused path the rollout comes out empty, not erroring."""
         model = model_cache("vit_s_16")
         rollout = AttentionRollout(model)
         rollout.generate_batch(torch.randn(2, 3, config.IMAGE_SIZE, config.IMAGE_SIZE))
         assert len(rollout.attention_maps) == len(model.backbone.blocks)
 
     def test_leaves_the_model_as_it_found_it(self, model_cache):
-        """
-        Capture mutates fused_attn on every block. Left flipped, the model would
-        keep running the slower unfused path for the rest of the process.
-        """
+        """Capture mutates fused_attn on every block; left flipped, the model
+        runs the slower path for the rest of the process."""
         model = model_cache("vit_s_16")
         before = [block.attn.fused_attn for block in model.backbone.blocks]
 
@@ -252,10 +228,8 @@ class TestAttentionRollout:
         assert np.isfinite(maps).all()
 
     def test_raises_rather_than_returning_a_blank_map(self, model_cache):
-        """
-        A constant heatmap would pass through localization scoring as a real
-        result. Failing loudly is the only way that bug surfaces.
-        """
+        """A constant heatmap would pass through localization scoring as a real
+        result, so failing loudly is the only way it surfaces."""
         rollout = AttentionRollout(model_cache("vit_s_16"))
         rollout._start_capture = lambda: None  # capture never installed
 
@@ -271,18 +245,16 @@ class TestNormalization:
         assert result[1].flatten().tolist() == pytest.approx([0.0, 1.0])
 
     def test_a_constant_map_collapses_to_zero(self):
-        """
-        The signature localization._is_degenerate looks for. A constant map has
-        no peak to point with, and this is the form it arrives in.
-        """
+        """The signature localization._is_degenerate looks for: a constant map
+        has no peak, and this is the form it arrives in."""
         assert _normalize_per_sample(torch.full((1, 4, 4), 3.0)).max() == 0.0
 
 
 class TestRawMaps:
     """
-    The energy fraction is measured before normalization, because min-max
-    subtracts away exactly the uniform component the random baseline is defined
-    as. Both explainers therefore have to expose the pre-normalization map.
+    The energy fraction is measured before normalization, since min-max
+    subtracts exactly the uniform component the random baseline is defined as.
+    Both explainers have to expose the pre-normalization map.
     """
 
     @pytest.mark.parametrize("name", ["densenet121", "vit_s_16"])
@@ -304,10 +276,9 @@ class TestRawMaps:
 
     def test_rollouts_raw_map_has_the_floor_that_normalization_removes(self, model_cache):
         """
-        The reason this matters. Rolled-up attention is strictly positive with a
-        substantial floor, so min-subtraction is not a rescale for it — measure
-        energy on the normalized map and the metric no longer shares a baseline
-        with the uniform-heatmap number printed beside it.
+        Rolled-up attention is strictly positive with a substantial floor, so
+        min-subtraction is not a rescale for it: measured on the normalized
+        map, the metric no longer shares a baseline with the number beside it.
         """
         rollout = AttentionRollout(model_cache("vit_s_16"))
         normalized = rollout.generate_batch(
@@ -317,17 +288,16 @@ class TestRawMaps:
 
         assert raw.min() > 0.0
         assert normalized.min() == pytest.approx(0.0, abs=1e-6)
-        # The floor is a real share of the map, not a rounding artifact
+        # A real share of the map, not a rounding artifact.
         assert raw.min() / raw.max() > 0.01
 
 
 class TestHookGating:
     def test_the_hook_does_not_capture_outside_generate_batch(self, model_cache):
         """
-        Grad-CAM and rollout are both live during ViT's XAI stage. An always-on
-        hook fires on the other explainer's forward passes, calling
-        requires_grad_() on a tensor inside no_grad — harmless now, and an
-        exception the moment any caller uses torch.inference_mode().
+        Both explainers are live during ViT's XAI stage, so an always-on hook
+        fires on the other's forward passes and calls requires_grad_() inside
+        no_grad — an exception the moment a caller uses inference_mode().
         """
         model = model_cache("densenet121")
         with GradCAM(model, model_name="densenet121") as cam:
@@ -355,10 +325,8 @@ class TestHookGating:
 class TestExplainerConstruction:
     @pytest.mark.parametrize("name", ARCHITECTURES)
     def test_available_explainers_needs_no_model(self, name):
-        """
-        Localization plans its run over the methods before instantiating any of
-        them, which is what lets it keep one explainer attached at a time.
-        """
+        """Localization plans its run over the methods before instantiating
+        any, which is what lets it keep one attached at a time."""
         assert [key for key, _ in available_explainers(name)][0] == "gradcam"
 
     def test_available_explainers_agrees_with_build_explainers(self, model_cache):
@@ -394,10 +362,8 @@ class TestBuildExplainers:
             release_explainers(cnn)
 
     def test_the_class_agnostic_flag_distinguishes_the_two_methods(self, model_cache):
-        """
-        Rollout produces one map per image whatever the class. Losing this flag
-        would let the localization report present the two as equivalent.
-        """
+        """Rollout produces one map per image whatever the class; losing this
+        flag would let the report present the two methods as equivalent."""
         explainers = build_explainers(model_cache("vit_s_16"), "vit_s_16")
         try:
             flags = {key: explainer.class_agnostic for key, _, explainer in explainers}

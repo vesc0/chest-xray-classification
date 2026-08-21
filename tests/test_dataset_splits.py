@@ -1,10 +1,7 @@
 """
-Splitting and subset sampling.
-
-These lock down the three properties the README claims and the experimental
-protocol depends on: train/val are patient-disjoint, subsets are nested, and
-every split tracks the pool's label distribution. All three are silent when
-broken — the run still trains, it just no longer measures what it claims to.
+Splitting and subset sampling: train/val patient-disjoint, subsets nested, and
+every split tracking the pool's label distribution. All three break silently —
+the run still trains, it just stops measuring what it claims to.
 """
 
 import numpy as np
@@ -26,7 +23,7 @@ def prevalence(frame):
 
 class TestStackLabelVectors:
     def test_empty_frame_keeps_the_class_axis(self):
-        # Downstream code indexes [:, class_idx]; a bare (0,) would break it
+        # Downstream code indexes [:, class_idx]; a bare (0,) would break it.
         empty = make_label_frame(n_patients=1).iloc[0:0]
         assert _stack_label_vectors(empty).shape == (0, config.NUM_CLASSES)
 
@@ -59,18 +56,15 @@ class TestGroupedTrainValSplit:
         train, val = _grouped_train_val_split(
             label_frame, test_size=0.2, group_col=config.PATIENT_ID_COLUMN
         )
-        # Whole patients move together, so the fraction cannot be exact
+        # Whole patients move together, so the fraction cannot be exact.
         assert 0.15 <= len(val) / len(label_frame) <= 0.25
 
     def test_label_marginals_are_preserved(self):
         """
-        Sized deliberately larger than the default fixture.
-
-        Balancing needs enough patients to have any freedom left once the rare
-        classes have been placed: measured across seeds, 300 patients leaves
-        residual deviations up to ~0.13 on the common classes, while 800 holds
-        within 0.04. A tight bound on a small frame would be testing sampling
-        noise rather than the stratification.
+        Larger than the default fixture on purpose: balancing needs freedom
+        left once the rare classes are placed. 300 patients leaves deviations
+        up to ~0.13, 800 holds within 0.04, so a tight bound on a small frame
+        would test sampling noise rather than the stratification.
         """
         frame = make_label_frame(n_patients=800, seed=3)
         train, val = _grouped_train_val_split(
@@ -96,11 +90,8 @@ class TestGroupedTrainValSplit:
 class TestStratifiedSubset:
     def test_subsets_are_nested(self, label_frame):
         """
-        The property that makes a scaling curve mean anything.
-
-        If a 100-image subset is not contained in a 200-image one, the curve
-        measures which patients each draw happened to catch rather than the
-        effect of training-data volume.
+        What makes a scaling curve mean anything: unnested subsets measure
+        which patients each draw caught, not training-data volume.
         """
         small = _stratified_subset(
             label_frame, 100, group_col=config.PATIENT_ID_COLUMN, seed=config.SEED
@@ -136,18 +127,11 @@ class TestStratifiedSubset:
 
     def test_a_prefix_beats_a_random_draw_of_the_same_size(self):
         """
-        The test that distinguishes stratified sampling from plain sampling.
-
-        An absolute-prevalence check is not enough on its own: a random draw of
-        a few hundred rows also lands within a few points of the pool on the
-        common classes, so it passes the assertion above. Scoring deviation in
-        *relative* terms is what exposes the difference — it weights a 0.5%
-        class as heavily as a 40% one, which is precisely what the shard
-        ordering optimizes and what a random draw gets wrong.
-
-        Measured across fixture seeds, the stratified prefix beats the best of
-        20 random draws every time, so this compares against that best rather
-        than the median.
+        What separates stratified sampling from plain sampling. An absolute
+        check is not enough — a random draw also lands within a few points on
+        the common classes. Relative deviation weights a 0.5% class as heavily
+        as a 40% one, which is what the shard ordering optimizes. The
+        stratified prefix beats the *best* of 20 random draws on every seed.
         """
         frame = make_label_frame(n_patients=800, seed=5)
         pool = prevalence(frame)
@@ -207,11 +191,9 @@ class TestIterativeStratifiedGroupFolds:
 
     def test_rare_classes_reach_every_fold(self, label_frame):
         """
-        The reason for iterative stratification over a plain grouped split.
-
-        The rarest class here sits near 0.5%; a naive split can drop it from a
-        fold entirely, which makes its AUROC undefined and quietly removes it
-        from the macro average.
+        The reason for iterative stratification over a plain grouped split: a
+        naive one can drop the 0.5% class from a fold entirely, making its
+        AUROC undefined and quietly removing it from the macro.
         """
         folds = _iterative_stratified_group_folds(
             label_frame, [0.5, 0.5], config.PATIENT_ID_COLUMN, seed=0
@@ -219,5 +201,5 @@ class TestIterativeStratifiedGroupFolds:
         pool_counts = _stack_label_vectors(label_frame).sum(axis=0)
         for rows in folds:
             counts = _stack_label_vectors(label_frame.iloc[rows]).sum(axis=0)
-            # Any class with a real presence in the pool must survive the split
+            # Any class with a real presence in the pool must survive.
             assert (counts[pool_counts >= 4] > 0).all()

@@ -1,11 +1,4 @@
-"""
-Utility helpers
-
-Includes:
-  - Reproducibility seeding
-  - Training curve plotting
-  - Comparison table generation
-"""
+"""Seeding, run logging, training curves, and cross-run comparison tables."""
 
 import atexit
 import json
@@ -19,7 +12,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-# Use non-interactive backend for saving plots to files
 matplotlib.use("Agg")
 
 import config
@@ -35,7 +27,7 @@ class _Tee:
     def write(self, data: str) -> int:
         self._stream.write(data)
         self._handle.write(data)
-        # Flush per write: a run that crashes should still leave a full log
+        # Flush per write: a crashed run should still leave a full log.
         self._handle.flush()
         return len(data)
 
@@ -43,7 +35,7 @@ class _Tee:
         self._stream.flush()
         self._handle.flush()
 
-    # Passthroughs so the replacement still looks like a real stream
+    # Passthroughs so this still looks like a real stream.
     def isatty(self) -> bool:
         return self._stream.isatty()
 
@@ -55,9 +47,8 @@ def start_run_log(tag: str = "run") -> Path:
     """
     Mirror stdout and stderr into outputs/<experiment>/logs/.
 
-    Captures stderr too, so a traceback ends up in the log rather than only on
-    a terminal that may since have been closed. Each run gets its own
-    timestamped file, so an --eval-only re-run never overwrites the training log.
+    stderr too, so a traceback survives the terminal. Each run gets its own
+    timestamped file, so --eval-only never overwrites the training log.
     """
     log_dir = config.OUTPUT_DIR / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -84,36 +75,29 @@ def seed_everything(seed: int = config.SEED) -> None:
     """
     Seed the main-process RNGs and pin cuDNN to deterministic kernels.
 
-    This alone does not make augmentation reproducible: DataLoader workers are
-    separate processes with their own RNG state. get_dataloaders() pairs this
-    with seed_worker / make_dataloader_generator to cover them.
+    Not sufficient on its own: DataLoader workers are separate processes, which
+    seed_worker / make_dataloader_generator cover.
     """
 
-    # Python random seed
     random.seed(seed)
 
-    # NumPy random seed
     np.random.seed(seed)
 
-    # PyTorch CPU seed
     torch.manual_seed(seed)
 
-    # PyTorch GPU seed
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    # Force deterministic CUDA operations
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
 
 def seed_worker(worker_id: int) -> None:
     """
-    Seed one DataLoader worker process (used as worker_init_fn).
+    Seed one DataLoader worker (as worker_init_fn).
 
-    PyTorch gives each worker a distinct torch seed derived from the loader's
-    generator, but leaves Python's `random` and NumPy unseeded — and the
-    torchvision transforms used here draw from both.
+    PyTorch seeds torch per worker but leaves Python's `random` and NumPy
+    alone, and the transforms here draw from both.
     """
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
@@ -128,20 +112,14 @@ def make_dataloader_generator(seed: int = config.SEED) -> torch.Generator:
 
 
 def plot_training_curves(history: dict, model_name: str) -> Path:
-    """
-    Plot loss, AUROC, and AUPRC curves for train/val and save to disk.
-    """
+    """Plot train/val loss, AUROC and AUPRC curves and save them."""
     
-    # Create results directory if missing
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Epoch numbers for x-axis
     epochs = range(1, len(history["train_loss"]) + 1)
 
-    # Create 1 row × 3 columns figure
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
-    # ---------------- LOSS ----------------
     axes[0].plot(epochs, history["train_loss"], label="Train Loss", marker="o", markersize=4)
     axes[0].plot(epochs, history["val_loss"], label="Val Loss", marker="s", markersize=4)
     axes[0].set_xlabel("Epoch")
@@ -150,7 +128,6 @@ def plot_training_curves(history: dict, model_name: str) -> Path:
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 
-    # ---------------- AUROC ----------------
     axes[1].plot(epochs, history["train_auroc"], label="Train AUROC", marker="o", markersize=4)
     axes[1].plot(epochs, history["val_auroc"], label="Val AUROC", marker="s", markersize=4)
     axes[1].set_xlabel("Epoch")
@@ -159,7 +136,6 @@ def plot_training_curves(history: dict, model_name: str) -> Path:
     axes[1].legend()
     axes[1].grid(True, alpha=0.3)
 
-    # ---------------- AUPRC ----------------
     axes[2].plot(epochs, history["train_auprc"], label="Train AUPRC", marker="o", markersize=4)
     axes[2].plot(epochs, history["val_auprc"], label="Val AUPRC", marker="s", markersize=4)
     axes[2].set_xlabel("Epoch")
@@ -168,14 +144,11 @@ def plot_training_curves(history: dict, model_name: str) -> Path:
     axes[2].legend()
     axes[2].grid(True, alpha=0.3)
 
-    # Adjust subplot spacing
     fig.tight_layout()
 
-    # Save figure
     path = config.RESULTS_DIR / f"{model_name}_training_curves.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
 
-    # Free memory
     plt.close(fig)
 
     print(f"[utils] Training curves saved -> {path}")
@@ -184,28 +157,21 @@ def plot_training_curves(history: dict, model_name: str) -> Path:
 
 
 def compare_models(results_dir: Path | None = None) -> None:
-    """
-    Load all *_results.json files from results_dir and print a side-by-side
-    comparison table of macro metrics.
-    """
+    """Print a side-by-side table of macro metrics for one experiment."""
 
-    # Use default results directory if not provided
     results_dir = results_dir or config.RESULTS_DIR
 
-    # Find all result JSON files
     result_files = sorted(results_dir.glob("*_results.json"))
     if not result_files:
         print("[compare] No result files found.")
         return
 
-    # Load all model result files
     models = {}
     for result_file in result_files:
         name = result_file.stem.replace("_results", "")
         with open(result_file, encoding="utf-8") as handle:
             models[name] = json.load(handle)
 
-    # Metrics to display
     metric_keys = [
         "auroc",
         "auprc",
@@ -217,7 +183,6 @@ def compare_models(results_dir: Path | None = None) -> None:
         "hamming_loss",
     ]
 
-    # Create table header
     header = f"{'Metric':<22}" + "".join(f"{name:>16}" for name in models)
 
     print(f"\n{'=' * 70}")
@@ -226,7 +191,6 @@ def compare_models(results_dir: Path | None = None) -> None:
     print(header)
     print("-" * len(header))
 
-    # Print each metric row
     for key in metric_keys:
         row = f"{key:<22}"
         for name, result in models.items():
@@ -241,19 +205,12 @@ def compare_localization(results_dir: Path | None = None) -> None:
     """
     Side-by-side localization for every model scored in results_dir.
 
-    Without this the localization stage writes one JSON per model per method and
-    nothing ever reads them together, so the central XAI question — which
-    architecture actually looks in the right place — has to be answered by
-    opening five files by hand.
-
-    **Deliberately omits IoU and IoBB.** Both depend on the size of the
-    predicted box, and ViT-S/16's CAM grid is 14x14 where the other four are
-    7x7, so ViT gets finer boxes for free (see explainability.py). A caveat
-    printed under a number does not survive the number being quoted, so the
-    overlap metrics stay in the per-model JSONs where they are read next to
-    their own settings block. The pointing game and the energy fraction are far
-    less sensitive to grid size, and both are printed beside the random
-    baseline they have to beat.
+    Deliberately omits IoU and IoBB: both scale with the predicted box, and
+    ViT's 14x14 CAM grid gets finer boxes for free. A caveat printed under a
+    number does not survive that number being quoted, so the overlap metrics
+    stay in the per-model JSONs beside their own settings. The pointing game
+    and energy fraction are far less grid-sensitive, and both print next to the
+    random baseline they have to beat.
     """
     results_dir = results_dir or config.RESULTS_DIR
 
@@ -264,7 +221,6 @@ def compare_localization(results_dir: Path | None = None) -> None:
 
     rows = []
     for result_file in result_files:
-        # <model>_localization_<method>.json
         stem = result_file.stem
         model_name, _, method_key = stem.partition("_localization_")
         with open(result_file, encoding="utf-8") as handle:
@@ -329,11 +285,8 @@ def compare_localization(results_dir: Path | None = None) -> None:
 
 def _check_comparable(experiments: dict) -> None:
     """
-    Warn when runs are not directly comparable.
-
-    Macro metrics average over whatever classes were scored, so runs with
-    different class sets or different evaluation splits cannot be read off the
-    same table.
+    Warn when runs are not directly comparable: macro metrics average over
+    whatever classes were scored, so different class sets cannot share a table.
     """
     class_sets = {
         name: tuple(result.get("class_names") or ())
@@ -372,25 +325,19 @@ def _read_train_sizes(output_root: Path) -> dict[str, int]:
 
 
 def compare_experiments(output_root: Path = config.PROJECT_ROOT / "outputs") -> None:
-    """
-    Compare results across all experiments (training-set sizes).
-    """
+    """Compare macro results across every experiment in outputs/."""
 
-    # Find all experiment result files
     result_files = sorted(output_root.glob("*/results/*_results.json"))
     if not result_files:
         print("[compare] No experiment results found.")
         return
 
-    # Load all experiment results
     experiments = {}
     train_sizes = _read_train_sizes(output_root)
     experiment_train_size = {}
     for result_file in result_files:
-        # Example: outputs/full_dataset/results/resnet_results.json
         exp_name = result_file.parent.parent.name
         model_name = result_file.stem.replace("_results", "")
-        # Combined experiment/model display name
         display_name = f"{exp_name}/{model_name}"
         with open(result_file, encoding="utf-8") as handle:
             experiments[display_name] = json.load(handle)
@@ -398,7 +345,6 @@ def compare_experiments(output_root: Path = config.PROJECT_ROOT / "outputs") -> 
 
     _check_comparable(experiments)
 
-    # Metrics to compare
     metric_keys = [
         "auroc",
         "auprc",
@@ -410,7 +356,6 @@ def compare_experiments(output_root: Path = config.PROJECT_ROOT / "outputs") -> 
         "hamming_loss",
     ]
 
-    # Dynamically adjust column width
     col_width = max(len(name) for name in experiments) + 2
 
     # Create table header
@@ -425,7 +370,7 @@ def compare_experiments(output_root: Path = config.PROJECT_ROOT / "outputs") -> 
     import pandas as pd
     csv_data = []
 
-    # Training-set size gives the metric rows their x-axis
+    # Training-set size gives the metric rows their x-axis.
     size_row_str = f"{'train_images':<22}"
     size_row_dict = {"Metric": "train_images"}
     for display_name in experiments:
@@ -435,7 +380,6 @@ def compare_experiments(output_root: Path = config.PROJECT_ROOT / "outputs") -> 
     print(size_row_str)
     csv_data.append(size_row_dict)
 
-    # Print metric rows
     for key in metric_keys:
         row_str = f"{key:<22}"
         row_dict = {"Metric": key}
@@ -446,7 +390,7 @@ def compare_experiments(output_root: Path = config.PROJECT_ROOT / "outputs") -> 
         print(row_str)
         csv_data.append(row_dict)
 
-    # Cost rows: mean epoch time is fairer than total, which early stopping skews
+    # Mean epoch time is fairer than total, which early stopping skews.
     timing_keys = [
         ("mean_epoch_seconds", ("training", "mean_epoch_seconds")),
         ("epochs_run", ("training", "epochs_run")),
@@ -469,7 +413,6 @@ def compare_experiments(output_root: Path = config.PROJECT_ROOT / "outputs") -> 
 
     print(f"{'=' * (22 + col_width * len(experiments))}\n")
 
-    # Save to CSV
     csv_path = output_root / "experiment_comparison.csv"
     pd.DataFrame(csv_data).to_csv(csv_path, index=False)
     print(f"[compare] Saved comparison table to {csv_path}\n")

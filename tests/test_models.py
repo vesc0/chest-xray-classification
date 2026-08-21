@@ -1,12 +1,9 @@
 """
 The model factory and the architecture assumptions built on top of it.
 
-Two things are pinned here. The roster the factory can build has to stay in
-step with config.SUPPORTED_MODELS, because a name present in one but not the
-other fails only when a sweep reaches that model — hours into a run. And the
-structural facts the XAI code relies on (prefix-token count, fixed input
-resolution) are properties of third-party checkpoints, so they need a test
-rather than a comment.
+Pins two things: the factory's roster against config.SUPPORTED_MODELS, since a
+mismatch only fails once a sweep reaches that model, and the structural facts
+the XAI code relies on, which are properties of third-party checkpoints.
 
 Backbones are built with pretrained=False; nothing here downloads weights.
 """
@@ -47,22 +44,16 @@ class TestFactory:
 
 class TestWeightTags:
     def test_no_timm_tag_pulls_in_21k_pretraining(self):
-        """
-        Pretraining data is the variable the roster is controlled on. DenseNet,
-        SwinV2 and MaxViT have no IN21k option here, so a 21k tag on either timm
-        model would hand it training data no other backbone got — and would
-        flatter the pure ViT in particular.
-        """
+        """A 21k tag would hand one model training data no other backbone got."""
         for tag in (VIT_S_WEIGHT_TAG, CONVNEXTV2_T_WEIGHT_TAG):
             assert "in21k" not in tag and "in22k" not in tag, tag
 
 
 class TestWeightTagOverride:
     """
-    `--weight-tag` is the one sanctioned way past the IN1k-only invariant, for
-    the pretraining-data ablation. Every guard below exists because its failure
-    mode is silent: the run trains, converges, and reports a number that is
-    simply wrong about what it measured.
+    The one sanctioned way past the IN1k-only invariant. Every guard below
+    exists because its failure mode is a converged run reporting a number that
+    is simply wrong about what it measured.
     """
 
     def test_override_builds_a_working_model(self):
@@ -76,10 +67,8 @@ class TestWeightTagOverride:
             assert model(images).shape == (2, config.NUM_CLASSES)
 
     def test_the_in22k_tag_keeps_the_structure_the_xai_code_assumes(self):
-        """
-        The ablation swaps checkpoints, not architectures — so the Grad-CAM
-        reshape and rollout must still find one prefix token and 12 blocks.
-        """
+        """The ablation swaps checkpoints, not architectures, so the XAI code
+        must still find one prefix token and 12 blocks."""
         model = build_model(
             "vit_s_16",
             pretrained=False,
@@ -89,11 +78,8 @@ class TestWeightTagOverride:
         assert len(model.backbone.blocks) == 12
 
     def test_the_ablation_pair_differs_only_in_pretraining_data(self):
-        """
-        What makes the default ViT-S run a valid control for the 22k run: same
-        architecture, same recipe family, same input statistics. If a timm
-        release ever repoints either tag, this failing is the signal.
-        """
+        """What makes the IN1k run a valid control for the 22k one. If a timm
+        release repoints either tag, this failing is the signal."""
         import timm
 
         in1k = timm.get_pretrained_cfg(VIT_S_WEIGHT_TAG)
@@ -103,11 +89,8 @@ class TestWeightTagOverride:
         assert in1k.input_size == in22k.input_size
 
     def test_rejects_a_tag_whose_normalization_differs(self):
-        """
-        The augreg checkpoints are JAX ports expecting mean/std = 0.5. Feeding
-        them ImageNet-normalized input de-normalizes every image, and nothing
-        downstream would notice.
-        """
+        """The augreg JAX ports want mean/std = 0.5; feeding them
+        ImageNet-normalized input de-normalizes every image, silently."""
         with pytest.raises(ValueError, match="expects mean/std"):
             build_model(
                 "vit_s_16",
@@ -117,10 +100,8 @@ class TestWeightTagOverride:
 
     @pytest.mark.parametrize("name", ["densenet121", "swin_v2_t", "maxvit_t"])
     def test_rejects_an_override_on_the_torchvision_models(self, name):
-        """
-        Those three resolve weights through `.DEFAULT` enums. Accepting a tag
-        and ignoring it would report an ablation that never happened.
-        """
+        """They resolve weights through `.DEFAULT`; accepting a tag and
+        ignoring it would report an ablation that never happened."""
         with pytest.raises(ValueError, match="only supported for"):
             build_model(
                 name, pretrained=False, weight_tag="deit3_small_patch16_224.fb_in1k"
@@ -133,33 +114,28 @@ class TestWeightTagOverride:
 
 class TestXRVWeights:
     """
-    The medical-pretraining arm. Two things need pinning: that the input
-    adapter reproduces XRV's own normalization exactly, and that no checkpoint
-    trained on ChestX-ray14 can be selected. Both fail silently otherwise — the
-    first as a converged run trained on de-normalized images, the second as a
-    test score that is really a training score.
+    The medical-pretraining arm. Pins that the input adapter reproduces XRV's
+    normalization exactly, and that no ChestX-ray14-trained checkpoint can be
+    selected — a converged run on de-normalized images, and a test score that
+    is really a training score, respectively.
     """
 
     def test_the_adapter_reproduces_xrv_normalization(self):
         """
-        The load-bearing claim of DenseNet121XRVClassifier: the shared
-        ImageNet-normalized transform can feed an XRV checkpoint without a
-        second DataLoader, because undoing one affine map and applying another
-        is exact. Compared against xrv's own function rather than against a
-        re-derivation of the same arithmetic.
+        The load-bearing claim: the shared transform can feed an XRV checkpoint
+        without a second DataLoader, because the conversion is exact. Compared
+        against xrv's own function, not a re-derivation of the same arithmetic.
         """
         import numpy as np
         from PIL import Image
         from torchvision import transforms
 
-        # Through the project's guarded importer, not a bare `import`: a bare
-        # one here would leave torchxrayvision's folders on sys.path and fail
-        # test_importing_it_does_not_shadow_the_project_modules below, for a
-        # reason that has nothing to do with the code under test.
+        # The guarded importer, not a bare `import`, which would leave XRV's
+        # folders on sys.path and fail the shadowing test below.
         xrv = _import_torchxrayvision()
 
         pixels = np.random.default_rng(0).integers(0, 256, (32, 32), dtype=np.uint8)
-        # convert("RGB") is what dataset.py does to these grayscale radiographs
+        # What dataset.py does to these grayscale radiographs.
         image = Image.fromarray(pixels, mode="L").convert("RGB")
         shared_transform = transforms.Compose(
             [
@@ -178,24 +154,17 @@ class TestXRVWeights:
 
     @pytest.mark.parametrize("tag", sorted(XRV_LEAKY_WEIGHTS))
     def test_rejects_weights_that_saw_the_test_split(self, tag):
-        """
-        Every blocked tag was trained on ChestX-ray14 or on a dataset derived
-        from it, so it has already seen images this pipeline reports as held
-        out. Nothing downstream can detect that, which is why it is blocked at
-        construction.
-        """
+        """Every blocked tag has already seen images this pipeline reports as
+        held out, and nothing downstream could detect it."""
         with pytest.raises(ValueError, match="leaks the evaluation set"):
             build_model("densenet121_xrv", pretrained=False, weight_tag=tag)
 
     def test_importing_it_does_not_shadow_the_project_modules(self):
         """
-        torchxrayvision's vendored baseline models `sys.path.insert(0, ...)`
-        their own folders, one of which holds a package named `config`. Ahead
-        of the project root, that makes `import config` resolve to theirs in
-        any interpreter that has not already imported ours — which is every
-        spawned DataLoader worker. The symptom lands nowhere near the cause:
-        workers die on `module 'config' has no attribute 'SEED'` and the parent
-        reports BrokenPipeError.
+        XRV's vendored models insert their own folders at sys.path[0], and one
+        holds a package named `config`. Every spawned DataLoader worker would
+        then import theirs and die on a missing SEED, surfacing in the parent
+        as a BrokenPipeError nowhere near the cause.
         """
         import sys
 
@@ -209,11 +178,8 @@ class TestXRVWeights:
         assert XRV_DEFAULT_WEIGHT_TAG not in XRV_LEAKY_WEIGHTS
 
     def test_every_available_tag_is_classified(self):
-        """
-        A new XRV release adding a checkpoint should not default to "allowed".
-        Each tag is either on the blocklist or asserted disjoint from NIH here,
-        so an unreviewed one fails this test instead of quietly training.
-        """
+        """A new XRV checkpoint must not default to "allowed": each tag is
+        either blocked or asserted NIH-disjoint here."""
         reviewed_clean = {
             "densenet121-res224-chex",  # CheXpert, Stanford
             "densenet121-res224-pc",  # PadChest, Spain
@@ -227,11 +193,8 @@ class TestXRVWeights:
             build_model("densenet121_xrv", pretrained=False, weight_tag="not_a_real_tag")
 
     def test_it_stays_out_of_the_architecture_sweep(self):
-        """
-        `--model all` compares architectures. This is DenseNet-121 again with
-        different weights, so sweeping it would put the same architecture in
-        the comparison table twice.
-        """
+        """Sweeping it would enter DenseNet-121 into the architecture
+        comparison table twice, once per pretraining corpus."""
         assert "densenet121_xrv" in config.SUPPORTED_MODELS
         assert "densenet121_xrv" not in config.SWEEP_MODELS
         assert set(config.SWEEP_MODELS) < set(config.SUPPORTED_MODELS)
@@ -239,20 +202,14 @@ class TestXRVWeights:
 
 class TestArchitectureAssumptions:
     def test_vit_has_exactly_one_prefix_token(self, model_cache):
-        """
-        Both the Grad-CAM reshape and Attention Rollout drop prefix tokens to
-        recover a square patch grid. A distilled or register-token checkpoint
-        carries more, which would shift every patch position.
-        """
+        """Both explainers drop prefix tokens to recover a square patch grid;
+        a distilled or register-token checkpoint would shift every patch."""
         assert model_cache("vit_s_16").backbone.num_prefix_tokens == 1
 
     def test_maxvit_is_what_fixes_the_input_resolution(self, model_cache):
         """
-        MaxViT builds its attention partitions from a declared input size and
-        reshapes against them, so it — not the other four — is why
-        config.IMAGE_SIZE cannot be raised on its own. If a torchvision release
-        ever makes this flexible, this test failing is the signal that the
-        constraint lifted.
+        MaxViT alone is why config.IMAGE_SIZE cannot be raised across the
+        board. This failing is the signal that torchvision lifted it.
         """
         model = model_cache("maxvit_t")
         with torch.no_grad():

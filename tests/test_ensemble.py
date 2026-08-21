@@ -72,12 +72,10 @@ def chance(labels, rng):
 
 def degraded(labels, rng, fraction):
     """
-    Perfectly separating probabilities, with `fraction` of the rows randomized.
+    Perfectly separating probabilities with `fraction` of rows randomized.
 
-    Blending a noisy signal toward noise is not monotonic in AUROC, so ranking
-    runs by a mixing weight makes for a fixture that fails on some seeds.
-    Replacing whole rows is monotonic: more randomized rows is strictly less
-    signal.
+    Blending toward noise is not monotonic in AUROC, so a mixing weight would
+    fail on some seeds; replacing whole rows is strictly less signal.
     """
     probs = (labels * 0.5 + 0.25).astype(np.float32)
     count = int(round(fraction * len(labels)))
@@ -90,11 +88,9 @@ def degraded(labels, rng, fraction):
 @pytest.fixture
 def wide_labels(rng):
     """
-    200 rows with 60 positives per class.
-
-    The diversity measures need MIN_POSITIVES_FOR_DIVERSITY rows on *both* sides
-    of each class, so the 40-row fixture above scores every class as unusable
-    and every correlation as NaN.
+    200 rows with 60 positives per class: the diversity measures need
+    MIN_POSITIVES_FOR_DIVERSITY on *both* sides, which the 40-row fixture above
+    cannot supply without every correlation coming back NaN.
     """
     values = np.zeros((200, config.NUM_CLASSES), dtype=np.float32)
     for class_idx in range(config.NUM_CLASSES):
@@ -120,13 +116,10 @@ class TestResidualCorrelation:
 
     def test_two_accurate_members_are_not_scored_as_identical(self, wide_labels, rng):
         """
-        The measure this replaced correlated everything at 0.9+.
-
-        Correlating the raw residual p - y is dominated by the shared label
-        term: at this data's prevalence nearly every row is a negative, so two
-        models look near-identical for agreeing the disease is rare. Splitting
-        by true class is what makes the figure informative, and this pins it —
-        two independently-noised strong models must not read as duplicates.
+        The measure this replaced correlated everything at 0.9+: the raw
+        residual is dominated by the shared label term, so two models look
+        identical for agreeing the disease is rare. Two independently-noised
+        strong models must not read as duplicates.
         """
         first = np.clip(wide_labels * 0.6 + rng.random(wide_labels.shape) * 0.4, 0, 1)
         second = np.clip(wide_labels * 0.6 + rng.random(wide_labels.shape) * 0.4, 0, 1)
@@ -168,8 +161,8 @@ class TestSelectMembersByDiversity:
         config.PROJECT_ROOT = tmp_path
         base = degraded(wide_labels, rng, 0.10)
         write_run(tmp_path, "best", "swin_t", wide_labels, base)
-        # A near-copy of the best run, and an independently-noised run of equal
-        # accuracy. Both clear the floor; only the second adds anything.
+        # A near-copy of the best run and an independently-noised run of equal
+        # accuracy: both clear the floor, only the second adds anything.
         write_run(tmp_path, "duplicate", "maxvit_t", wide_labels, base * 0.99 + 0.005)
         write_run(tmp_path, "complementary", "densenet121", wide_labels,
                   degraded(wide_labels, rng, 0.10))
@@ -183,11 +176,8 @@ class TestSelectMembersByDiversity:
 
     def test_a_weak_outlier_does_not_end_the_search(self, tmp_path, wide_labels, rng):
         """
-        Regression: the penalty ranks a weak-but-unusual run first.
-
-        Stopping at the first candidate that fails to improve ended the search
-        there and returned a one-member 'ensemble'. The search must skip it and
-        carry on to the candidates that do help.
+        When the penalty ranks a weak-but-unusual run first, stopping at the
+        first candidate that fails to improve returns a one-member 'ensemble'.
         """
         config.PROJECT_ROOT = tmp_path
         write_run(tmp_path, "best", "swin_t", wide_labels, degraded(wide_labels, rng, 0.05))
@@ -284,12 +274,9 @@ class TestStacker:
 
     def test_it_weights_an_informative_member_above_a_useless_one(self, wide_labels, rng):
         """
-        The property that makes stacking worth having over the mean.
-
-        Note what is *not* asserted: that the combined scores beat the mean's
-        AUROC even in-sample. Logistic regression minimizes log-loss, not
-        AUROC, so that is not guaranteed on any particular fit — the learned
-        weighting is the thing to pin.
+        What makes stacking worth having over the mean. Note what is *not*
+        asserted: that it beats the mean's AUROC even in-sample. Logistic
+        regression minimizes log-loss, so the weighting is the thing to pin.
         """
         informative = degraded(wide_labels, rng, 0.05)
         useless = chance(wide_labels, rng)
@@ -316,13 +303,9 @@ class TestStackedPredictions:
 
     def test_validation_predictions_are_genuinely_out_of_fold(self, rng):
         """
-        The guard this exists for.
-
-        A stacker's in-sample validation scores are better than it will ever do
-        again; tuning thresholds on them calibrates to a performance the model
-        does not have. Out-of-fold predictions must therefore score *worse* than
-        the in-sample fit — if they match it, the folds are not holding anything
-        out.
+        A stacker's in-sample scores are better than it will ever do again, so
+        out-of-fold predictions must score *worse* than the in-sample fit. If
+        they match, the folds are not holding anything out.
         """
         from sklearn.metrics import roc_auc_score
 

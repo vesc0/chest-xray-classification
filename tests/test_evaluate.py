@@ -2,9 +2,8 @@
 Thresholding, calibration, the derived screening metric, and the bootstrap.
 
 Nothing here touches a model or the disk: every function under test takes
-label/probability arrays. The one exception is the patient-grouping helper,
-which needs a DataLoader to read its sampler — that loader wraps an in-memory
-frame, not the dataset.
+label/probability arrays. The exception is the patient-grouping helper, which
+needs a DataLoader to read its sampler — over an in-memory frame.
 """
 
 import importlib.metadata
@@ -50,14 +49,12 @@ class TestApplyThresholds:
 
 
 class TestConfusionSweep:
-    """
-    The candidate set every threshold decision is made over. If the counts are
-    wrong the objective is wrong, silently and for every class at once.
-    """
+    """The candidate set every threshold decision is made over: wrong counts
+    mean a wrong objective, silently and for every class at once."""
 
     def test_counts_match_a_brute_force_scan(self, rng):
         y_true = (rng.random(200) < 0.3).astype(np.float32)
-        y_prob = rng.random(200).round(2).astype(np.float32)  # forces ties
+        y_prob = rng.random(200).round(2).astype(np.float32)  # ties
 
         thresholds, tp, fp, fn, tn = confusion_sweep(y_true, y_prob)
         for index, threshold in enumerate(thresholds):
@@ -118,10 +115,8 @@ class TestTuneThresholds:
         assert (preds[:, 0] == labels[:, 0]).all()
 
     def test_every_threshold_is_a_score_the_model_actually_produced(self, rng):
-        """
-        Candidates come from the predictions, not a grid, so each threshold is
-        reachable and reproduces the counts it was chosen for.
-        """
+        """Candidates come from the predictions, so each threshold is reachable
+        and reproduces the counts it was chosen for."""
         labels = (rng.random((400, config.NUM_CLASSES)) < 0.3).astype(np.float32)
         probs = rng.random((400, config.NUM_CLASSES)).astype(np.float32)
         thresholds, summary = tune_thresholds(labels, probs)
@@ -129,24 +124,21 @@ class TestTuneThresholds:
         for class_idx, class_name in enumerate(config.CLASS_NAMES):
             if summary[class_name]["status"] != "tuned":
                 continue
-            # Compared against the rounded value the summary reports, since the
-            # stored threshold is one of the raw float32 scores
+            # Against the rounded value the summary reports; the stored
+            # threshold is one of the raw float32 scores.
             assert np.isclose(probs[:, class_idx], thresholds[class_idx]).any()
 
     def test_a_rare_class_scored_far_below_the_old_grid_floor_still_tunes(self):
         """
-        The regression this whole change exists for.
-
-        A grid over [0.05, 0.95] scores zero at every point when a class's
-        scores all sit below 0.05, and returns 0.05 with all-negative
-        predictions labelled "tuned". The candidate set cannot do that: the
-        threshold has to be a score the model produced.
+        A grid over [0.05, 0.95] scores zero everywhere when a class's scores
+        all sit below its floor, and returns that floor with all-negative
+        predictions labelled "tuned". A candidate set cannot do that.
         """
         rng = np.random.default_rng(0)
         labels = np.zeros((600, config.NUM_CLASSES), dtype=np.float32)
         probs = np.full((600, config.NUM_CLASSES), 0.5, dtype=np.float32)
 
-        # 60 positives, every score for the class crushed below 0.05
+        # 60 positives, every score crushed below 0.05.
         labels[:60, 0] = 1.0
         probs[:60, 0] = rng.uniform(0.02, 0.04, 60).astype(np.float32)
         probs[60:, 0] = rng.uniform(0.0, 0.02, 540).astype(np.float32)
@@ -157,7 +149,7 @@ class TestTuneThresholds:
         assert entry["status"] == "tuned"
         assert thresholds[0] < 0.05
         assert entry["objective"] > 0.5
-        # And the decisive part: it does not predict the class negative everywhere
+        # The decisive part: not negative everywhere.
         assert apply_thresholds(probs, thresholds)[:, 0].sum() > 0
 
     def test_reports_one_entry_per_class(self, rng):
@@ -173,10 +165,8 @@ class TestTuneThresholds:
         assert summary[config.CLASS_NAMES[0]]["status"] == "tuned"
 
     def test_youden_reports_an_unrankable_class_as_degenerate(self):
-        """
-        Youden can legitimately bottom out where F1 cannot. Saying so beats
-        returning a threshold that separates nothing.
-        """
+        """Youden can legitimately bottom out where F1 cannot; saying so beats
+        returning a threshold that separates nothing."""
         config.THRESHOLD_METRIC = "youden"
         labels = np.zeros((400, config.NUM_CLASSES), dtype=np.float32)
         labels[:100, 0] = 1.0
@@ -213,7 +203,7 @@ class TestTuneThresholds:
         config.THRESHOLD_TARGET_SENSITIVITY = 0.95
         by_sensitivity, _ = tune_thresholds(labels, probs)
 
-        # A higher recall floor can only be met by a looser threshold
+        # A higher recall floor needs a looser threshold.
         assert (by_sensitivity <= by_f1 + 1e-6).all()
 
     def test_rejects_an_unknown_threshold_metric(self):
@@ -232,10 +222,8 @@ class TestTuneThresholds:
 
 
 class TestThresholdSettings:
-    """
-    Provenance for the thresholds file. Reproducing an operating point needs the
-    support cutoff and the objective's own parameters, not just its name.
-    """
+    """Provenance: reproducing an operating point needs the support cutoff and
+    the objective's parameters, not just its name."""
 
     def test_records_the_support_cutoff(self):
         assert threshold_settings()["min_support"] == config.THRESHOLD_MIN_SUPPORT
@@ -256,10 +244,8 @@ class TestThresholdSettings:
 
 
 class TestSavePredictions:
-    """
-    The arrays that make every later thresholding decision a script rather than
-    another inference pass over five models.
-    """
+    """The arrays that make later thresholding a script rather than another
+    inference pass over five models."""
 
     def _arrays(self, rng, rows=40):
         labels = (rng.random((rows, config.NUM_CLASSES)) < 0.3).astype(np.float32)
@@ -281,13 +267,10 @@ class TestSavePredictions:
 
     def test_patient_ids_off_a_dataframe_round_trip(self, rng, tmp_path):
         """
-        The real caller passes patient_groups(), which is a pandas column.
-
-        That arrives as dtype=object, and np.savez stores it as an object array
-        — which np.load refuses to read back under allow_pickle=False. The
-        test above misses it because np.arange(...).astype(str) is already
-        fixed-width text, so the whole post-hoc path broke while the suite
-        stayed green.
+        The real caller passes a pandas column, which arrives as dtype=object
+        and comes back unreadable under allow_pickle=False. The test above
+        misses it because its ids are already fixed-width text, so the whole
+        post-hoc path broke while the suite stayed green.
         """
         config.RESULTS_DIR = tmp_path
         labels, probs = self._arrays(rng)
@@ -303,7 +286,8 @@ class TestSavePredictions:
         assert (restored["groups"] == groups.astype(str)).all()
 
     def test_reads_predictions_written_before_patient_ids_were_text(self, rng, tmp_path):
-        """An existing outputs/ tree must stay readable without re-running inference."""
+        """An existing outputs/ tree must stay readable without re-running
+        inference over every run in it."""
         config.RESULTS_DIR = tmp_path
         labels, probs = self._arrays(rng)
         groups = np.array([str(i // 2) for i in range(40)], dtype=object)
@@ -344,7 +328,7 @@ class TestSavePredictions:
 
 class TestExpectedCalibrationError:
     def test_perfectly_calibrated_scores_zero(self):
-        # Half the samples positive, all predicted 0.5: confidence == accuracy
+        # Half positive, all predicted 0.5: confidence == accuracy.
         labels = np.array([0.0, 1.0] * 50)
         probs = np.full(100, 0.5)
         assert _expected_calibration_error(labels, probs) == pytest.approx(0.0, abs=1e-9)
@@ -356,8 +340,8 @@ class TestExpectedCalibrationError:
         assert _expected_calibration_error(np.ones(50), np.ones(50)) == pytest.approx(0.0)
 
     def test_the_top_bin_is_closed_so_probability_one_is_counted(self):
-        # Bin edges are half-open except the last; a p=1.0 sample must not be
-        # dropped, or ECE would be computed over fewer samples than exist.
+        # Edges are half-open except the last, so a p=1.0 sample must not fall
+        # outside every bin.
         assert _expected_calibration_error(np.zeros(10), np.ones(10)) > 0.0
 
     def test_every_prediction_lands_in_exactly_one_bin(self, rng):
@@ -365,8 +349,8 @@ class TestExpectedCalibrationError:
         probs = rng.random(500)
         labels = (rng.random(500) < probs).astype(float)
         for strategy in ("quantile", "uniform"):
-            # Perfectly miscalibrated: |confidence - accuracy| is 1 in every
-            # bin, so the weighted sum equals the fraction of samples counted.
+            # Perfectly miscalibrated, so the weighted sum equals the fraction
+            # of samples actually counted.
             assert _expected_calibration_error(
                 np.zeros(500), np.ones(500), strategy=strategy
             ) == pytest.approx(1.0)
@@ -374,15 +358,12 @@ class TestExpectedCalibrationError:
 
     def test_uniform_bins_hide_miscalibration_in_the_rare_class_mass(self):
         """
-        The reason quantile is the default.
-
-        Every prediction is tiny, as it is for a 0.16%-prevalence label, and the
-        model is badly calibrated *within* that mass — confident-ish scores are
-        no likelier to be positive than near-zero ones. Uniform bins put the lot
-        in bin 1 and average the error away; quantile bins split it and see it.
+        Why quantile is the default. Every prediction is tiny, as for a
+        0.16%-prevalence label, and the model is miscalibrated *within* that
+        mass. Uniform bins put the lot in bin 1 and average the error away.
         """
         low = np.linspace(0.001, 0.06, 500)
-        # Positives concentrated at the *bottom* of the range: ranking inverted
+        # Positives at the *bottom* of the range: ranking inverted.
         labels = (np.arange(500) < 100).astype(float)
 
         uniform = _expected_calibration_error(labels, low, strategy="uniform")
@@ -390,12 +371,10 @@ class TestExpectedCalibrationError:
         assert quantile > uniform
 
     def test_reads_the_bin_count_at_call_time(self):
-        """
-        Config is read when the function runs, not when the module is imported.
-        Bound as a default argument, a runtime override would never arrive.
-        """
-        # Four score groups; coarse bins merge them in pairs whose errors
-        # partially cancel, so the granularity has to change the answer.
+        """Config is read when the function runs; bound as a default argument,
+        a runtime override would never arrive."""
+        # Four score groups, so coarse bins merge them into pairs whose errors
+        # partially cancel and the granularity has to change the answer.
         probs = np.repeat([0.1, 0.3, 0.7, 0.9], 100)
         labels = np.repeat([0.0, 1.0, 0.0, 1.0], 100)
 
@@ -437,12 +416,8 @@ class TestNormalVsAbnormal:
 
 
 class TestEnvironmentVersions:
-    """
-    Provenance stamped into every results file.
-
-    Two results files months apart are only comparable if you can see they were
-    produced under the same libraries.
-    """
+    """Provenance: two results files months apart are only comparable if you
+    can see which libraries produced them."""
 
     def test_reports_python_and_every_listed_package(self):
         versions = _environment_versions()
@@ -455,7 +430,7 @@ class TestEnvironmentVersions:
         assert _environment_versions()["torch"] == importlib.metadata.version("torch")
 
     def test_torchvision_is_recorded(self):
-        # The one that decides which pretrained weights `.DEFAULT` resolves to
+        # Decides which pretrained weights `.DEFAULT` resolves to.
         assert _environment_versions()["torchvision"] is not None
 
     def test_reports_none_for_a_missing_package_instead_of_raising(self, monkeypatch):
@@ -476,9 +451,8 @@ class TestEnvironmentVersions:
 
 class TestBootstrapConfidenceIntervals:
     """
-    The intervals are the difference between five numbers and five claims. Their
-    failure mode is not a crash — it is an interval that looks authoritative and
-    is quietly too narrow.
+    The intervals are the difference between five numbers and five claims, and
+    their failure mode is not a crash but an interval quietly too narrow.
     """
 
     @staticmethod
@@ -519,16 +493,13 @@ class TestBootstrapConfidenceIntervals:
             assert low <= results["macro"][metric] <= high
 
     def test_patient_grouping_widens_the_interval(self, rng):
-        """
-        The reason grouping exists. Several studies from one patient are
-        correlated; resampling images pretends they are independent, and returns
-        an interval narrower than the evidence supports.
-        """
+        """Resampling images pretends a patient's correlated studies are
+        independent, returning an interval narrower than the evidence."""
         config.BOOTSTRAP_SAMPLES = 120
         labels, probs, groups = self._scored(rng, rows=600, groups_of=6)
 
-        # Make studies from one patient near-identical, which is what the real
-        # correlation looks like and what image-level resampling ignores.
+        # Near-identical studies per patient: what the real correlation looks
+        # like, and what image-level resampling ignores.
         for start in range(0, len(labels), 6):
             labels[start:start + 6] = labels[start]
             probs[start:start + 6] = probs[start]
@@ -539,12 +510,9 @@ class TestBootstrapConfidenceIntervals:
         assert (by_patient[1] - by_patient[0]) > (by_image[1] - by_image[0])
 
     def test_thresholded_metrics_get_intervals_when_predictions_are_given(self, rng):
-        """
-        The threshold is frozen on validation before test is touched, so
-        resampling test rows at that fixed operating point is an ordinary
-        sampling interval — and F1 on the rare classes is the noisiest number
-        in the whole table.
-        """
+        """The threshold is frozen before test is touched, so this is an
+        ordinary sampling interval — and rare-class F1 is the noisiest number
+        in the table."""
         config.BOOTSTRAP_ENABLED = True
         config.BOOTSTRAP_SAMPLES = 60
         labels, probs, _ = self._scored(rng, rows=1000)
@@ -561,10 +529,9 @@ class TestBootstrapConfidenceIntervals:
 
     def test_rare_classes_get_relatively_wider_f1_intervals(self, rng):
         """
-        Compared relative to the estimate, not in absolute width: an F1 near
-        zero is squeezed against the floor, so the rare class can hold a
-        narrower absolute interval while being far less determined. Relative
-        width is what "we do not really know Hernia's F1" actually means.
+        Relative to the estimate, not in absolute width: an F1 near zero is
+        squeezed against the floor, so a rare class can hold a narrower
+        absolute interval while being far less determined.
         """
         config.BOOTSTRAP_ENABLED = True
         config.BOOTSTRAP_SAMPLES = 80
@@ -644,11 +611,8 @@ class TestPatientGroups:
         assert list(patient_groups(self._loader(shuffle=False))) == ["a", "a", "b", "c"]
 
     def test_refuses_a_shuffled_loader(self):
-        """
-        Predictions and patient IDs are matched by position, so a shuffled
-        loader would pair each prediction with the wrong patient and produce a
-        confident, wrong interval.
-        """
+        """The join is positional, so a shuffled loader pairs each prediction
+        with the wrong patient and yields a confident, wrong interval."""
         with pytest.raises(ValueError, match="unshuffled"):
             patient_groups(self._loader(shuffle=True))
 
@@ -687,8 +651,8 @@ class TestComputeMetrics:
         assert results["macro"]["auroc"] is None
 
     def test_all_negative_baseline_is_reported_next_to_sample_accuracy(self, rng):
-        # Sample accuracy looks impressive on sparse labels; the baseline is
-        # what makes it readable.
+        # Accuracy looks impressive on sparse labels; the baseline is what
+        # makes it readable.
         labels = (rng.random((100, config.NUM_CLASSES)) < 0.05).astype(np.float32)
         probs = rng.random((100, config.NUM_CLASSES)).astype(np.float32)
         results = compute_metrics(labels, probs, apply_thresholds(probs, 0.5))
@@ -696,10 +660,9 @@ class TestComputeMetrics:
 
     def test_samples_f1_credits_a_correctly_predicted_normal_study(self):
         """
-        38.5% of the official test split has no findings at all. Under
-        sklearn's zero_division=0 those rows score 0.0 when predicted
-        correctly, which caps a *perfect* model at 0.615 and makes the metric
-        unreadable next to the others.
+        38.5% of the test split has no findings, and under zero_division=0
+        those rows score 0.0 when predicted correctly — capping a *perfect*
+        model at 0.615.
         """
         labels = np.zeros((10, config.NUM_CLASSES), dtype=np.float32)
         labels[:4, 0] = 1.0  # 6 of 10 studies are normal

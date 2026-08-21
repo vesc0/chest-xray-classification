@@ -1,13 +1,9 @@
 """
-Evaluation module
+Inference, per-class threshold calibration, metrics, and bootstrap intervals.
 
-Computes and reports:
-  - Per-class AUROC / AUPRC
-  - Threshold-calibrated precision / recall / F1
-  - Micro/macro aggregate metrics
-  - Calibration metrics (Brier score, ECE)
-  - Validation-set threshold tuning for long-tailed labels
-  - Bootstrap confidence intervals on the ranking metrics
+Thresholds are fitted on validation only and frozen before the test set is
+read. Every reported metric carries a patient-level bootstrap interval, since
+one seed per configuration cannot support a ranking claim on its own.
 """
 
 import importlib.metadata
@@ -42,9 +38,7 @@ from metrics import (
 )
 
 
-# =============================================================================
-# Inference
-# =============================================================================
+# --- Inference ----------------------------------------------------------------
 @torch.no_grad()
 def collect_predictions(
     model: nn.Module,
@@ -52,19 +46,13 @@ def collect_predictions(
     device: torch.device,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """
-    Run inference on an entire loader.
+    Run inference over a loader, returning (labels, probs, timing).
 
-    Returns:
-        labels: (N, NUM_CLASSES) ground-truth multi-hot
-        probs:  (N, NUM_CLASSES) predicted probabilities
-        timing: wall-clock breakdown
-
-    Timing separates two figures that are easy to conflate. End-to-end includes
-    image decode and transforms, so it reflects what a deployment would feel but
-    is dominated by the DataLoader for small models; model-only isolates the
-    forward pass and is the fair architecture comparison. The first batch is
-    excluded from model-only time as warm-up, since it carries lazy allocation
-    and kernel selection.
+    Timing separates two figures that are easy to conflate: end-to-end includes
+    decode and transforms, so it reflects deployment but is DataLoader-bound for
+    small models, while model-only isolates the forward pass and is the fair
+    architecture comparison. The first batch is excluded from model-only as
+    warm-up, since it carries lazy allocation and kernel selection.
     """
     model.eval()
     all_labels, all_probs = [], []
@@ -79,7 +67,6 @@ def collect_predictions(
     for batch_idx, batch in enumerate(loader):
         images = batch["image"].to(device, non_blocking=True)
 
-        # Labels are kept on CPU to avoid GPU overhead
         labels = batch["label"].cpu().numpy()
 
         synchronize(device)
@@ -124,9 +111,7 @@ def collect_predictions(
     return labels_np, probs_np, timing
 
 
-# =============================================================================
-# Thresholding
-# =============================================================================
+# --- Thresholding -------------------------------------------------------------
 def apply_thresholds(probs: np.ndarray, thresholds: np.ndarray | float | None) -> np.ndarray:
     """Convert probabilities into binary predictions using per-class thresholds."""
     if thresholds is None:
@@ -167,27 +152,22 @@ def confusion_sweep(
     """
     Confusion counts at every distinct predicted score.
 
-    The candidates are the scores the model actually produced — the same set
-    behind sklearn's precision_recall_curve — so no achievable operating point
-    is out of reach and none of them is unreachable. A fixed grid fails on both
-    counts: it cannot express an optimum outside its bounds, and on a rare class
-    whose scores all sit below the grid's floor every grid point scores zero, so
-    the search returns the floor with all-negative predictions.
-
-    Sorting once and taking a cumulative sum gives all four counts in one pass,
-    which also replaces the previous 91 x 3 scalar sklearn calls per class.
+    Candidates are the scores the model produced, so every achievable operating
+    point is reachable and no unachievable one is. A fixed grid fails both ways:
+    it cannot express an optimum outside its bounds, and on a rare class scored
+    entirely below its floor every point scores zero, so the search returns the
+    floor with all-negative predictions.
 
     Returns (thresholds, tp, fp, fn, tn) in descending threshold order, matching
-    the `probs >= threshold` rule apply_thresholds() uses: index 0 is the
-    strictest point and the last index predicts every sample positive. Recall is
-    therefore non-decreasing in the index.
+    apply_thresholds()'s `probs >= threshold`: index 0 is strictest and the last
+    predicts everything positive, so recall is non-decreasing in the index.
     """
     order = np.argsort(-y_prob, kind="mergesort")
     sorted_true = y_true[order].astype(np.int64)
     sorted_prob = y_prob[order]
 
-    # One candidate per distinct score. Tied scores have to enter the positive
-    # set together, or the counts describe a split no threshold can produce.
+    # Tied scores have to enter the positive set together, or the counts
+    # describe a split no threshold can produce.
     last_of_run = np.r_[np.flatnonzero(np.diff(sorted_prob)), sorted_prob.size - 1]
 
     true_positive = np.cumsum(sorted_true)[last_of_run]
@@ -236,10 +216,9 @@ def select_candidate(
     if metric_name == "sensitivity":
         target = float(config.THRESHOLD_TARGET_SENSITIVITY)
         reaches_target = recall >= target
-        # Recall only grows with the index, so the first candidate to clear the
-        # target is also the most specific one that does. The last index
-        # predicts everything positive and has recall 1.0, so this is always
-        # reachable — the fallback is defensive only.
+        # Recall grows with the index, so the first candidate to clear the
+        # target is the most specific one that does. The last index has recall
+        # 1.0, so the fallback below is defensive only.
         index = int(np.argmax(reaches_target)) if reaches_target.any() else recall.size - 1
         score = float(specificity[index])
     else:
@@ -249,8 +228,7 @@ def select_candidate(
             beta = 1.0 if metric_name == "f1" else float(config.THRESHOLD_BETA)
             objective = _fbeta_curve(precision, recall, beta)
 
-        # Ties break toward recall, which increases with the index, so take the
-        # last member of a tied run rather than the first.
+        # Ties break toward recall, which grows with the index.
         tied = np.flatnonzero(objective >= objective.max() - 1e-12)
         index = int(tied[-1])
         score = float(objective[index])
@@ -271,23 +249,11 @@ def tune_thresholds(
     """
     Fit one threshold per class on the validation set.
 
-    Two situations fall back to config.DEFAULT_THRESHOLD rather than returning a
-    fitted number, and each records why:
-
-      "default"    - too few positives to fit anything stable, or the class has
-                     only one outcome present.
-      "degenerate" - no candidate threshold scored above zero, so no operating
-                     point separates anything.
-
-    "degenerate" is unreachable for f1 and fbeta by construction: the lowest
-    candidate is the smallest score the model produced, predicting every sample
-    positive, so recall is 1 and F1 is positive whenever the class has a single
-    positive. That is the guarantee the old fixed grid could not make — with a
-    floor of 0.05 and a rare class scored entirely below it, every grid point
-    scored zero and the search returned 0.05, labelled it "tuned", and predicted
-    the class negative everywhere. The status is still checked because Youden
-    and the fixed-sensitivity rule can legitimately reach it: both go to zero or
-    below for a class the model cannot rank at all.
+    Two situations fall back to config.DEFAULT_THRESHOLD and record why:
+    "default" (too few positives, or only one outcome present) and "degenerate"
+    (no candidate scored above zero). The second is unreachable for f1 and
+    fbeta by construction, but youden and the fixed-sensitivity rule can both
+    legitimately reach it on a class the model cannot rank at all.
     """
     metric_name = resolve_threshold_metric()
     thresholds = np.full(labels.shape[1], config.DEFAULT_THRESHOLD, dtype=np.float32)
@@ -347,11 +313,8 @@ def tune_thresholds(
 
 def threshold_settings() -> dict:
     """
-    Every setting that determines which thresholds come out of tune_thresholds.
-
-    Recorded next to the thresholds themselves, so a thresholds file can be
-    reproduced from its own contents rather than from whatever config.py happens
-    to say later.
+    Every setting that determines tune_thresholds' output, recorded next to the
+    thresholds so the file is reproducible from its own contents.
     """
     metric_name = str(config.THRESHOLD_METRIC).lower()
     settings = {
@@ -401,13 +364,10 @@ def save_predictions(
     """
     Persist the raw labels and probabilities behind one split's metrics.
 
-    This is what makes every thresholding decision reversible. Without it,
-    switching from F1 to a fixed-sensitivity operating point — or putting a
-    confidence interval on a tuned threshold — means re-running inference on
-    every model. With it, all of that is a post-hoc script over ~1 MB of arrays.
-
-    Patient IDs are stored alongside so the post-hoc analysis can resample by
-    patient the way the in-run bootstrap does.
+    This is what makes every thresholding decision reversible: re-thresholding,
+    subgroup analysis and ensembling all become post-hoc scripts over ~1 MB of
+    arrays instead of another inference pass. Patient IDs travel with them so
+    post-hoc code can resample by patient the way the in-run bootstrap does.
     """
     if not config.SAVE_PREDICTIONS:
         return None
@@ -416,20 +376,16 @@ def save_predictions(
     path = config.RESULTS_DIR / f"{model_name}_{split}_predictions.npz"
 
     payload = {
-        # int8 labels and float32 probabilities: the arrays are multi-hot and
-        # the probabilities came out of a float32 forward pass, so nothing is
-        # lost and the file stays small enough to keep for every model.
+        # Multi-hot labels and a float32 forward pass, so these dtypes lose
+        # nothing and keep the file small enough to save for every model.
         "labels": labels.astype(np.int8),
         "probs": probs.astype(np.float32),
         "class_names": np.asarray(config.CLASS_NAMES),
     }
     if groups is not None:
-        # Patient IDs arrive straight off a pandas column, so np.asarray gives
-        # dtype=object — and np.load refuses to read an object array back
-        # unless allow_pickle is on. Storing them as fixed-width text keeps the
-        # loader's safe default intact instead of trading it away to read this
-        # project's own output. They are identifiers, only ever compared for
-        # equality and grouped on, so text loses nothing.
+        # A pandas column gives dtype=object, which np.load will not read back
+        # without allow_pickle. Fixed-width text keeps the safe default, and
+        # these are only ever compared for equality.
         groups = np.asarray(groups)
         if groups.dtype == object:
             groups = groups.astype(str)
@@ -440,8 +396,7 @@ def save_predictions(
     return path
 
 
-# Set once the first legacy-format prediction file is converted on read, so the
-# notice is printed once per process rather than once per file.
+# So the legacy-format notice prints once per process, not once per file.
 _LEGACY_GROUPS_REPORTED = False
 
 
@@ -449,12 +404,10 @@ def load_predictions(model_name: str, split: str) -> dict[str, np.ndarray]:
     """
     Read back what save_predictions() wrote.
 
-    Files written before patient IDs were stored as text hold `groups` as an
-    object array, which np.load will not touch under allow_pickle=False. Those
-    are re-read permissively and converted on the way out, so an outputs/ tree
-    full of finished runs stays readable without re-running inference over every
-    one of them. The permissive path is deliberately narrow: it is entered only
-    after the safe read has failed for that specific reason.
+    Files predating text patient IDs hold `groups` as an object array, which
+    np.load will not touch under allow_pickle=False. Those are re-read
+    permissively and converted, so a tree of finished runs stays readable. That
+    path is entered only after the safe read fails for that specific reason.
     """
     path = config.RESULTS_DIR / f"{model_name}_{split}_predictions.npz"
     if not path.exists():
@@ -472,10 +425,8 @@ def load_predictions(model_name: str, split: str) -> dict[str, np.ndarray]:
 
     global _LEGACY_GROUPS_REPORTED
     if not _LEGACY_GROUPS_REPORTED:
-        # Once per process, not once per file: ensemble.py's selection rule
-        # reads every run in outputs/, and one notice says everything twenty
-        # identical ones would. Re-running evaluation rewrites a file in the
-        # current format.
+        # ensemble.py reads every run in outputs/, and one notice says what
+        # twenty identical ones would.
         _LEGACY_GROUPS_REPORTED = True
         print(
             f"[evaluate] {path.name} stores patient IDs in the pre-text format; "
@@ -532,8 +483,8 @@ def _calibration_bin_edges(probs: np.ndarray, num_bins: int, strategy: str) -> n
             f"Unsupported ECE bin strategy '{strategy}'. Use one of: quantile, uniform."
         )
 
-    # Heavy ties collapse neighbouring quantiles onto the same value; unique
-    # merges them rather than leaving empty bins that contribute nothing.
+    # Heavy ties collapse neighbouring quantiles onto one value; merge them
+    # rather than leaving empty bins.
     edges = np.unique(np.quantile(probs, np.linspace(0.0, 1.0, num_bins + 1)))
     if edges.size < 2:
         # Every prediction is the same number: one bin that contains them all.
@@ -550,16 +501,10 @@ def _expected_calibration_error(
     """
     Binary expected calibration error for one class.
 
-    Config is read at call time rather than bound as a default argument, so a
-    runtime override reaches this the way it reaches every other setting.
-
-    Uniform bins are the textbook definition and are close to useless on the
-    rare classes here: nearly every prediction for a 0.16%-prevalence label
-    lands in the first bin, that bin is trivially well calibrated because the
-    disease really is that rare, and it carries almost all of the weight. The
-    class then scores an excellent ECE for knowing nothing about radiographs.
-    Quantile bins give each bin the same number of predictions instead, which
-    spreads that mass out and exposes whatever structure is inside it.
+    Config is read at call time so a runtime override reaches this. Uniform
+    bins are the textbook definition and near-useless on rare classes, where
+    almost every prediction lands in a trivially well-calibrated first bin that
+    carries almost all the weight; quantile bins spread that mass out.
     """
     if probs.size == 0:
         return 0.0
@@ -568,9 +513,8 @@ def _expected_calibration_error(
     strategy = (config.ECE_BIN_STRATEGY if strategy is None else strategy).lower()
     edges = _calibration_bin_edges(probs, int(num_bins), strategy)
 
-    # Bins are (lower, upper], with the first extended down to include its own
-    # lower edge. Closing the top bin is what keeps a p = 1.0 prediction from
-    # falling outside every bin and being dropped from the average.
+    # Bins are (lower, upper], the first extended down to its own edge. Closing
+    # the top bin keeps a p = 1.0 prediction from being dropped entirely.
     assignment = np.clip(np.searchsorted(edges, probs, side="left") - 1, 0, edges.size - 2)
 
     ece = 0.0
@@ -590,12 +534,10 @@ def _normal_vs_abnormal_metrics(labels: np.ndarray, probs: np.ndarray) -> dict:
     """
     Screening metric derived from the 14 pathology outputs.
 
-    "No Finding" is not a trained class, so normality is read off the pathology
-    predictions: a study is abnormal when any of the 14 is present. Two standard
-    aggregations are reported — the strongest single finding (max) and the
-    probabilistic OR under an independence assumption (noisy-or). This keeps the
-    clinically useful normal/abnormal signal without letting a 54%-prevalence
-    class into the macro and micro averages.
+    "No Finding" is not a trained class, so a study is abnormal when any of the
+    14 is present, aggregated two ways: strongest single finding (max) and
+    probabilistic OR (noisy-or). This keeps the normal/abnormal signal without
+    letting a 54%-prevalence class into the macro and micro averages.
     """
     y_true = (labels.sum(axis=1) > 0).astype(np.int32)
     scores = {
@@ -615,20 +557,14 @@ def _normal_vs_abnormal_metrics(labels: np.ndarray, probs: np.ndarray) -> dict:
     return results
 
 
-# =============================================================================
-# Metrics computation
-# =============================================================================
-# =============================================================================
-# Bootstrap confidence intervals
-# =============================================================================
+# --- Bootstrap confidence intervals -------------------------------------------
 def patient_groups(loader: DataLoader) -> np.ndarray:
     """
     Patient ID per row, aligned with what collect_predictions returns.
 
-    The alignment is positional: collect_predictions concatenates batches in
-    loader order, so this is only valid for an unshuffled loader. A shuffled one
-    would pair each prediction with some other patient's ID and yield confident,
-    wrong intervals — so it raises rather than guessing.
+    Alignment is positional, so this is valid only for an unshuffled loader; a
+    shuffled one would pair each prediction with some other patient's ID and
+    yield confident, wrong intervals. It raises rather than guessing.
     """
     sampler = getattr(loader, "sampler", None)
     if not isinstance(sampler, SequentialSampler):
@@ -649,8 +585,8 @@ def _percentile_ci(values: list[float]) -> list[float] | None:
     """Two-sided percentile interval, or None if too little of it was scorable."""
     finite = np.asarray([v for v in values if v is not None and np.isfinite(v)])
 
-    # A handful of degenerate resamples is expected for the rare classes; an
-    # interval built from a handful of points is not worth reporting.
+    # Degenerate resamples are expected on rare classes; an interval built from
+    # a handful of points is not worth reporting.
     if finite.size < 0.5 * max(len(values), 1) or finite.size < 2:
         return None
 
@@ -661,11 +597,10 @@ def _percentile_ci(values: list[float]) -> list[float] | None:
 
 def _rows_by_group(groups: np.ndarray) -> list[np.ndarray]:
     """
-    Row indices belonging to each group, precomputed once.
+    Row indices per group, precomputed once.
 
-    Sorting and splitting is O(n log n); testing `inverse == g` once per group
-    is O(groups x rows), which on the test split is 2.8k patients scanned
-    against 25.6k rows for the same answer.
+    Sorting and splitting is O(n log n) against O(groups x rows) for the
+    obvious loop — 2.8k patients x 25.6k rows on the test split.
     """
     _, inverse = np.unique(groups, return_inverse=True)
     order = np.argsort(inverse, kind="stable")
@@ -680,8 +615,8 @@ def _thresholded_rates(
     """
     Per-class precision, recall and F1 from the confusion counts.
 
-    Matches sklearn's zero_division=0 convention, computed over all classes at
-    once so it costs nothing inside the bootstrap loop.
+    sklearn's zero_division=0 convention, vectorized over classes so it costs
+    nothing inside the bootstrap loop.
     """
     true_positive = np.logical_and(preds, labels).sum(axis=0)
     precision = _safe_divide(true_positive, preds.sum(axis=0))
@@ -698,22 +633,15 @@ def bootstrap_cis(
     """
     Percentile confidence intervals for the per-class and macro metrics.
 
-    Resamples the evaluation set with replacement and recomputes the metrics;
-    no retraining is involved, so this is the cheap way to turn five point
-    estimates into five intervals you can actually compare.
+    With `groups`, whole patients are resampled: several correlated studies per
+    patient make an image-level bootstrap treat them as independent and return
+    an interval that is too narrow.
 
-    When `groups` is given, whole patients are resampled rather than individual
-    images. ChestX-ray14 carries several studies per patient and those rows are
-    correlated, so an image-level bootstrap treats correlated observations as
-    independent and produces an interval that is too narrow.
-
-    Passing `preds` adds intervals for precision/recall/F1. Those thresholds
-    were frozen on validation before the test set was touched, so resampling
-    test rows at a fixed operating point is an ordinary sampling interval and
-    means exactly what the AUROC interval means. It is also where the intervals
-    are needed most: Hernia's test F1 rests on 86 positives. What this does not
-    capture is uncertainty in the threshold itself — that needs resampling the
-    validation set, which threshold_analysis.py does.
+    `preds` adds precision/recall/F1 intervals, which is where they are needed
+    most — Hernia's test F1 rests on 86 positives. Thresholds were frozen on
+    validation first, so this is an ordinary sampling interval at a fixed
+    operating point; uncertainty in the threshold itself needs the validation
+    set resampled, which threshold_analysis.py does.
 
     Returns a dict with "per_class", "macro", and the settings used.
     """
@@ -774,8 +702,7 @@ def bootstrap_cis(
             for name, values in rates.items():
                 for class_idx in range(num_classes):
                     point_draws[name][class_idx].append(float(values[class_idx]))
-                # Matches f1_score(average="macro"): the mean over every class,
-                # including the ones that scored zero.
+                # Matches f1_score(average="macro"): every class, zeros too.
                 macro_point_draws[name].append(float(values.mean()))
 
     per_class = {}
@@ -820,24 +747,12 @@ def compute_metrics(
     threshold_status: dict[str, str] | None = None,
 ) -> dict:
     """
-    Compute a comprehensive set of evaluation metrics.
+    Per-class, macro, micro and calibration metrics, with bootstrap intervals.
 
-    Args:
-        labels: (N, NUM_CLASSES) ground-truth multi-hot.
-        probs: (N, NUM_CLASSES) predicted probabilities.
-        preds: (N, NUM_CLASSES) thresholded predictions.
-        thresholds: Per-class decision thresholds.
-        groups: Optional per-row grouping (patient IDs) for the bootstrap, so
-            correlated studies from one patient resample together. Ignored when
-            config.BOOTSTRAP_ENABLED is False.
-        threshold_status: Per-class outcome from tune_thresholds. Carried into
-            the report so a class left at the default is not read as a fitted
-            operating point that happened to score badly — at Hernia's
-            prevalence those two look identical in the table and mean opposite
-            things.
-
-    Returns a dict containing per-class, macro, micro, and calibration figures,
-    plus bootstrap confidence intervals when enabled.
+    `groups` carries patient IDs so correlated studies resample together.
+    `threshold_status` carries tune_thresholds' per-class outcome into the
+    report, so a class left at the default is not read as a fitted operating
+    point that scored badly — in the table those look identical.
     """
     if thresholds is None:
         thresholds = np.full(labels.shape[1], config.DEFAULT_THRESHOLD, dtype=np.float32)
@@ -847,7 +762,7 @@ def compute_metrics(
         thresholds = np.asarray(thresholds, dtype=np.float32)
 
     results: dict = {
-        # Recorded so a comparison across runs can verify the class sets match
+        # So a cross-run comparison can verify the class sets match.
         "class_names": list(config.CLASS_NAMES),
         "num_classes": config.NUM_CLASSES,
         "per_class": {},
@@ -866,15 +781,14 @@ def compute_metrics(
     per_class_brier = []
     per_class_ece = []
 
-    # Per-class metrics
     for class_idx, class_name in enumerate(config.CLASS_NAMES):
         targets = labels[:, class_idx]
         scores = probs[:, class_idx]
         predictions = preds[:, class_idx]
         support = int(targets.sum())
 
-        # Same helpers the per-epoch training metrics use, so the validation
-        # curve and the number reported here mean the same thing
+        # Same helpers as the per-epoch training metrics, so the validation
+        # curve and the number reported here mean the same thing.
         auroc = class_auroc(targets, scores)
         auprc = class_auprc(targets, scores)
         brier = float(np.mean((scores - targets) ** 2))
@@ -899,7 +813,7 @@ def compute_metrics(
             "prevalence": round(float(targets.mean()), 4),
         }
 
-    # Macro metrics — macro_average skips the classes that were not scorable
+    # macro_average skips the classes that were not scorable.
     macro_auroc = macro_average(per_class_auroc)
     macro_auprc = macro_average(per_class_auprc)
     results["macro"]["auroc"] = round(macro_auroc, 4) if macro_auroc is not None else None
@@ -916,13 +830,11 @@ def compute_metrics(
         float(f1_score(labels, preds, average="macro", zero_division=0)),
         4,
     )
-    # zero_division=1, not 0. A study with no findings has an empty true label
-    # set, and predicting it correctly leaves precision and recall both 0/0;
-    # scoring that row 0.0 punishes the right answer. 38.5% of the official test
-    # split is No Finding, so under zero_division=0 a *perfect* model scores
-    # 0.615 here and the metric cannot be read at all. The price is that an
-    # all-negative model now collects those rows for free, which is what the
-    # baseline below is for.
+    # zero_division=1, not 0: a correctly predicted No Finding study leaves
+    # precision and recall both 0/0, and scoring it 0.0 punishes the right
+    # answer. At 38.5% No Finding a *perfect* model would score 0.615. The
+    # price is that an all-negative model collects those rows free, which is
+    # what the baseline below is for.
     all_negative_rows = float((labels.sum(axis=1) == 0).mean())
     results["macro"]["samples_f1"] = round(
         float(f1_score(labels, preds, average="samples", zero_division=1)),
@@ -941,7 +853,6 @@ def compute_metrics(
     )
     results["macro"]["hamming_loss"] = round(float(sk_hamming_loss(labels, preds)), 4)
 
-    # Micro metrics
     flat_labels = labels.ravel()
     flat_probs = probs.ravel()
     flat_preds = preds.ravel()
@@ -962,14 +873,12 @@ def compute_metrics(
         4,
     )
 
-    # Calibration metrics
     results["calibration"]["macro_brier"] = round(float(np.mean(per_class_brier)), 4)
     results["calibration"]["macro_ece"] = round(float(np.mean(per_class_ece)), 4)
-    # The binning changes what the number means, so it travels with it
+    # The binning changes what the number means, so it travels with it.
     results["calibration"]["ece_bins"] = int(config.ECE_BINS)
     results["calibration"]["ece_bin_strategy"] = str(config.ECE_BIN_STRATEGY).lower()
 
-    # Bootstrap intervals, attached alongside the point estimates they belong to
     if config.BOOTSTRAP_ENABLED:
         print(
             f"[evaluate] Bootstrapping {config.BOOTSTRAP_SAMPLES} resamples "
@@ -990,9 +899,7 @@ def compute_metrics(
     return results
 
 
-# =============================================================================
-# Output utilities
-# =============================================================================
+# --- Output utilities ---------------------------------------------------------
 def print_results(results: dict, model_name: str) -> None:
     """Print a formatted summary table of evaluation results."""
     bootstrap = results.get("bootstrap")
@@ -1024,8 +931,8 @@ def print_results(results: dict, model_name: str) -> None:
     print(header)
     print("-" * len(header))
 
-    # A class left at the default threshold is not a fitted operating point that
-    # scored badly, and in the table those two are indistinguishable
+    # A class left at the default is not a fitted operating point that scored
+    # badly, and in the table those two are indistinguishable.
     not_tuned = []
     for class_name, metrics in results["per_class"].items():
         auroc = f"{metrics['auroc']:.4f}" if metrics["auroc"] is not None else "N/A"
@@ -1087,8 +994,8 @@ def print_results(results: dict, model_name: str) -> None:
             f"{thresholded}"
         )
 
-    # Each aggregate sits next to the score an all-negative model would get,
-    # because on labels this sparse the bare number reads far better than it is.
+    # Next to the score an all-negative model would get: on labels this sparse
+    # the bare number reads far better than it is.
     print(
         f"  Samples F1:                      {macro['samples_f1']:.4f}"
         f"   (all-negative baseline {macro['all_negative_samples_f1_baseline']:.4f})"
@@ -1110,7 +1017,7 @@ def print_results(results: dict, model_name: str) -> None:
         f"the rare classes, where it means little)"
     )
 
-    # Derived screening metric — not part of the 14-class averages above
+    # Derived, not part of the 14-class averages above.
     screening = results.get("normal_vs_abnormal", {})
     if screening:
         def _fmt(value):
@@ -1130,10 +1037,8 @@ def print_results(results: dict, model_name: str) -> None:
     if run or training or inference:
         print("-" * len(header))
 
-    # A post-hoc run scored saved arrays rather than a model, so it has no
-    # device, batch size or parameter count. Printing the block anyway reported
-    # "0 params" and "[recovered]", which read as a broken training run rather
-    # than as a combination of finished ones.
+    # A post-hoc run scored saved arrays, not a model, so it has no device or
+    # parameter count; printing the block anyway reads as a broken run.
     if run.get("source"):
         print(f"  Source: {run['source']}")
         members = (results.get("ensemble") or {}).get("members") or []
@@ -1183,17 +1088,15 @@ def print_results(results: dict, model_name: str) -> None:
     print(f"{rule}\n")
 
 
-# Distribution names (not import names) of the packages that can move a
-# reported number: torchvision decides which pretrained weights `.DEFAULT`
-# resolves to and timm does the same for the tags behind ViT-S and
-# ConvNeXtV2, scikit-learn implements every metric here, Pillow decodes the
-# radiographs, and torch/numpy/scipy supply the arithmetic underneath.
+# Distribution names (not import names) of every package that can move a
+# reported number: the two weight registries, the metrics, the image decoder,
+# and the arithmetic underneath.
 _PROVENANCE_PACKAGES = (
     "torch",
     "torchvision",
     "timm",
     # Pins the weight URLs behind densenet121_xrv, so a release that repoints
-    # a tag is visible in the results file rather than only in the lock file.
+    # a tag shows up in the results file.
     "torchxrayvision",
     "numpy",
     "scipy",
@@ -1207,15 +1110,10 @@ def _environment_versions() -> dict[str, str | None]:
     """
     Record the library versions this evaluation ran under.
 
-    Without them a results file cannot be compared to one written months later:
-    a torchvision upgrade can change which ImageNet weights `.DEFAULT` means, so
-    the model starts fine-tuning from somewhere else entirely, and a
-    scikit-learn upgrade can shift a metric's edge cases — both silently. The
-    lock file records the current environment; this records the one that
-    produced these particular numbers.
-
-    Missing packages are reported as None rather than raising: provenance is
-    not worth losing a finished training run over.
+    A torchvision upgrade can silently change what `.DEFAULT` resolves to, and
+    a scikit-learn upgrade can shift a metric's edge cases. The lock file
+    records the current environment; this records the one behind these numbers.
+    Missing packages report None rather than raising.
     """
     versions: dict[str, str | None] = {"python": platform.python_version()}
     for package in _PROVENANCE_PACKAGES:
@@ -1228,11 +1126,8 @@ def _environment_versions() -> dict[str, str | None]:
 
 def _load_previous_results(model_name: str) -> dict:
     """
-    Read this experiment's existing results file, if any.
-
-    --eval-only does not train, so figures that only a training run can know
-    (training timing, how many parameters were actually unfrozen) would
-    otherwise be nulled out on every re-run.
+    Read this experiment's existing results file, if any, so that --eval-only
+    does not null out figures only a training run can know.
     """
     path = config.RESULTS_DIR / f"{model_name}_results.json"
     if not path.exists():
@@ -1247,10 +1142,8 @@ def _load_previous_results(model_name: str) -> dict:
 
 def load_threshold_status(model_name: str) -> dict[str, str]:
     """
-    Per-class tuning outcome from the thresholds file calibration just wrote.
-
-    Read back rather than passed down, so calibrate_thresholds keeps returning a
-    plain array and the notebooks that unpack it still work.
+    Per-class tuning outcome, read back from the thresholds file rather than
+    passed down, so calibrate_thresholds keeps returning a plain array.
     """
     path = config.RESULTS_DIR / f"{model_name}_thresholds.json"
     if not path.exists():
@@ -1277,9 +1170,7 @@ def save_results(results: dict, model_name: str) -> Path:
     return path
 
 
-# =============================================================================
-# Main evaluation pipeline
-# =============================================================================
+# --- Main evaluation pipeline -------------------------------------------------
 def evaluate_model(
     model: nn.Module,
     test_loader: DataLoader,
@@ -1288,16 +1179,11 @@ def evaluate_model(
     training_timing: dict | None = None,
     trainable_params: int | None = None,
 ) -> dict:
-    """
-    Full evaluation pipeline: inference -> thresholding -> metrics -> save.
-
-    Returns the results dict.
-    """
+    """Inference -> thresholding -> metrics -> save. Returns the results."""
     device = next(model.parameters()).device
 
-    # Anything that describes how the checkpoint was *trained* is unknowable on
-    # an --eval-only run: the current config holds whatever the CLI happened to
-    # pass this time, which is not what produced these weights.
+    # How the checkpoint was *trained* is unknowable on an --eval-only run:
+    # the current config is whatever this invocation passed.
     trained_this_run = training_timing is not None
     previous = _load_previous_results(model_name)
 
@@ -1310,11 +1196,9 @@ def evaluate_model(
         "checkpoint_metric": config.CHECKPOINT_METRIC,
         "seed": config.SEED,
         "trainable_params": trainable_params,
-        # The checkpoint fine-tuning started from, resolved rather than echoed
-        # from config.WEIGHT_TAG: an un-overridden run would otherwise record
-        # None, which does not identify anything. Absent (None) for the
-        # torchvision-backed models, whose weights are pinned by the
-        # torchvision version already recorded under `versions`.
+        # Resolved rather than echoed from config.WEIGHT_TAG, which is None on
+        # an un-overridden run and identifies nothing. None for the torchvision
+        # models, whose weights are pinned by the version under `versions`.
         "weight_tag": getattr(model, "weight_tag", None),
     }
 
@@ -1332,7 +1216,7 @@ def evaluate_model(
                 "existing results file"
             )
         else:
-            # Nothing to recover: report unknown rather than the current config
+            # Nothing to recover: unknown beats the current config.
             training_fields = dict.fromkeys(training_fields)
             print(
                 "[evaluate] WARNING: no previous results to recover the training "
@@ -1345,14 +1229,13 @@ def evaluate_model(
     labels, probs, inference_timing = collect_predictions(model, test_loader, device)
     preds = apply_thresholds(probs, thresholds)
 
-    # Read once and reused: the same IDs group the bootstrap and travel into the
-    # saved predictions so a post-hoc analysis can group the same way.
+    # The same IDs group the bootstrap and travel into the saved predictions,
+    # so post-hoc analysis groups the same way.
     test_patients = _loader_patient_groups(test_loader)
     save_predictions(labels, probs, model_name, "test", groups=test_patients)
 
-    # Resample whole patients, so the interval accounts for several correlated
-    # studies coming from the same person. Losing the grouping is not worth
-    # losing the run over — fall back to image-level and say so.
+    # Whole patients, so the interval accounts for correlated studies. Losing
+    # the grouping is not worth losing the run over — fall back and say so.
     groups = None
     if config.BOOTSTRAP_ENABLED and config.BOOTSTRAP_GROUP_BY_PATIENT:
         groups = test_patients
@@ -1372,17 +1255,17 @@ def evaluate_model(
         threshold_status=load_threshold_status(model_name),
     )
 
-    # Conditions the numbers above were produced under. total_params alone is
-    # misleading: a head_only probe trains 14k of DenseNet-121's 7.0M.
+    # total_params alone is misleading: a head_only probe trains 14k of
+    # DenseNet-121's 7.0M.
     total_params = sum(p.numel() for p in model.parameters())
     results["run"] = {
-        # How the checkpoint was trained (carried over on --eval-only)
+        # How the checkpoint was trained; carried over on --eval-only.
         **training_fields,
         "trainable_fraction": (
             round(trainable_params / total_params, 6) if trainable_params else None
         ),
         "total_params": total_params,
-        # Conditions of *this* evaluation, always current
+        # Conditions of *this* evaluation, always current.
         **threshold_settings(),
         "ece_bins": config.ECE_BINS,
         "ece_bin_strategy": str(config.ECE_BIN_STRATEGY).lower(),
@@ -1391,16 +1274,13 @@ def evaluate_model(
         "device": device.type,
         "amp": device.type == "cuda",
         "trained_this_run": trained_this_run,
-        # Deliberately not carried over on --eval-only: these describe the
-        # environment that computed the metrics in this file, which is the
-        # current one. When trained_this_run is false, training may well have
-        # happened under different versions.
+        # Not carried over on --eval-only: these describe the environment that
+        # computed these metrics. Training may have run under other versions.
         "versions": _environment_versions(),
     }
 
     results["timing"] = {
         "training": training_timing,
-        # True when the training block came from an earlier run, not this one
         "training_timing_carried_over": carried_over,
         "inference": inference_timing,
     }

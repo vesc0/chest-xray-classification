@@ -1,9 +1,9 @@
 """
 Loss, freezing, and checkpoint-metric direction.
 
-The tuning-mode tests build real backbones (randomly initialized, no download)
-because the head/backbone split is resolved by attribute name per architecture
-— exactly the thing a torchvision or timm upgrade renames without warning.
+The tuning-mode tests build real backbones (randomly initialized, no download):
+the head/backbone split is resolved by attribute name per architecture, which
+is exactly what a torchvision or timm upgrade renames without warning.
 """
 
 import numpy as np
@@ -40,11 +40,8 @@ class TestAsymmetricLoss:
             assert torch.isfinite(loss(torch.tensor(logits), targets))
 
     def test_survives_half_precision_input(self):
-        """
-        Under CUDA autocast the logits arrive as fp16, where eps underflows to
-        zero and the log terms become -inf. The loss casts to fp32 first; this
-        is the guard on that cast.
-        """
+        """Under autocast the logits arrive fp16, where eps underflows to zero
+        and the log terms become -inf. Guards the loss's fp32 cast."""
         loss = AsymmetricLoss()
         logits = torch.tensor([[8.0, -8.0]], dtype=torch.float16)
         targets = torch.tensor([[1.0, 0.0]], dtype=torch.float16)
@@ -60,7 +57,7 @@ class TestAsymmetricLoss:
         assert torch.isfinite(logits.grad).all()
 
     def test_down_weights_negatives_more_than_positives(self):
-        # gamma_neg > gamma_pos is the whole point of the asymmetry
+        # gamma_neg > gamma_pos is the whole point of the asymmetry.
         symmetric = AsymmetricLoss(gamma_neg=1.0, gamma_pos=1.0)
         asymmetric = AsymmetricLoss(gamma_neg=4.0, gamma_pos=1.0)
         logits = torch.tensor([[0.0, 0.0]])
@@ -134,7 +131,7 @@ class TestTuningModes:
         config.FREEZE_EPOCHS = 0
         config.PARTIAL_UNFREEZE_FRACTION = 0.25
         _apply_tuning_mode(model, 1, backbone, head)
-        # Later layers, not earlier ones
+        # Later layers, not earlier ones.
         assert backbone[-1].requires_grad
         assert not backbone[0].requires_grad
 
@@ -160,11 +157,8 @@ class TestTuningModes:
 
 class TestFrozenBatchNorm:
     def test_frozen_batchnorm_stops_updating_its_statistics(self, model_cache):
-        """
-        requires_grad=False stops weight updates but not running statistics:
-        model.train() switches the whole tree, so a "frozen" backbone would
-        still drift onto radiograph statistics.
-        """
+        """requires_grad=False stops weight updates but not running statistics,
+        so a "frozen" backbone would still drift onto radiograph statistics."""
         model = model_cache("densenet121")
         backbone, head = _split_backbone_head_params(model)
         config.TUNING_MODE = "head_only"

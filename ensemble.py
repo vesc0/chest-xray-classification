@@ -1,45 +1,21 @@
 """
-Post-hoc ensembling over saved prediction arrays.
+Post-hoc ensembling over saved prediction arrays. Nothing here runs a model.
 
-Nothing here runs a model. Every finished run in outputs/ already wrote the
-probability it assigned to each validation and test image, and those arrays are
-row-aligned across runs by construction: the val/test splits are fixed by
-config.SEED, never subset, and read by an unshuffled loader, so row i is the
-same image in every file. Averaging them is the entire ensemble. It costs
-seconds and needs neither the dataset nor a GPU.
+Every finished run wrote the probability it assigned to each validation and
+test image, and those arrays are row-aligned by construction: the splits are
+fixed by config.SEED, never subset, and read unshuffled. Averaging them is the
+whole ensemble, in seconds, with no dataset and no GPU. The alignment is
+checked rather than trusted — a member trained under a different seed would
+pair each prediction with some other image's label and produce not an obvious
+error but a slightly worse number among plausible ones.
 
-That alignment is an assumption strong enough to be worth checking rather than
-trusting. A member trained under a different SEED or VAL_SPLIT would pair each
-prediction with some other image's label, and the result would not look wrong —
-it would be a slightly worse number in a table of plausible numbers. So the
-labels and patient IDs of every member are compared before anything is averaged,
-and a mismatch raises.
+Members are chosen by a rule stated in advance (best run per architecture
+family, above a validation floor) rather than by a search, and are equally
+weighted. Alternatives are implemented so the claim stays checkable; see
+docs/design-notes.md for what each one measured.
 
-Members are chosen by a rule stated in advance — the best-scoring run per
-architecture family, with families below a validation floor dropped — rather
-than by a search. Greedy forward selection (Caruana et al., 2004) over the same
-pool was measured here and scores about 0.0015 macro AUROC higher, which is
-inside the bootstrap interval on the ensemble's own margin. It buys that by
-fitting the member list to the 8,652 validation images, and partly by selecting
-the strongest run twice. The rule selects nearly the same set and does not ask
-the reader to trust that the search was run only once.
-
-The validation floor is what keeps a failed run out. A member that is merely
-weaker still contributes — the medically-pretrained DenseNet is the least
-accurate member selected here and the largest single contributor to macro
-AUPRC, because its errors are the least correlated with the ImageNet backbones'.
-A member that never converged is different in kind: it is near-uncorrelated with
-everything because it is near-noise, and it drags the mean down.
-
-Members are equally weighted and their probabilities averaged directly.
-Averaging in logit space and averaging per-class ranks were both measured on
-this pool: logit lands within 0.0001 macro AUROC of the plain mean and rank
-about 0.001 below it. All three are implemented so the claim is checkable, and
-the simplest is the default.
-
-The ensemble is written as its own experiment rather than as another row beside
-an architecture's results, because it is not an architecture and compare_models()
-reads its table as one row per architecture.
+The ensemble is written as its own experiment, because compare_models() reads
+its table as one row per architecture and this is not an architecture.
 
 Usage:
   python ensemble.py --auto
@@ -76,54 +52,39 @@ from evaluate import (
 from metrics import macro_average, per_class_auprc, per_class_auroc
 from utils import seed_everything, start_run_log
 
-# Combination rules, in the order they were measured. See the module docstring.
+# Combination rules, in the order they were measured.
 COMBINATION_RULES = ("mean", "logit", "rank", "stack")
 
-# Validation macro AUROC a family's best run must clear to be ensembled. 0.75
-# sits well below every converged run in this project (the weakest, medical
-# pretraining on PadChest, reaches 0.78) and well above a run that failed to
-# train (SwinV2-T reaches 0.67). It is a floor for "did this converge", not a
-# quality bar — excluding merely-weak members costs accuracy, see the docstring.
+# Validation macro AUROC a family's best run must clear. A floor for "did this
+# converge" (weakest converged run 0.78, failed run 0.67), not a quality bar:
+# merely weak members still contribute diversity.
 DEFAULT_VAL_FLOOR = 0.75
 
-# Probabilities are clipped this far from the open interval before the logit
-# rule takes their log-odds, so a saturated 0.0 or 1.0 cannot become infinite
-# and swamp every other member.
+# Keeps a saturated 0.0 or 1.0 from becoming an infinite log-odds that swamps
+# every other member.
 LOGIT_EPSILON = 1e-6
 
-# How much a candidate's redundancy with the already-selected members counts
-# against its accuracy under --select diverse.
-#
-# Only the *spread* of each term matters, not its level. Across this project's
-# converged runs validation AUROC spans about 0.07 and mean error correlation
-# about 0.25, so 0.3 is roughly where the two become equally decisive. Note the
-# correlation spread is the wider of the two: a weight near 1 does not weigh
-# diversity "a bit more", it ignores accuracy and selects whichever run is most
-# unlike the others — which on any real pool is the one that trained worst.
-#
-# The weight only orders the candidates that get tried. Each one is kept only
-# if it actually improves ensemble validation AUROC, so a badly chosen weight
-# costs search order, not correctness.
+# How much redundancy counts against accuracy under --select diverse. Only the
+# *spread* of each term matters: AUROC spans ~0.07 across converged runs and
+# error correlation ~0.25, so 0.3 is roughly where the two weigh equally, and a
+# weight near 1 would just select whichever run trained worst. It only orders
+# what gets tried — candidates are kept only if they improve validation AUROC.
 DEFAULT_DIVERSITY_WEIGHT = 0.3
 
-# Validation positives a class needs before it contributes to a diversity
-# figure. Below this the correlation is computed on a handful of rows and is
-# noise; Hernia has 14 positives in validation.
+# Below this a correlation is computed on a handful of rows and is noise;
+# Hernia has 14 validation positives.
 MIN_POSITIVES_FOR_DIVERSITY = 30
 
 
-# =============================================================================
-# Reading members
-# =============================================================================
+# --- Reading members ----------------------------------------------------------
 @contextmanager
 def _reading(experiment: str):
     """
     Point config.RESULTS_DIR at another experiment for the duration.
 
-    load_predictions() resolves its path through config, which is per-experiment
-    global state — and an ensemble is the one consumer that spans experiments.
-    Swapping it here reuses the loader (including its handling of files written
-    before patient IDs were stored as text) instead of reimplementing the read.
+    load_predictions() resolves its path through per-experiment global state,
+    and an ensemble is the one consumer that spans experiments. Swapping it
+    here reuses that loader instead of reimplementing the read.
     """
     saved = config.RESULTS_DIR
     config.RESULTS_DIR = config.PROJECT_ROOT / "outputs" / experiment / "results"
@@ -157,12 +118,10 @@ def is_ensemble_output(results_dir: Path, model_name: str) -> bool:
     """
     True when this run's results file says it was itself produced by ensembling.
 
-    Ensembles write predictions in the same format as any other run, into the
-    same outputs/ tree that --auto scans. Without this, a second --auto run
-    finds the first ensemble, scores it highest (it is), selects it as a member,
-    and makes it its own baseline — so the reported margin over the best member
-    collapses to zero and the ensemble silently contains itself. Running the
-    same command twice would produce two different results.
+    Ensembles write into the same tree --auto scans, so without this a second
+    --auto run would select the first ensemble as a member and as its own
+    baseline: the margin collapses to zero and the same command run twice gives
+    two different answers.
     """
     path = results_dir / f"{model_name}_results.json"
     if not path.exists():
@@ -181,14 +140,10 @@ def discover_runs(
     """
     Every (experiment, model) in outputs/ that saved both splits.
 
-    A run missing either split cannot be ensembled — thresholds are fitted on
-    validation and only then applied to test, so a member that saved only test
-    predictions has no calibration half to contribute.
-
-    Ensembles are excluded, by their own results file. `exclude_experiment`
-    additionally drops the folder this run is about to write to, which covers
-    the one case the marker cannot: an ensemble interrupted after saving
-    predictions but before writing its results file.
+    A member missing either split has no calibration half to contribute.
+    Ensembles are excluded by their own results file; `exclude_experiment`
+    covers the case that marker cannot — an ensemble interrupted after saving
+    predictions but before writing its results.
     """
     output_root = output_root or config.PROJECT_ROOT / "outputs"
     suffix = "_val_predictions.npz"
@@ -207,9 +162,7 @@ def discover_runs(
     return found
 
 
-# =============================================================================
-# Member selection
-# =============================================================================
+# --- Member selection ---------------------------------------------------------
 def _val_auroc(member: tuple[str, str]) -> float | None:
     data = read_member(member, "val")
     return macro_average(per_class_auroc(data["labels"], data["probs"]))
@@ -223,14 +176,12 @@ def select_members(
     """
     Apply the selection rule: best run per architecture family, above the floor.
 
-    The family is the model name, so the two pretraining corpora of
-    densenet121_xrv compete with each other and the 224px and 384px DenseNet
-    runs compete with each other, but neither competes with Swin. Head-only
-    probes and subset runs need no special case: they lose to the full run of
-    their own family on validation.
+    Family is the model name, so DenseNet's 224px and 384px runs compete with
+    each other but not with Swin. Head-only probes and subset runs need no
+    special case — they lose to their own family's full run on validation.
 
-    Returns the selected members and the full scan, so the run log records what
-    was considered and why each candidate was kept or dropped.
+    Returns the selection and the full scan, so the log records what was
+    considered and why each candidate was kept or dropped.
     """
     scan = []
     best_per_family: dict[str, dict] = {}
@@ -257,9 +208,8 @@ def select_members(
 
         scan.append(entry)
 
-    # Resolved after the whole scan, so a run that was briefly the family's best
-    # is reported as beaten by the family's actual winner rather than by
-    # whichever run happened to overtake it first.
+    # After the whole scan, so a run that was briefly its family's best is
+    # reported as beaten by the actual winner, not by whoever overtook it.
     for entry in scan:
         score = entry.pop("_score", None)
         if score is None:
@@ -288,20 +238,15 @@ def select_members_by_diversity(
     """
     Grow the ensemble by adding the most accurate member that is least redundant.
 
-    Starting from the best single run, each round scores every remaining
-    candidate by `validation AUROC - diversity_weight * mean error correlation
-    with the members already chosen`, tries the winner, and keeps it only if the
-    ensemble's validation AUROC actually improves. The penalty decides what to
-    try next; the measurement decides what to keep.
+    From the best single run, each round scores candidates by `validation AUROC
+    - diversity_weight * mean error correlation with the members already
+    chosen`, tries the winner, and keeps it only if validation AUROC improves.
+    The penalty decides what to try; the measurement decides what to keep.
 
-    On this project's runs this ties the family rule rather than beating it, and
-    the README records why: an exhaustive sweep of every equal-weight subset of
-    the pool puts the ceiling at 0.8258 test macro AUROC against the family
-    rule's 0.8254, so there is roughly four ten-thousandths available to any
-    selection strategy, against a bootstrap interval an order of magnitude
-    wider. It is implemented because the diversity figures it reports are worth
-    having, and because "we tried selecting for complementarity" is a question
-    worth being able to answer with a number.
+    On this pool it ties the family rule rather than beating it — an exhaustive
+    subset sweep puts the ceiling four ten-thousandths above it, against a
+    bootstrap interval an order of magnitude wider. It is kept for the
+    diversity figures and to be able to answer the question with a number.
     """
     candidates = []
     for member in discover_runs(output_root, exclude_experiment=exclude_experiment):
@@ -363,10 +308,9 @@ def select_members_by_diversity(
             ranked.append((entry["_score"] - diversity_weight * redundancy, redundancy, entry))
         ranked.sort(key=lambda item: -item[0])
 
-        # Try candidates in penalized order and take the first that actually
-        # helps, rather than stopping at the first that does not. The two differ
-        # whenever the penalty ranks a weak-but-unusual run at the top: stopping
-        # there ends the search at one member and reports it as an ensemble.
+        # The first candidate that helps, not a stop at the first that does
+        # not: the penalty can rank a weak-but-unusual run top, and stopping
+        # there would end the search at one member and call it an ensemble.
         accepted = None
         for _, redundancy, candidate in ranked:
             trial = combine([probs[key(entry)] for entry in chosen + [candidate]], "mean")
@@ -397,17 +341,14 @@ def select_members_by_diversity(
     return members, candidates
 
 
-# =============================================================================
-# Alignment
-# =============================================================================
+# --- Alignment ----------------------------------------------------------------
 def check_alignment(members: list[tuple[str, str]], split: str) -> dict[str, np.ndarray]:
     """
     Verify every member scored the same rows in the same order.
 
-    Returns the shared labels/groups/class_names, read once from the first
-    member. Row alignment is what makes averaging meaningful, and it is not
-    self-evident from the files: two runs under different seeds produce arrays
-    of identical shape whose rows are different images.
+    Returns the shared labels/groups/class_names from the first member. Two
+    runs under different seeds produce arrays of identical shape whose rows are
+    different images, so this is not self-evident from the files.
     """
     reference_member, *rest = members
     reference = read_member(reference_member, split)
@@ -447,23 +388,19 @@ def check_alignment(members: list[tuple[str, str]], split: str) -> dict[str, np.
     return reference
 
 
-# =============================================================================
-# Diversity
-# =============================================================================
+# --- Diversity ----------------------------------------------------------------
 def residual_correlation(labels: np.ndarray, probs_a: np.ndarray, probs_b: np.ndarray) -> float:
     """
     How similarly two members err, correlated within each true class separately.
 
-    The obvious measure — correlate the raw residuals p - y — is nearly
-    degenerate on this data. The residual is dominated by the label: for a class
-    at 4% prevalence almost every row is a negative with residual -p, so two
-    models correlate at 0.9+ purely because they agree the disease is rare.
-    Splitting by true class removes that shared term and leaves the part that
-    matters: among the patients who actually have the disease, do these two
-    models miss the *same* ones?
+    Correlating the raw residual p - y is nearly degenerate here: at 4%
+    prevalence almost every row is a negative with residual -p, so any two
+    models correlate above 0.9 purely by agreeing the disease is rare.
+    Splitting by true class leaves the part that matters — among the patients
+    who have the disease, do these two miss the *same* ones?
 
-    Returns a correlation in [-1, 1]. Lower means the two make different
-    mistakes, which is what makes averaging them worth anything.
+    Lower means the two make different mistakes, which is what makes averaging
+    them worth anything.
     """
     residual_a = probs_a - labels
     residual_b = probs_b - labels
@@ -486,11 +423,10 @@ def decision_disagreement(labels: np.ndarray, probs_a: np.ndarray, probs_b: np.n
     """
     The share of positive calls two members would make differently.
 
-    Each is allowed exactly as many positives per class as the class has, so the
-    figure measures *which* patients each one picks rather than how liberally it
-    predicts — two identically-ranked models score 0 however their thresholds
-    are set. Reported alongside the correlation because it is the more concrete
-    statement: "these two disagree on half the patients they flag".
+    Each gets exactly as many positives per class as the class has, so this
+    measures *which* patients each picks rather than how liberally it predicts.
+    Reported next to the correlation as the more concrete statement: "these two
+    disagree on half the patients they flag".
     """
     scores = []
     for class_idx in range(labels.shape[1]):
@@ -501,8 +437,7 @@ def decision_disagreement(labels: np.ndarray, probs_a: np.ndarray, probs_b: np.n
         flagged_b = np.zeros(labels.shape[0], dtype=bool)
         flagged_a[np.argsort(-probs_a[:, class_idx])[:positives]] = True
         flagged_b[np.argsort(-probs_b[:, class_idx])[:positives]] = True
-        # Both flag `positives` cells, so the two can differ on at most 2*positives
-        # of them; dividing by that puts every class on a 0-1 scale.
+        # Both flag `positives` cells, so they differ on at most 2*positives.
         scores.append(float((flagged_a != flagged_b).sum()) / (2 * positives))
 
     return float(np.mean(scores)) if scores else float("nan")
@@ -529,10 +464,8 @@ def diversity_matrices(
 
 def print_diversity(names: list[str], correlation: np.ndarray, disagreement: np.ndarray) -> None:
     """The complementarity evidence: are these members actually different?"""
-    # Column headers are the member index, not a truncated name: at six members
-    # the names are long enough that truncating them to a column width makes
-    # several of them identical.
-    # +6 leaves room for the '[N] ' prefix each row label carries.
+    # Headers are the member index: at six members, names truncated to a column
+    # width come out identical. +6 leaves room for the '[N] ' row prefix.
     label_width = max(len(name) for name in names) + 6
     keys = [f"[{index + 1}]" for index in range(len(names))]
 
@@ -560,9 +493,7 @@ def print_diversity(names: list[str], correlation: np.ndarray, disagreement: np.
     )
 
 
-# =============================================================================
-# Combination
-# =============================================================================
+# --- Combination --------------------------------------------------------------
 def combine(probability_arrays: list[np.ndarray], rule: str = "mean") -> np.ndarray:
     """Average the members into one probability array under the chosen rule."""
     stacked = np.asarray(probability_arrays, dtype=np.float64)
@@ -576,11 +507,10 @@ def combine(probability_arrays: list[np.ndarray], rule: str = "mean") -> np.ndar
         return 1.0 / (1.0 + np.exp(-log_odds))
 
     if rule == "rank":
-        # Ranked per class, then rescaled to [0, 1]. Scale-free, so it is the
-        # rule to reach for if a member is badly calibrated — but it discards
-        # the margins, and it measured worst of the three here. The output is
-        # not a probability, which is why calibration figures computed from it
-        # describe the rank transform rather than the ensemble.
+        # Scale-free, so the rule to reach for if a member is badly calibrated,
+        # but it discards the margins and measured worst of the three. Its
+        # output is not a probability, so calibration figures from it describe
+        # the rank transform rather than the ensemble.
         ranked = np.empty_like(stacked)
         rows = stacked.shape[1]
         for member_idx in range(stacked.shape[0]):
@@ -601,24 +531,17 @@ def combine(probability_arrays: list[np.ndarray], rule: str = "mean") -> np.ndar
     raise ValueError(f"Unknown combination rule '{rule}'. Pick one of {COMBINATION_RULES}.")
 
 
-# =============================================================================
-# Stacking
-# =============================================================================
-# Inverse regularization for the per-class logistic combiner. Chosen on
-# patient-grouped half-splits of validation, not on test: 0.3 was the peak of a
-# sweep from 0.003 to 10, and the curve is flat enough between 0.1 and 1 that
-# the exact value is not load-bearing. Weaker regularization lets a member with
-# 88 validation positives acquire a large coefficient it cannot support.
+# --- Stacking -----------------------------------------------------------------
+# Inverse regularization for the per-class combiner, chosen on patient-grouped
+# half-splits of validation rather than on test. The curve is flat between 0.1
+# and 1, so the exact value is not load-bearing.
 STACK_REGULARIZATION = 0.3
 
-# Validation positives a class needs before a combiner is fitted for it. Below
-# this it keeps the plain mean — the same reasoning as THRESHOLD_MIN_SUPPORT,
-# and it is what stops Hernia (14 validation positives, 6 free parameters) from
-# being fitted into noise.
+# Below this a class keeps the plain mean, which stops Hernia (14 validation
+# positives, 6 free parameters) from being fitted into noise.
 STACK_MIN_POSITIVES = 50
 
-# Folds used to produce out-of-fold validation predictions. See
-# stacked_predictions() for why they are needed at all.
+# For the out-of-fold validation predictions; see stacked_predictions().
 STACK_FOLDS = 5
 
 
@@ -637,12 +560,10 @@ def fit_stacker(
     """
     Fit one logistic combiner per class over the members' log-odds.
 
-    Per class rather than one model over all of them: the members do not rank
-    equally well on every pathology, and a single global weighting cannot say
-    that Swin should dominate Emphysema while the medically-pretrained DenseNet
-    carries Cardiomegaly. Fitting on log-odds rather than probabilities makes
-    equal weights reproduce the logit mean exactly, so the combiner starts from
-    a sensible model and has only to correct it.
+    Per class because no single global weighting can say that Swin should
+    dominate Emphysema while the medically-pretrained DenseNet carries
+    Cardiomegaly. On log-odds because equal weights then reproduce the logit
+    mean exactly, so the combiner starts sensible and only has to correct it.
 
     Classes below STACK_MIN_POSITIVES get no entry and fall back to the mean.
     """
@@ -689,16 +610,13 @@ def stacked_predictions(
     """
     Out-of-fold validation predictions and test predictions from the combiner.
 
-    The out-of-fold part is not optional. Every other rule here is fixed, so its
-    validation predictions are as honest as its test ones and thresholds can be
-    tuned on them directly. A stacker is *fitted* on validation, so its
-    validation predictions are in-sample and better than it will ever do again —
-    tuning thresholds on them picks operating points calibrated to a
-    performance the model does not have. Measured on this project's runs, that
-    mistake costs 0.006 macro F1 on test, and costs it silently.
-
-    So validation predictions come from folds that never saw the patient being
-    predicted, and the model applied to test is refitted on all of validation.
+    The out-of-fold part is not optional. Every other rule is fixed, so its
+    validation predictions are as honest as its test ones; a stacker is
+    *fitted* on validation, so its in-sample predictions are better than it
+    will ever do again, and thresholds tuned on them are calibrated to a
+    performance the model does not have — measured here at 0.006 macro F1 on
+    test, silently. Validation predictions therefore come from folds that never
+    saw the patient; the model applied to test is refitted on all of validation.
     """
     fold_of_row = _grouped_folds(groups, val_labels.shape[0], STACK_FOLDS)
 
@@ -767,9 +685,7 @@ def print_stacker(info: dict, member_labels: list[str]) -> None:
     )
 
 
-# =============================================================================
-# Ensemble versus its best member
-# =============================================================================
+# --- Ensemble versus its best member ------------------------------------------
 def paired_delta(
     labels: np.ndarray,
     ensemble_probs: np.ndarray,
@@ -779,12 +695,10 @@ def paired_delta(
     """
     Bootstrap the ensemble-minus-best-member difference on the same resamples.
 
-    The margin an ensemble wins by is small enough that a point estimate does
-    not establish it, which is the same reason config.BOOTSTRAP_ENABLED exists.
-    Both models are scored on *each* resample and the difference taken there, so
-    the shared variance from which images were drawn cancels; comparing two
-    independently-resampled intervals for overlap would be a far weaker test.
-    Patients resample together, as everywhere else in this project.
+    Both are scored on *each* resample and the difference taken there, so the
+    shared variance from which images were drawn cancels; comparing two
+    independently-resampled intervals for overlap is a far weaker test. The
+    margin is small enough that a point estimate would not establish it.
     """
     rows_by_group = _rows_by_group(groups) if groups is not None else None
     rng = np.random.default_rng(config.SEED)
@@ -821,9 +735,7 @@ def paired_delta(
     return summary
 
 
-# =============================================================================
-# Reporting
-# =============================================================================
+# --- Reporting ----------------------------------------------------------------
 def print_scan(scan: list[dict], val_floor: float, rule: str = "best per family") -> None:
     print(f"\n[ensemble] Candidate runs (rule: {rule}, floor {val_floor} val AUROC)")
     print(f"  {'experiment':34}{'model':18}{'val AUROC':>10}  status")
@@ -866,9 +778,7 @@ def print_delta(delta: dict, baseline: dict) -> None:
     )
 
 
-# =============================================================================
-# Pipeline
-# =============================================================================
+# --- Pipeline -----------------------------------------------------------------
 def run_ensemble(
     members: list[tuple[str, str]],
     model_name: str = "ensemble",
@@ -1006,9 +916,7 @@ def run_ensemble(
     return results
 
 
-# =============================================================================
-# Entry point
-# =============================================================================
+# --- Entry point --------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
         description="Average saved predictions from several runs into one ensemble"
@@ -1038,7 +946,7 @@ def main():
             "architecture family. 'diverse' grows the set by adding the most "
             "accurate member least redundant with those already chosen, keeping "
             "it only if validation AUROC improves. They tie on this project's "
-            "runs — see the README for the exhaustive ceiling that explains why"
+            "runs — see the design notes for the exhaustive ceiling that explains why"
         ),
     )
     parser.add_argument(

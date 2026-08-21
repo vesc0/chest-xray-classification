@@ -1,11 +1,9 @@
 """
 Subgroup stratification over saved predictions.
 
-The load-bearing part is alignment: predictions and metadata are matched by
-position, so the tests that matter are the ones proving a misaligned join is
-refused rather than silently producing plausible disparities.
-
-Nothing here reads the dataset drive — the metadata frames are synthetic.
+The load-bearing part is alignment: the join is positional, so the tests that
+matter prove a misaligned one is refused rather than silently producing
+plausible disparities. The metadata frames are synthetic.
 """
 
 import numpy as np
@@ -95,12 +93,8 @@ class TestSharedClasses:
         assert shared_classes(labels, level, ~level, minimum=10).tolist() == [0]
 
     def test_rare_class_is_dropped_from_both_sides(self):
-        """
-        The Hernia case: one positive in a band is not an AUROC.
-
-        Left in, a single case swings that band's 14-class macro by points and
-        the swing gets read as a demographic disparity.
-        """
+        """The Hernia case: one positive in a band is not an AUROC, and left in
+        it swings that band's macro by points that read as a disparity."""
         labels = np.zeros((40, 2), dtype=np.int8)
         labels[:20, 0] = 1
         labels[20:, 0] = 1
@@ -138,7 +132,7 @@ class TestSubgroupMetrics:
         )["underdiagnosis"] == pytest.approx(0.0)
 
     def test_class_absent_from_subgroup_is_skipped_not_zeroed(self):
-        # Class 1 has no positives here; a NaN-blind macro would halve the FNR.
+        # Class 1 has no positives; a NaN-blind macro would halve the FNR.
         labels = np.array([[1, 0], [1, 0]])
         preds = np.zeros_like(labels, dtype=bool)
         assert subgroup_metrics(labels, labels.astype(np.float32), preds, ALL)[
@@ -197,12 +191,9 @@ class TestBootstrapGaps:
 
     def test_resamples_whole_patients(self, monkeypatch):
         """
-        Drawn rows arrive as complete patients, never as loose studies.
-
-        Row-level resampling would treat a patient's correlated studies as
-        independent evidence and shrink every interval. Patient 0 owns three
-        rows here, so under patient-level draws its subgroup can only ever be
-        empty or a multiple of three.
+        Rows arrive as complete patients, never as loose studies — row-level
+        draws would shrink every interval. Patient 0 owns three rows here, so
+        its subgroup can only ever be empty or a multiple of three.
         """
         import bias_analysis
 

@@ -1,11 +1,8 @@
 """
-The explanation sanity check itself.
-
-This is the check that decides whether the localization numbers mean anything,
-so its own failure modes matter. Two in particular are silent: a stage list that
-skips part of the network understates how much of the explanation survives
-randomization, and a randomization that does not actually re-initialize anything
-makes every method look like it passed.
+The explanation sanity check itself, which decides whether the localization
+numbers mean anything — so its own silent failures matter: a stage list that
+skips part of the network understates how much survives randomization, and a
+randomization that re-initializes nothing passes every method.
 """
 
 import numpy as np
@@ -28,10 +25,8 @@ ARCHITECTURES = list(config.SUPPORTED_MODELS)
 @pytest.fixture
 def fresh_model():
     """
-    A model nobody else shares.
-
-    randomize() mutates in place, so these tests cannot use the session-scoped
-    model_cache without corrupting every test that runs after them.
+    A model nobody else shares: randomize() mutates in place, so the
+    session-scoped model_cache would be corrupted for every later test.
     """
     from models import build_model
 
@@ -44,11 +39,8 @@ class TestStageRegistry:
 
     @pytest.mark.parametrize("name", ARCHITECTURES)
     def test_every_prefix_matches_something(self, name, model_cache):
-        """
-        A prefix that matches nothing is a stage that randomizes nothing, and
-        the run would report the explanation surviving a step that never
-        happened.
-        """
+        """A prefix matching nothing randomizes nothing, and the run reports
+        the explanation surviving a step that never happened."""
         parameter_names = [n for n, _ in model_cache(name).named_parameters()]
         for label, prefixes in RANDOMIZATION_STAGES[name]:
             for prefix in prefixes:
@@ -58,11 +50,8 @@ class TestStageRegistry:
 
     @pytest.mark.parametrize("name", ARCHITECTURES)
     def test_the_stages_cover_the_whole_model(self, name, model_cache):
-        """
-        Cascading randomization ends with a fully random network. A parameter no
-        stage touches stays trained through every step, so the final row would
-        not be the fully-randomized control it is read as.
-        """
+        """A parameter no stage touches stays trained through every step, so
+        the final row is not the fully-randomized control it is read as."""
         parameter_names = [n for n, _ in model_cache(name).named_parameters()]
         covered = {
             n for n in parameter_names
@@ -73,10 +62,8 @@ class TestStageRegistry:
 
     @pytest.mark.parametrize("name", ARCHITECTURES)
     def test_the_stages_are_disjoint(self, name, model_cache):
-        """
-        Overlapping stages would randomize a block twice and report the second
-        pass as new information.
-        """
+        """Overlapping stages randomize a block twice and report the second
+        pass as new information."""
         parameter_names = [n for n, _ in model_cache(name).named_parameters()]
         for n in parameter_names:
             hits = [
@@ -87,10 +74,8 @@ class TestStageRegistry:
 
     @pytest.mark.parametrize("name", ARCHITECTURES)
     def test_the_classifier_is_randomized_first(self, name):
-        """
-        Cascading means top-down. Starting anywhere else measures a different
-        thing from the paper's test.
-        """
+        """Cascading means top-down; starting elsewhere measures something
+        other than the paper's test."""
         first_label, _ = RANDOMIZATION_STAGES[name][0]
         assert first_label in {"head", "classifier"}
 
@@ -122,10 +107,8 @@ class TestRandomize:
         assert torch.equal(untouched, fresh_model.backbone.features.conv0.weight)
 
     def test_it_resets_batchnorm_running_statistics(self, fresh_model):
-        """
-        reset_parameters() does not touch these. Trained statistics on random
-        weights is neither the trained model nor a random one.
-        """
+        """reset_parameters() does not touch these, and trained statistics on
+        random weights is neither model."""
         norm = fresh_model.backbone.features.norm0
         with torch.no_grad():
             norm.running_mean.fill_(5.0)
@@ -133,10 +116,8 @@ class TestRandomize:
         assert torch.allclose(norm.running_mean, torch.zeros_like(norm.running_mean))
 
     def test_bare_parameters_are_randomized_too(self, model_cache):
-        """
-        ViT's class token and position embedding have no reset_parameters, so
-        the module-level pass cannot reach them and the fallback has to.
-        """
+        """ViT's class token and position embedding have no reset_parameters,
+        so only the fallback can reach them."""
         from models import build_model
 
         model = build_model("vit_s_16", pretrained=False).eval()
@@ -172,11 +153,8 @@ class TestRankCorrelation:
         assert _rank_correlation(heatmap, 1.0 - heatmap) == pytest.approx(-1.0)
 
     def test_a_blank_map_is_excluded_rather_than_scored(self):
-        """
-        scipy returns NaN for a constant input. Averaging that in poisons the
-        column; calling it zero would credit a method that collapsed to blank
-        with having decorrelated.
-        """
+        """Averaging scipy's NaN in poisons the column, and calling it zero
+        credits a method that collapsed to blank with decorrelating."""
         assert _rank_correlation(np.zeros((8, 8)), np.random.random((8, 8))) is None
         assert _rank_correlation(np.random.random((8, 8)), np.zeros((8, 8))) is None
 
@@ -193,11 +171,8 @@ class TestPointingGame:
         assert baseline == pytest.approx(9 / 64)
 
     def test_a_blank_map_is_a_miss_not_a_point_at_the_corner(self):
-        """
-        A signal-free map still has an argmax, at index 0. If a box reaches the
-        top-left corner, scoring that argmax would turn an absent explanation
-        into a hit.
-        """
+        """A signal-free map still has an argmax at index 0, which a box
+        reaching the corner would turn into a hit."""
         mask = np.zeros((8, 8), dtype=bool)
         mask[0:3, 0:3] = True  # includes (0, 0)
 
@@ -207,11 +182,8 @@ class TestPointingGame:
 
 class TestCoverage:
     def test_every_explainer_gets_checked(self, model_cache):
-        """
-        The question is asked of the method, not the model — rollout is built
-        from attention rather than gradients and has no reason to behave like
-        Grad-CAM here, which is exactly why it must not be skipped.
-        """
+        """The question is asked of the method: rollout is built from attention
+        rather than gradients and has no reason to behave like Grad-CAM."""
         for name in ARCHITECTURES:
             assert name in RANDOMIZATION_STAGES
             assert available_explainers(name)

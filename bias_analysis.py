@@ -1,26 +1,20 @@
 """
-Post-hoc subgroup analysis over saved predictions.
+Post-hoc subgroup analysis over saved predictions. Nothing here runs a model.
 
-Nothing here runs a model. It reads the test probability arrays evaluate.py
-writes, re-attaches the patient metadata behind each row, and asks whether one
-frozen model treats patient groups differently:
+Re-attaches the patient metadata behind each saved test prediction and asks two
+questions separately: does the model *rank* worse for a group (stratified
+AUROC), and does the group get *missed* more at the deployed threshold
+(stratified FNR, plus the share of abnormal studies where no class fires)? They
+can disagree, which is the point — equal AUROC with unequal FNR puts the
+disparity in the operating point rather than the features.
 
-  - Does the model *rank* worse for a group (stratified AUROC)?
-  - Does the group get *missed* more at the deployed threshold (stratified FNR,
-    and the share of abnormal studies where no class fires at all)?
-
-The two can disagree, and that disagreement is the point: equal AUROC with
-unequal FNR means the disparity lives in the operating point, not the features.
-
-Thresholds stay global. Refitting per subgroup would answer a different
-question — "could a group-aware model do better?" rather than "what does the
-single deployed threshold do to each group?", which is what gets shipped.
+Thresholds stay global, because "what does the shipped threshold do to each
+group?" is the question about a deployable system. Every gap is reported
+against a reference group with a patient-level bootstrap interval on the
+*difference*, both levels scored inside the same resample.
 
 Framing follows Seyyed-Kalantari et al. (2021), restricted to the two
-attributes CXR14 carries: sex and age. Every gap is reported against a
-reference group with a patient-level bootstrap interval on the *difference*,
-drawn from the same resample as the reference — comparing two independent
-intervals for overlap would understate what the paired comparison can resolve.
+attributes CXR14 carries.
 
 Usage:
   python bias_analysis.py --experiment s2_swint_full --model swin_t
@@ -39,36 +33,29 @@ from evaluate import _percentile_ci, _rows_by_group, apply_thresholds, load_pred
 from metrics import macro_average, per_class_auroc
 
 
-# Upper bound is inclusive. CXR14 carries a handful of impossible ages (the max
-# is 414); anything past the last band is dropped rather than pooled into it.
+# Upper bound inclusive. CXR14 carries impossible ages (the max is 414), so
+# anything past the last band is dropped rather than pooled into it.
 AGE_BANDS = ((0, 19), (20, 39), (40, 59), (60, 79), (80, 100))
 
-# Gaps are reported against the largest level on each axis, so the reference is
-# the best-measured one rather than an alphabetical accident.
+# The largest level on each axis, so the reference is the best-measured one.
 REFERENCE_LEVEL = {"sex": "M", "age": "40-59"}
 
-# Positives a class needs *within a subgroup* before its AUROC joins that
-# subgroup's macro. Without a floor the long tail wrecks the comparison: Hernia
-# has one positive among the 6,908 images aged 20-39, and that single case is
-# enough to move the band's 14-class macro by five points. Ten is low enough to
-# keep nine of fourteen classes in the 252-image 80-100 band and high enough
-# that no macro rests on a coin flip.
+# Positives a class needs *within a subgroup* to join its macro. Without a
+# floor the long tail invents disparities: Hernia's single positive among the
+# 6,908 images aged 20-39 moves that band's macro by five points.
 MIN_CLASS_POSITIVES = 10
 
 METRIC_KEYS = ("auroc", "fnr", "underdiagnosis")
 
 
-# =============================================================================
-# Metadata
-# =============================================================================
+# --- Metadata -----------------------------------------------------------------
 def test_metadata() -> pd.DataFrame:
     """
     The official test split in loader order, straight from the CSV.
 
-    Deliberately not dataset.load_metadata(): that resolves every image path to
-    check the drive, which this analysis does not need. Row order is the CSV's
-    own, filtered by test_list.txt — the same order the unshuffled test loader
-    walked — and align_metadata() verifies that rather than trusting it.
+    Not dataset.load_metadata(), which resolves every image path to check the
+    drive. Row order is the CSV's own, filtered by test_list.txt — the order
+    the unshuffled loader walked — and align_metadata() verifies that.
     """
     frame = pd.read_csv(config.DATA_ENTRY_CSV)
     test_files = set(Path(config.TEST_LIST).read_text().strip().splitlines())
@@ -79,10 +66,9 @@ def align_metadata(meta: pd.DataFrame, groups: np.ndarray | None) -> pd.DataFram
     """
     Check the metadata rows line up with the saved predictions.
 
-    Predictions and metadata are matched by position, so a mismatch would pair
-    each score with some other patient's demographics and produce confident,
-    meaningless disparities. The saved patient IDs make that checkable: if the
-    run dropped images the CSV lists, the sequences diverge and this raises.
+    The join is positional, so a mismatch would pair each score with some other
+    patient's demographics and produce confident, meaningless disparities. The
+    saved patient IDs make that checkable.
     """
     if groups is None:
         raise ValueError(
@@ -114,9 +100,7 @@ def subgroup_masks(meta: pd.DataFrame) -> dict[str, dict[str, np.ndarray]]:
     }
 
 
-# =============================================================================
-# Subgroup metrics
-# =============================================================================
+# --- Subgroup metrics ---------------------------------------------------------
 def shared_classes(
     labels: np.ndarray,
     level: np.ndarray,
@@ -126,11 +110,9 @@ def shared_classes(
     """
     Classes well enough attested in *both* groups to be averaged over.
 
-    A macro taken over whichever classes happen to be scorable in each group is
-    not a comparison — the two averages cover different diseases. Restricting
-    each pair to its own shared set keeps every gap like-for-like, and costs
-    less than one global set would: a band that is thin on Hernia no longer
-    drops Hernia from comparisons it is not part of.
+    A macro over whichever classes each group happens to score is not a
+    comparison; the two averages cover different diseases. Per-pair rather than
+    one global set, so a band thin on Hernia does not drop it everywhere.
     """
     in_level = labels[level].sum(axis=0)
     in_reference = labels[reference].sum(axis=0)
@@ -143,13 +125,12 @@ def per_class_rates(
     """
     Per-class AUROC and FNR for one subgroup, plus its underdiagnosis rate.
 
-    Kept per-class so a macro over any subset of classes is a mean of these
-    numbers rather than another pass over the rows — which is what makes the
-    bootstrap affordable when each level averages over a different subset.
+    Per-class so a macro over any subset is a mean of these rather than another
+    pass over the rows, which is what makes the bootstrap affordable when every
+    level averages over a different subset.
 
     'underdiagnosis' is the Seyyed-Kalantari framing read off all 14 heads: a
-    study that carries a finding but fires no class at all is one the model
-    called healthy. As a single rate over studies it needs no class subsetting.
+    study carrying a finding that fires no class at all was called healthy.
     """
     if labels.shape[0] == 0:
         empty = np.full(labels.shape[1], np.nan)
@@ -203,14 +184,10 @@ def bootstrap_gaps(
     """
     Patient-level bootstrap intervals on each level's gap to its reference.
 
-    Both sides of a gap are scored inside the same resample, over the same class
-    set, and subtracted there, so the interval covers the difference itself. The
-    class sets are fixed from the observed data rather than refit per draw: a
-    resample that loses a class would otherwise silently change the estimand.
-
-    Whole patients are resampled, matching the rest of the project — a patient
-    contributes several correlated images, and resampling rows would count them
-    as independent evidence.
+    Both sides are scored inside the same resample, over the same class set,
+    and subtracted there, so the interval covers the difference itself. Class
+    sets are fixed from the observed data rather than refit per draw — a
+    resample that lost a class would silently change the estimand.
     """
     num_samples = int(config.BOOTSTRAP_SAMPLES if num_samples is None else num_samples)
     rows_by_group = _rows_by_group(groups)
@@ -231,8 +208,8 @@ def bootstrap_gaps(
                 rows = index[mask[index]]
                 rates[level] = per_class_rates(labels[rows], probs[rows], preds[rows])
 
-            # Each level pairs against the reference over its own class set, so
-            # the reference is averaged several ways from the one pass above.
+            # Each level uses its own class set, so the reference is averaged
+            # several ways from the single pass above.
             ref_auroc, ref_fnr, ref_underdiagnosis = rates[REFERENCE_LEVEL[axis]]
             for level in levels:
                 classes = class_sets[axis][level]
@@ -254,9 +231,7 @@ def bootstrap_gaps(
     }
 
 
-# =============================================================================
-# One model, end to end
-# =============================================================================
+# --- One model, end to end ----------------------------------------------------
 def analyze_model(
     model_name: str,
     num_samples: int | None = None,
@@ -360,15 +335,13 @@ def analyze_model(
     return report
 
 
-# =============================================================================
-# Reporting
-# =============================================================================
+# --- Reporting ----------------------------------------------------------------
 def _interval(bounds: list[float] | None) -> str:
     return f"[{bounds[0]:+.3f}, {bounds[1]:+.3f}]" if bounds else "n/a"
 
 
 def _resolved(bounds: list[float] | None) -> bool:
-    """A gap whose interval excludes zero is one this data can actually resolve."""
+    """A gap whose interval excludes zero is one this data can resolve."""
     return bool(bounds) and (bounds[0] > 0 or bounds[1] < 0)
 
 
@@ -420,10 +393,8 @@ def print_report(report: dict) -> None:
 
 def compare_experiments(output_root: Path = config.PROJECT_ROOT / "outputs") -> None:
     """
-    One row per run: overall performance beside the gaps it leaves behind.
-
-    This is the table the architecture/scale sweep exists for — whether the
-    design choices that buy macro AUROC also close the demographic gaps.
+    One row per run: overall performance beside the gaps it leaves behind —
+    whether the choices that buy macro AUROC also close the demographic ones.
     """
     report_files = sorted(output_root.glob("*/results/*_bias.json"))
     if not report_files:
@@ -470,9 +441,7 @@ def compare_experiments(output_root: Path = config.PROJECT_ROOT / "outputs") -> 
     print(f"\n[bias] Saved comparison table to {csv_path}")
 
 
-# =============================================================================
-# Entry point
-# =============================================================================
+# --- Entry point --------------------------------------------------------------
 def _discover_models(experiment: str, output_root: Path) -> list[str]:
     results = output_root / experiment / "results"
     return sorted(

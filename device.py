@@ -1,9 +1,8 @@
 """
 Accelerator selection and synchronization.
 
-Split out of train.py so that evaluation, explainability, and the CLI can pick a
-device without importing the training stack. Depends on nothing but torch, which
-keeps it at the bottom of the import graph alongside config.
+Separate from train.py so evaluation, explainability and the CLI can pick a
+device without importing the training stack.
 """
 
 import torch
@@ -22,9 +21,8 @@ def synchronize(device: torch.device) -> None:
     """
     Block until queued accelerator work has finished.
 
-    CUDA and MPS dispatch kernels asynchronously, so a timer stopped without
-    this measures how long it took to *queue* the work, not to run it —
-    understating GPU time several-fold. Required around any timed region.
+    CUDA and MPS dispatch asynchronously, so a timer stopped without this
+    measures queue time, not run time. Required around any timed region.
     """
     if device.type == "cuda":
         torch.cuda.synchronize()

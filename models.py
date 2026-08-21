@@ -1,53 +1,11 @@
 """
-Model definitions
+One backbone per architecture family, each with a 14-class multi-label head.
 
-One backbone per architecture family, so a result can be attributed to the
-architecture rather than to capacity, resolution, or pretraining data
-(parameter counts are as built here, with the 14-class head):
-
-  1. DenseNet-121   (7.0M)  CNN baseline — the backbone used in CheXNet
-  2. ViT-S/16      (21.7M)  pure Vision Transformer
-  3. ConvNeXtV2-T  (27.9M)  modern CNN
-  4. SwinV2-T      (27.6M)  modern (hierarchical, windowed) Vision Transformer
-  5. MaxViT-T      (30.4M)  hybrid — MBConv plus block/grid attention per stage
-
-The four non-baseline models sit in a 22-31M band, so "modern CNN vs modern
-ViT" is a comparison at matched capacity. DenseNet-121 is deliberately *not*
-scale-matched: its value is being the exact backbone the CheXNet results were
-produced with, which changing the depth would throw away.
-
-Two invariants hold across all five, and both are load-bearing for the
-comparison:
-
-  - **ImageNet-1k pretraining only.** No IN21k/IN22k checkpoints by default,
-    even where they exist (ConvNeXtV2 and ViT-S both ship them). DenseNet,
-    SwinV2 and MaxViT have no IN21k option here, so 21k anywhere would confound
-    architecture with pretraining data — and would specifically flatter the
-    pure ViT, the architecture most dependent on pretraining scale.
-  - **Identical preprocessing.** Every backbone below expects 224x224 input
-    with ImageNet mean/std, so dataset.py can apply one shared transform.
-    This is why ViT-S uses DeiT III weights (see ViTSmallClassifier).
-
-`--weight-tag` is the one sanctioned way out of the first invariant, for the
-separate question of how much pretraining *data* is worth on a fixed
-architecture. It is opt-in per run and `build_model` rejects any timm tag whose
-normalization statistics differ from config.IMAGENET_MEAN/STD — so it can relax
-the pretraining invariant without silently breaking the preprocessing one.
-
-A sixth model, `densenet121_xrv`, sits outside the roster and outside both
-invariants by construction: same DenseNet-121 graph, but initialized from
-TorchXRayVision chest-X-ray weights instead of ImageNet, with the input
-converted to XRV's scale inside `forward` so the shared transform still holds.
-Its control is the densenet121 run, and it exists to put a number on how much
-of the roster's spread is architecture and how much is pretraining domain.
-It is excluded from `--model all`; see config.SUPPORTED_MODELS.
-
-Three come from torchvision; ViT-S and ConvNeXtV2 come from timm, which is the
-only source for them. The timm tags are pinned below rather than resolved by
-`.DEFAULT`, because a tag is what decides which of several checkpoints a name
-means.
-
-All output NUM_CLASSES logits (one per pathology) for multi-label classification.
+Two invariants hold across the roster and are load-bearing for the comparison:
+ImageNet-1k pretraining only, and identical 224x224 ImageNet-normalized input
+so dataset.py can share one transform. `--weight-tag` is the sanctioned way
+past the first; `build_model` rejects any tag that would break the second.
+`densenet121_xrv` sits outside both on purpose. See docs/design-notes.md.
 """
 
 import sys
@@ -64,20 +22,10 @@ def _import_torchxrayvision():
     """
     Import torchxrayvision without letting it shadow this project's modules.
 
-    Its vendored baseline models each run `sys.path.insert(0, <own folder>)` at
-    import time, and one of those folders contains a package named `config`.
-    Position 0 puts it *ahead* of the project root, so in any interpreter that
-    has not already imported our config, `import config` resolves to
-    torchxrayvision's.
-
-    This process is fine, because config is in sys.modules long before the
-    first XRV model is built. The DataLoader workers are where it bites: spawn
-    hands each worker a copy of this sys.path and no preloaded modules, so
-    every worker dies on `module 'config' has no attribute 'SEED'` and the
-    parent reports a BrokenPipeError several frames away from the cause.
-
-    sys.path is restored to exactly what it was. Whatever torchxrayvision
-    imported for itself is already in sys.modules and keeps working.
+    Its vendored models each `sys.path.insert(0, <own folder>)` at import time,
+    and one of those folders holds a package named `config` that would then win
+    over ours. Harmless in this process, fatal in spawned DataLoader workers,
+    which get the path but no preloaded modules. Restoring sys.path is enough.
     """
     saved_path = list(sys.path)
     try:
@@ -93,29 +41,21 @@ def _import_torchxrayvision():
     return torchxrayvision
 
 
-# Pinned timm weight tags. Unlike torchvision's `.DEFAULT`, a timm model name
-# maps to several checkpoints that differ in pretraining data, so the tag is
-# part of the experiment definition and belongs in version control.
+# Pinned rather than resolved by `.DEFAULT`: one timm name maps to several
+# checkpoints differing in pretraining data, so the tag defines the experiment.
 VIT_S_WEIGHT_TAG = "deit3_small_patch16_224.fb_in1k"
 CONVNEXTV2_T_WEIGHT_TAG = "convnextv2_tiny.fcmae_ft_in1k"
 
-# Models whose checkpoint is selected by a timm tag, and can therefore accept a
-# `--weight-tag` override. The torchvision three resolve weights through
-# `.DEFAULT` enums and have no equivalent, so overriding them is an error
-# rather than a silent no-op.
+# Only these accept `--weight-tag`; the torchvision models have no equivalent,
+# so overriding them is an error rather than a silent no-op.
 TIMM_BACKED_MODELS = ("vit_s_16", "convnextv2_t")
 
-# TorchXRayVision weights for the off-roster medical-pretraining arm. CheXpert
-# is the default of the leakage-free options: at 224k images it is the largest,
-# its labels were produced by a rule-based report labeler much like NIH's, and
-# it is the closest match to this pipeline's frontal-radiograph setting.
+# CheXpert is the largest of the leakage-free options and the closest match to
+# this pipeline's frontal-radiograph setting.
 XRV_DEFAULT_WEIGHT_TAG = "densenet121-res224-chex"
 
 # XRV checkpoints whose training data overlaps ChestX-ray14, keyed to why.
-# These are not merely suboptimal — using one makes the reported test AUROC a
-# measurement of memorization. The NIH test split is 25,596 images this project
-# never trains on; a checkpoint that already saw them turns Step 4 of the
-# pipeline into a training-set evaluation with no error raised anywhere.
+# Using one silently turns the held-out test split into training data.
 XRV_LEAKY_WEIGHTS = {
     "densenet121-res224-all": (
         "trained on nih-pc-chex-mimic_ch-google-openi-rsna, which includes "
@@ -132,40 +72,24 @@ XRV_LEAKY_WEIGHTS = {
 # so this one model cannot follow config.IMAGE_SIZE.
 MAXVIT_FIXED_IMAGE_SIZE = 224
 
-# Dropout before every classification head, so the five heads differ only in
-# their input width.
+# Every head is dropout + linear, so they differ only in input width.
 HEAD_DROPOUT = 0.3
 
 
-# =============================================================================
-# 1. DenseNet-121 (CNN baseline)
-# =============================================================================
 class DenseNet121Classifier(nn.Module):
     """
-    DenseNet-121 with a custom classification head.
+    DenseNet-121 (7.0M), the CNN baseline.
 
-    Architecture:
-      - DenseNet-121 backbone (pretrained on ImageNet)
-      - Global average pooling (built into DenseNet)
-      - Dropout → Linear(1024, NUM_CLASSES)
-
-    Kept at 121 layers on purpose: this is the reference baseline because it is
-    the CheXNet backbone, and a deeper variant chosen to close the parameter
-    gap with the other four would no longer be that baseline. Note its ImageNet
-    weights come from torchvision's original recipe (74.4% top-1) rather than
-    the modern recipes behind SwinV2-T and MaxViT-T, so the comparison is
-    between architectures *as they are normally obtained*, not between
-    architectures trained identically on ImageNet.
+    Kept at 121 layers because it is the CheXNet backbone; deepening it to close
+    the parameter gap with the rest of the roster would throw that away.
     """
 
     def __init__(self, num_classes: int = config.NUM_CLASSES, pretrained: bool = True):
         super().__init__()
 
-        # Load pretrained DenseNet-121 backbone
         weights = models.DenseNet121_Weights.DEFAULT if pretrained else None
         self.backbone = models.densenet121(weights=weights)
 
-        # Replace the original classifier head
         in_features = self.backbone.classifier.in_features  # 1024
         self.backbone.classifier = nn.Sequential(
             nn.Dropout(p=HEAD_DROPOUT),
@@ -173,45 +97,18 @@ class DenseNet121Classifier(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Forward pass through DenseNet backbone
         return self.backbone(x)
 
 
-# =============================================================================
-# 2. ViT-S/16 (pure Vision Transformer)
-# =============================================================================
 class ViTSmallClassifier(nn.Module):
     """
-    ViT-S/16 with a custom classification head.
+    ViT-S/16 (21.7M), the pure Vision Transformer.
 
-    Architecture:
-      - ViT-S/16 backbone, 12 blocks of global self-attention, width 384
-      - [CLS] token → Dropout → Linear(384, NUM_CLASSES)
-
-    **Why DeiT III weights on a ViT.** `deit3_small_patch16_224` *is* ViT-S/16 —
-    same blocks, same patch size, same width — differing only in the recipe
-    that produced the ImageNet weights. Three reasons it is the right checkpoint
-    here over `vit_small_patch16_224.augreg_in1k` and over the original DeiT:
-
-      - DeiT III is the current canonical answer to "train ViT-S on ImageNet-1k
-        alone", which is the pretraining budget every other model in this
-        roster gets, and it is stronger than DeiT-S at identical capacity
-        (~81.4% vs ~79.8% top-1). Using the weaker one would handicap the pure
-        ViT in the very comparison this roster exists to make.
-      - It has a matched IN22k sibling, `deit3_small_patch16_224.fb_in22k_ft_in1k`
-        — same authors, same recipe, same normalization, differing only in the
-        pretraining corpus. That makes the pretraining-data ablation a clean
-        swap of one tag rather than a change of recipe, checkpoint family and
-        preprocessing at once. The IN1k run here *is* the control for it.
-      - The augreg weights are ports of the original JAX checkpoints and expect
-        mean/std = 0.5, not ImageNet statistics. Using them would force
-        per-model normalization and a separate DataLoader per architecture;
-        both DeiT III tags keep the whole roster on one transform.
-
-    Expect this model to be the weakest of the five under ImageNet-1k-only
-    pretraining. That is a result, not a misconfiguration: pure ViTs are the
-    architecture most dependent on pretraining scale — which is what the IN22k
-    tag is there to measure.
+    DeiT III weights because `deit3_small_patch16_224` *is* ViT-S/16, differing
+    only in the recipe: it is the strongest ImageNet-1k-only checkpoint, it has
+    a matched IN22k sibling that makes the pretraining ablation a one-tag swap,
+    and unlike the augreg ports it expects ImageNet statistics. Expect this to
+    be the weakest roster model — pure ViTs depend most on pretraining scale.
     """
 
     def __init__(
@@ -222,13 +119,10 @@ class ViTSmallClassifier(nn.Module):
     ):
         super().__init__()
 
-        # Recorded rather than recomputed downstream: `weight_tag=None` means
-        # the pinned default, and a results file that says "None" does not
-        # identify the checkpoint the numbers came from.
+        # Resolved here so the results file names the actual checkpoint.
         self.weight_tag = weight_tag or VIT_S_WEIGHT_TAG
 
-        # img_size is passed explicitly so timm interpolates the position
-        # embeddings when IMAGE_SIZE is not the checkpoint's 224.
+        # img_size lets timm interpolate the position embeddings off 224.
         self.backbone = timm.create_model(
             self.weight_tag,
             pretrained=pretrained,
@@ -236,7 +130,6 @@ class ViTSmallClassifier(nn.Module):
             img_size=config.IMAGE_SIZE,
         )
 
-        # Replace classification head
         in_features = self.backbone.head.in_features  # 384
         self.backbone.head = nn.Sequential(
             nn.Dropout(p=HEAD_DROPOUT),
@@ -244,29 +137,16 @@ class ViTSmallClassifier(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Forward pass through ViT backbone
         return self.backbone(x)
 
 
-# =============================================================================
-# 3. ConvNeXtV2-T (modern CNN)
-# =============================================================================
 class ConvNeXtV2TinyClassifier(nn.Module):
     """
-    ConvNeXtV2-Tiny with a custom classification head.
+    ConvNeXtV2-T (27.9M), the modern CNN.
 
-    Architecture:
-      - ConvNeXtV2-T backbone (4 stages, global response normalization)
-      - Global average pooling → LayerNorm (both inside timm's head)
-      - Dropout → Linear(768, NUM_CLASSES)
-
-    The `fcmae_ft_in1k` tag is the FCMAE-pretrained model fine-tuned on
-    ImageNet-1k. Deliberately not `fcmae_ft_in22k_in1k`: the 22k variant would
-    give this model training data no other backbone in the roster had.
-
-    Only the final `head.fc` is replaced — the pooling and LayerNorm above it
-    are pretrained and worth keeping. They stay inside `backbone.head`, so
-    train.py's head/backbone split still counts them as head parameters.
+    `fcmae_ft_in1k`, not `fcmae_ft_in22k_in1k`, which would give this model
+    training data no other backbone had. Only the final `head.fc` is replaced;
+    timm's pretrained pooling and LayerNorm above it are kept.
     """
 
     def __init__(
@@ -277,7 +157,6 @@ class ConvNeXtV2TinyClassifier(nn.Module):
     ):
         super().__init__()
 
-        # Load pretrained ConvNeXtV2-T backbone
         self.weight_tag = weight_tag or CONVNEXTV2_T_WEIGHT_TAG
         self.backbone = timm.create_model(
             self.weight_tag,
@@ -285,7 +164,6 @@ class ConvNeXtV2TinyClassifier(nn.Module):
             num_classes=num_classes,
         )
 
-        # Replace the final projection, keeping timm's pooling and norm
         in_features = self.backbone.head.fc.in_features  # 768
         self.backbone.head.fc = nn.Sequential(
             nn.Dropout(p=HEAD_DROPOUT),
@@ -293,24 +171,15 @@ class ConvNeXtV2TinyClassifier(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Forward pass through ConvNeXtV2 backbone
         return self.backbone(x)
 
 
-# =============================================================================
-# 4. Swin-T (modern hierarchical Vision Transformer)
-# =============================================================================
 class SwinTinyClassifier(nn.Module):
     """
-    Swin Transformer V1-Tiny with a custom classification head.
+    Swin-T (27.5M), the hierarchical windowed Vision Transformer.
 
-    Architecture:
-      - Swin-T backbone (hierarchical, shifted-window attention)
-      - Dropout → Linear(768, NUM_CLASSES)
-
-    Holds the windowed-transformer slot because it is pretrained at 224, the
-    resolution the rest of the roster runs at. SwinV2-T was the original choice
-    and failed here — see SwinV2TinyClassifier below.
+    Holds this slot because it is pretrained at 224, the roster's resolution.
+    SwinV2-T was the original choice and failed — see SwinV2TinyClassifier.
     """
 
     def __init__(self, num_classes: int = config.NUM_CLASSES, pretrained: bool = True):
@@ -329,30 +198,22 @@ class SwinTinyClassifier(nn.Module):
         return self.backbone(x)
 
 
-# =============================================================================
-# 4b. SwinV2-T (retained for reproducibility, not part of the roster)
-# =============================================================================
 class SwinV2TinyClassifier(nn.Module):
     """
-    Swin Transformer V2-Tiny with a custom classification head.
+    SwinV2-T (27.6M), off-roster, kept so its failure stays reproducible.
 
-    **Kept only so the documented failure stays reproducible.** torchvision's
-    SwinV2 weights are 256-native; at 224 the final stage is a 7x7 map against
-    a window size of 8. SwinV2's log-spaced continuous position bias is meant
-    to absorb exactly this transfer, and measurably does not: full fine-tuning
-    reached train AUROC 0.656 after 20 epochs against 0.79-0.81 for every other
-    backbone, with localization at 1.19x the random baseline. Swin-T replaced
-    it in the roster; run this one at 256 to reproduce the resolution finding.
+    torchvision's weights are 256-native, and at 224 the final stage is a 7x7
+    map against a window size of 8 — a transfer SwinV2's continuous position
+    bias is meant to absorb and measurably does not (train AUROC 0.656 against
+    0.79-0.81 elsewhere). Run at `--image-size 256` for the resolution study.
     """
 
     def __init__(self, num_classes: int = config.NUM_CLASSES, pretrained: bool = True):
         super().__init__()
 
-        # Load pretrained SwinV2-T backbone
         weights = models.Swin_V2_T_Weights.DEFAULT if pretrained else None
         self.backbone = models.swin_v2_t(weights=weights)
 
-        # Replace classification head
         in_features = self.backbone.head.in_features  # 768
         self.backbone.head = nn.Sequential(
             nn.Dropout(p=HEAD_DROPOUT),
@@ -360,54 +221,28 @@ class SwinV2TinyClassifier(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Forward pass through Swin ViT backbone
         return self.backbone(x)
 
 
-# =============================================================================
-# 5. MaxViT-T (hybrid CNN / Transformer)
-# =============================================================================
 class MaxViTTinyClassifier(nn.Module):
     """
-    MaxViT-Tiny with a custom classification head.
+    MaxViT-T (30.4M), the hybrid: MBConv, block attention and grid attention
+    interleaved at every stage rather than a conv stem under a transformer.
 
-    Architecture:
-      - MaxViT-T backbone: every stage runs MBConv, then block attention
-        (local), then grid attention (sparse global)
-      - Adaptive average pooling → LayerNorm → Linear → Tanh (all pretrained)
-      - Dropout → Linear(512, NUM_CLASSES)
+    Fixes the pipeline at 224x224 — torchvision builds the attention partitions
+    from a declared input size and raises rather than adapting.
 
-    The hybrid slot in the roster: unlike a conv-stem-then-transformer design,
-    convolution and attention are interleaved at every stage, so there is no
-    point in the network where it stops being a CNN and starts being a
-    transformer.
-
-    **This model fixes the pipeline at 224x224.** torchvision builds MaxViT's
-    partition sizes from a declared input size and reshapes against them, so a
-    different resolution raises inside the attention partitioning rather than
-    adapting. config.IMAGE_SIZE is 224 for this reason.
-
-    Only the final projection is replaced; the pretrained pooling/norm/Tanh
-    stack above it is kept. torchvision's original final layer has no bias
-    (it follows a Tanh); the replacement uses the default bias, which is
-    standard for a freshly initialized head.
-
-    **Consequence for head_only tuning.** MaxViT is the only model here whose
-    architectural head is an MLP rather than a single projection, so keeping it
-    means head_only trains 271k parameters against 5-14k for the other four.
-    That is faithful to the architecture, and evaluate.py records
-    `trainable_params` per run so the difference is visible in the results
-    rather than hidden — but it does mean the head_only arm is not comparing
-    equal amounts of trainable capacity. Replacing the whole `classifier`
-    instead of its last element would even that up, at the cost of discarding
-    pretrained weights that are part of MaxViT's design.
+    Only the final projection is replaced, keeping the pretrained
+    pooling/norm/Tanh stack. That makes this the one model whose architectural
+    head is an MLP, so `head_only` trains 271k parameters here against 5-14k
+    elsewhere; evaluate.py records `trainable_params` so it stays visible.
     """
 
     def __init__(self, num_classes: int = config.NUM_CLASSES, pretrained: bool = True):
         super().__init__()
 
-        # Checked here rather than left to torchvision, which fails deep inside
-        # the attention partitioning with an uninterpretable shape error.
+        # Checked here: torchvision otherwise fails deep inside the attention
+        # partitioning with an uninterpretable shape error.
         if config.IMAGE_SIZE != MAXVIT_FIXED_IMAGE_SIZE:
             raise ValueError(
                 f"MaxViT-T only runs at {MAXVIT_FIXED_IMAGE_SIZE}x{MAXVIT_FIXED_IMAGE_SIZE}, "
@@ -415,11 +250,9 @@ class MaxViTTinyClassifier(nn.Module):
                 f"resolution study; densenet121, convnextv2_t and swin_t all resize."
             )
 
-        # Load pretrained MaxViT-T backbone
         weights = models.MaxVit_T_Weights.DEFAULT if pretrained else None
         self.backbone = models.maxvit_t(weights=weights)
 
-        # Replace the final projection, keeping torchvision's pooling/norm/Tanh
         in_features = self.backbone.classifier[-1].in_features  # 512
         self.backbone.classifier[-1] = nn.Sequential(
             nn.Dropout(p=HEAD_DROPOUT),
@@ -427,47 +260,23 @@ class MaxViTTinyClassifier(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Forward pass through MaxViT backbone
         return self.backbone(x)
 
 
-# =============================================================================
-# 6. DenseNet-121 / TorchXRayVision (chest-X-ray pretraining, off-roster)
-# =============================================================================
 class DenseNet121XRVClassifier(nn.Module):
     """
-    DenseNet-121 initialized from TorchXRayVision chest-X-ray weights.
+    DenseNet-121 initialized from TorchXRayVision chest-radiograph weights.
 
-    Architecture: byte-for-byte the same graph as DenseNet121Classifier —
-    `features.conv0 … features.norm5`, then `classifier` — with two differences
-    that come from the checkpoint rather than from a design choice here:
+    Off-roster: it breaks the ImageNet-1k-only invariant deliberately, to ask
+    how much of the roster's spread is pretraining domain rather than
+    architecture. Its control is the densenet121 run, which shares the module
+    layout exactly — so the Grad-CAM target, randomization stages and
+    head/backbone split all reuse the densenet121 entries and only the
+    pretraining corpus moves.
 
-      - `features.conv0` takes 1 channel, not 3.
-      - the weights come from radiographs, not from ImageNet.
-
-    Because the module layout is identical, the Grad-CAM target
-    (`features.denseblock4`), the randomization stage list, and train.py's
-    head/backbone split all reuse the densenet121 entries unchanged. That is the
-    point of pairing this model with the baseline: everything downstream is held
-    fixed and *only the pretraining corpus* moves.
-
-    **This model is deliberately outside the five-architecture roster.** It
-    breaks the ImageNet-1k-only invariant on purpose, so it answers a different
-    question than the roster does: not "which architecture", but "how much of
-    the architecture comparison is really a statement about pretraining domain".
-    Its control is the densenet121 run, at the same capacity, resolution, loss
-    and schedule.
-
-    **Input adapter.** XRV checkpoints were trained on single-channel images
-    scaled to roughly [-1024, 1024], not on 3-channel ImageNet-normalized
-    tensors. Rather than give this one model its own DataLoader — which would
-    fork the shared transform that the whole pipeline is built on — the
-    conversion happens in `forward` as an exact affine map. See `_to_xrv_scale`.
-
-    **Leakage.** The corpus this is pretrained on must not contain
-    ChestX-ray14, or the NIH test split is partly training data and every number
-    downstream is inflated. `XRV_LEAKY_WEIGHTS` blocks the tags that do; the
-    default is CheXpert, which does not.
+    The checkpoint takes 1-channel input on XRV's own scale; `_to_xrv_scale`
+    converts inside `forward` rather than forking the shared transform.
+    `XRV_LEAKY_WEIGHTS` blocks any corpus containing ChestX-ray14.
     """
 
     def __init__(
@@ -478,31 +287,24 @@ class DenseNet121XRVClassifier(nn.Module):
     ):
         super().__init__()
 
-        # Imported here rather than at module scope so that the other five
-        # models stay buildable without torchxrayvision installed.
+        # Imported here so the rest of the roster builds without XRV installed.
         xrv = _import_torchxrayvision()
 
         self.weight_tag = weight_tag or XRV_DEFAULT_WEIGHT_TAG
         _check_xrv_weight_tag(self.weight_tag)
 
         # `weights=` fixes the output width at the checkpoint's own pathology
-        # count, so num_classes cannot be passed alongside it. The head is
-        # replaced below in both branches, which makes that moot.
+        # count, so num_classes cannot be passed; the head is replaced below.
         self.backbone = xrv.models.DenseNet(
             weights=self.weight_tag if pretrained else None
         )
 
-        # An operating-point buffer fitted to the source corpus, which
-        # `xrv.models.DenseNet.forward` applies as a sigmoid plus a per-class
-        # rescale when it is set. This pipeline needs raw logits — evaluate.py
-        # and the loss both apply their own sigmoid — and the buffer's 18
-        # entries are indexed by the checkpoint's pathology list, not ours.
+        # Set, XRV's forward applies a sigmoid and a per-class rescale indexed
+        # by *its* pathology list. This pipeline needs raw logits.
         self.backbone.op_threshs = None
 
-        # XRV resizes any non-native input back to 224 inside `forward`, which
-        # would quietly override `--image-size`. DenseNet is fully
-        # convolutional and does not need it; dropping the attribute puts this
-        # model under the same resolution rule as the rest of the roster.
+        # XRV otherwise resizes non-native input back to 224 inside `forward`,
+        # quietly overriding `--image-size`. DenseNet is fully convolutional.
         if hasattr(self.backbone, "input_resolution"):
             del self.backbone.input_resolution
 
@@ -512,8 +314,8 @@ class DenseNet121XRVClassifier(nn.Module):
             nn.Linear(in_features, num_classes),
         )
 
-        # Buffers, not constants, so `.to(device)` carries them and the maths
-        # below never forces a host/device sync mid-batch.
+        # Buffers so `.to(device)` carries them; a constant would force a
+        # host/device sync mid-batch.
         self.register_buffer(
             "_imagenet_mean", torch.tensor(config.IMAGENET_MEAN).view(1, 3, 1, 1)
         )
@@ -523,19 +325,12 @@ class DenseNet121XRVClassifier(nn.Module):
 
     def _to_xrv_scale(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Map one ImageNet-normalized 3-channel batch onto XRV's input scale.
+        Map an ImageNet-normalized 3-channel batch onto XRV's input scale.
 
-        Exact, not approximate. dataset.py produces
-        `x[:, c] = (p / 255 - mean[c]) / std[c]` from an 8-bit pixel p, and
-        `xrv.utils.normalize` wants `(2 * p / 255 - 1) * 1024`. Undoing the
-        first and applying the second is a composition of two affine maps, so
-        no information is lost and gradients flow through unchanged.
-
-        The three channels are averaged after de-normalization rather than
-        taking channel 0. `Image.convert("RGB")` on a grayscale radiograph
-        makes them identical, so for this dataset the two are the same number;
-        averaging simply degrades gracefully instead of silently discarding two
-        thirds of a genuinely colored input.
+        Exact, not approximate: undoing dataset.py's normalization and applying
+        `xrv.utils.normalize`'s is a composition of two affine maps, so nothing
+        is lost and gradients pass through. Channels are averaged rather than
+        indexed, which is identical on grayscale input and degrades gracefully.
         """
         gray = (x * self._imagenet_std + self._imagenet_mean).mean(dim=1, keepdim=True)
         return (2.0 * gray - 1.0) * 1024.0
@@ -544,13 +339,9 @@ class DenseNet121XRVClassifier(nn.Module):
         return self.backbone(self._to_xrv_scale(x))
 
 
-# =============================================================================
-# Model factory
-# =============================================================================
-# Keyed by the `--model` value. Kept as a table rather than a branch chain so
-# that it and config.SUPPORTED_MODELS can be checked against each other; a
-# model listed in one but not the other is a test failure, not a crash halfway
-# into a sweep.
+# --- Model factory ------------------------------------------------------------
+# A table rather than a branch chain, so it can be checked against
+# config.SUPPORTED_MODELS by a test instead of crashing mid-sweep.
 MODEL_BUILDERS: dict[str, type[nn.Module]] = {
     "densenet121": DenseNet121Classifier,
     "vit_s_16": ViTSmallClassifier,
@@ -566,11 +357,9 @@ def _check_xrv_weight_tag(weight_tag: str) -> None:
     """
     Reject an XRV checkpoint that has already seen the NIH test split.
 
-    The failure this prevents is the worst kind available in this pipeline: the
-    run completes, the curves look ordinary, and the test AUROC comes back
-    several points above every other model — a result that reads as "medical
-    pretraining wins" and is actually the model recognizing images it was
-    trained on. Nothing downstream can detect it, so it is blocked here.
+    Such a run completes normally and reports a test AUROC several points high,
+    which reads as "medical pretraining wins" and is memorization. Nothing
+    downstream can detect it, so it is blocked here.
     """
     xrv = _import_torchxrayvision()
 
@@ -601,16 +390,12 @@ def _check_weight_tag_normalization(weight_tag: str) -> None:
     """
     Reject a weight tag whose checkpoint expects different input statistics.
 
-    dataset.py builds one transform from config.IMAGENET_MEAN/STD and shares it
-    across every loader, so a checkpoint trained under other statistics is not
-    a configuration this pipeline can express. The failure mode if unchecked is
-    the bad kind: the run trains, converges, and reports a plausible number that
-    is simply wrong. `vit_small_patch16_224.augreg_*` is the live example — the
-    JAX ports expect mean/std = 0.5, and swapping one in for the DeiT III tag
-    would silently de-normalize every image.
+    One transform is shared across every loader, so such a run would train,
+    converge, and report a plausible number that is simply wrong.
+    `vit_small_patch16_224.augreg_*` is the live example: it wants mean/std 0.5.
     """
-    # Returns None rather than raising when the tag is not registered, so a
-    # typo would otherwise surface as an AttributeError several frames away.
+    # Returns None rather than raising on an unknown tag, which would otherwise
+    # surface as an AttributeError several frames away.
     cfg = timm.get_pretrained_cfg(weight_tag, allow_unregistered=True)
     if cfg is None:
         raise ValueError(
@@ -634,22 +419,12 @@ def build_model(
     model_name: str, pretrained: bool = True, weight_tag: str | None = None
 ) -> nn.Module:
     """
-    Instantiate a model by name.
+    Instantiate one of config.SUPPORTED_MODELS.
 
-    Args:
-        model_name: One of config.SUPPORTED_MODELS.
-        pretrained: Whether to load ImageNet-pretrained weights. False keeps
-            construction offline, which is what the test suite relies on.
-        weight_tag: Optional tag overriding the pinned checkpoint, for the
-            pretraining-data ablation. For the timm-backed models this is a timm
-            tag (e.g. `deit3_small_patch16_224.fb_in22k_ft_in1k` in place of the
-            IN1k default) and must match the shared transform's normalization.
-            For densenet121_xrv it is a TorchXRayVision weight name selecting
-            the pretraining corpus, and must not be one that saw ChestX-ray14.
-            The torchvision-backed models accept no tag at all.
-
-    Returns:
-        nn.Module ready for training.
+    `pretrained=False` keeps construction offline, which the test suite relies
+    on. `weight_tag` overrides the pinned checkpoint for the pretraining-data
+    ablation: a timm tag for TIMM_BACKED_MODELS, an XRV weight name for
+    densenet121_xrv, and an error for the torchvision-backed models.
     """
     if model_name not in MODEL_BUILDERS:
         raise ValueError(
@@ -659,8 +434,8 @@ def build_model(
     if weight_tag is None:
         return MODEL_BUILDERS[model_name](pretrained=pretrained)
 
-    # Validated inside the class instead: the check needs torchxrayvision, and
-    # importing it here would make it a hard dependency of every model.
+    # Validated inside the class: the check needs torchxrayvision, which would
+    # otherwise become a hard dependency of every model.
     if model_name == "densenet121_xrv":
         return MODEL_BUILDERS[model_name](pretrained=pretrained, weight_tag=weight_tag)
 

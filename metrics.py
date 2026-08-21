@@ -1,19 +1,13 @@
 """
 Threshold-free ranking metrics shared by training and evaluation.
 
-Only the primitives both sides need live here. Per-epoch validation AUROC and
-the AUROC reported on the test set have to be the same number computed the same
-way, or the training curve does not predict the final result — previously each
-module had its own copy of the "is this class even defined?" rule and its own
-loop, so a fix to one silently left the other behind.
+Only the primitives both sides need: per-epoch validation AUROC and the AUROC
+reported on test have to be the same number computed the same way, or the
+training curve does not predict the final result. Stage-specific metrics
+(thresholds, Brier, ECE) stay in evaluate.py.
 
-Metrics specific to one stage stay where they are used: threshold tuning and
-calibration (Brier, ECE) belong to evaluate.py, which is their only consumer.
-
-Undefined classes are reported as NaN rather than 0.0, so that a class nobody
-could score is distinguishable from one scored at chance and never drags a
-macro average down. macro_average() skips them and returns None when nothing
-was scorable at all.
+Undefined classes are NaN, not 0.0, so a class nobody could score stays
+distinguishable from one scored at chance and never drags a macro down.
 """
 
 import numpy as np
@@ -65,10 +59,8 @@ def macro_average(values: np.ndarray) -> float | None:
 
 def epoch_metrics(labels: np.ndarray, probs: np.ndarray) -> dict[str, float]:
     """
-    Summarize one epoch's threshold-free ranking performance.
-
-    Falls back to 0.0 rather than None so the value can go straight into the
-    history arrays that drive plotting and early stopping.
+    One epoch's ranking performance, falling back to 0.0 rather than None so it
+    can go straight into the history arrays behind plotting and early stopping.
     """
     return {
         "auroc": macro_average(per_class_auroc(labels, probs)) or 0.0,

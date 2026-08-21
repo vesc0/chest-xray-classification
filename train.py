@@ -1,12 +1,6 @@
 """
-Training loop
-
-Features:
-  - Long-tail aware loss functions (ASL / weighted BCE / BCE)
-  - AdamW optimizer with warmup + cosine decay
-  - Early stopping and checkpointing on an imbalance-sensitive metric
-  - Mixed precision on CUDA
-  - Training history logging (loss / AUROC / AUPRC per epoch)
+Training loop: long-tail aware losses, AdamW with warmup and cosine decay,
+early stopping on an imbalance-sensitive metric, and AMP on CUDA.
 """
 
 import time
@@ -23,16 +17,11 @@ from device import get_device, synchronize
 from metrics import epoch_metrics
 
 
-# =============================================================================
-# Loss functions
-# =============================================================================
+# --- Loss functions -----------------------------------------------------------
 class AsymmetricLoss(nn.Module):
     """
-    Asymmetric loss for long-tailed multi-label classification.
-
-    Based on the common ASL formulation where negatives are down-weighted more
-    aggressively than positives. This is a strong default for multi-label
-    medical classification because it reduces the "predict-all-negatives" bias.
+    Asymmetric loss (ASL): negatives down-weighted harder than positives, which
+    is what keeps a long-tailed multi-label model off "predict all negatives".
     """
 
     def __init__(
@@ -49,8 +38,8 @@ class AsymmetricLoss(nn.Module):
         self.eps = eps
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        # Always compute in fp32. Under CUDA autocast the logits arrive as fp16,
-        # where eps underflows to zero and the log terms below become -inf.
+        # fp32 always: under autocast the logits arrive as fp16, where eps
+        # underflows to zero and the log terms below become -inf.
         logits = logits.float()
         targets = targets.float()
 
@@ -58,7 +47,6 @@ class AsymmetricLoss(nn.Module):
         probs_pos = probs.clamp(min=self.eps, max=1.0 - self.eps)
         probs_neg = 1.0 - probs
 
-        # Prevent extreme negative probabilities
         if self.clip > 0:
             probs_neg = (probs_neg + self.clip).clamp(max=1.0)
         probs_neg = probs_neg.clamp(min=self.eps, max=1.0 - self.eps)
@@ -66,7 +54,6 @@ class AsymmetricLoss(nn.Module):
         loss_pos = targets * torch.log(probs_pos)
         loss_neg = (1.0 - targets) * torch.log(probs_neg)
 
-        # Focus more on hard examples
         pos_weight = torch.pow(1.0 - probs_pos, self.gamma_pos) * targets
         neg_weight = torch.pow(1.0 - probs_neg, self.gamma_neg) * (1.0 - targets)
         asymmetric_weight = pos_weight + neg_weight
@@ -81,7 +68,6 @@ def _compute_pos_weight(train_loader: DataLoader, device: torch.device) -> torch
     positives = label_matrix.sum(axis=0)
     negatives = len(label_matrix) - positives
     pos_weight = (negatives + 1.0) / (positives + 1.0)
-    # Prevent extremely large weights
     pos_weight = np.clip(pos_weight, 1.0, config.MAX_POS_WEIGHT)
     return torch.tensor(pos_weight, dtype=torch.float32, device=device)
 
@@ -105,9 +91,7 @@ def _build_loss(train_loader: DataLoader, device: torch.device) -> nn.Module:
     )
 
 
-# =============================================================================
-# Optimizer and scheduler
-# =============================================================================
+# --- Optimizer and scheduler --------------------------------------------------
 def _build_optimizer(
     backbone_params: list[nn.Parameter],
     head_params: list[nn.Parameter],
@@ -165,9 +149,7 @@ def _build_scheduler(optimizer: torch.optim.Optimizer):
     )
 
 
-# =============================================================================
-# Fine-tuning utilities
-# =============================================================================
+# --- Fine-tuning utilities ----------------------------------------------------
 def _split_backbone_head_params(model: nn.Module) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
     """Split parameters into backbone and classifier-head groups."""
     if not hasattr(model, "backbone"):
@@ -176,18 +158,16 @@ def _split_backbone_head_params(model: nn.Module) -> tuple[list[nn.Parameter], l
     backbone = model.backbone
     head_module = None
 
-    # DenseNet / MaxViT
+    # DenseNet / MaxViT.
     if hasattr(backbone, "classifier"):
         head_module = backbone.classifier
 
-    # torchvision's ViT. No model in the current roster uses this name — the
-    # ViT slot comes from timm and lands on `head` below — but the attribute
-    # is what distinguishes it, and the fallthrough at the bottom returns an
-    # empty head, which would leave head_only mode training nothing at all.
+    # torchvision's ViT. Unused by the current roster, but the fallthrough
+    # returns an empty head, which would leave head_only training nothing.
     elif hasattr(backbone, "heads"):
         head_module = backbone.heads
 
-    # SwinV2 / ViT-S (timm) / ConvNeXtV2 (timm)
+    # Swin / ViT-S (timm) / ConvNeXtV2 (timm).
     elif hasattr(backbone, "head"):
         head_module = backbone.head
 
@@ -232,15 +212,12 @@ def _apply_tuning_mode(
     if mode == "partial":
         freeze_epochs = max(int(config.FREEZE_EPOCHS), 0)
 
-        # Always train classifier head
         _set_requires_grad(head_params, True)
 
-        # Warmup phase: train only head
         if epoch <= freeze_epochs:
             _set_requires_grad(backbone_params, False)
             return "partial_head_warmup"
         
-        # Unfreeze part of the backbone
         _set_requires_grad(backbone_params, False)
 
         fraction = float(config.PARTIAL_UNFREEZE_FRACTION)
@@ -249,7 +226,6 @@ def _apply_tuning_mode(
         n_unfrozen = int(len(backbone_params) * fraction)
         n_unfrozen = max(n_unfrozen, 1) if backbone_params else 0
 
-        # Unfreeze final layers
         for param in backbone_params[-n_unfrozen:]:
             param.requires_grad = True
         return "partial_unfrozen"
@@ -269,12 +245,9 @@ def _disable_frozen_norm_updates(model: nn.Module) -> int:
     """
     Put BatchNorm layers whose parameters are frozen into eval mode.
 
-    Freezing a backbone via requires_grad stops its weights from being updated
-    but not its BatchNorm running statistics: model.train() switches the whole
-    module tree, so a "frozen" CNN backbone would still drift onto radiograph
-    statistics. Must be called after model.train(). Idempotent.
-
-    Returns the number of BatchNorm layers switched off.
+    requires_grad stops weight updates but not running statistics, so a
+    "frozen" backbone would still drift onto radiograph statistics. Call after
+    model.train(); idempotent. Returns how many layers were switched off.
     """
     frozen = 0
     for module in model.modules():
@@ -286,9 +259,7 @@ def _disable_frozen_norm_updates(model: nn.Module) -> int:
     return frozen
 
 
-# =============================================================================
-# Training and validation loops
-# =============================================================================
+# --- Training and validation loops --------------------------------------------
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -299,7 +270,6 @@ def train_one_epoch(
 ) -> dict[str, float]:
     """Run one training epoch and return loss plus threshold-free metrics."""
     model.train()
-    # Keep frozen BatchNorm layers from updating their running statistics
     _disable_frozen_norm_updates(model)
 
     running_loss = 0.0
@@ -309,17 +279,14 @@ def train_one_epoch(
         images = batch["image"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
 
-        # Clear old gradients
         optimizer.zero_grad(set_to_none=True)
 
         use_amp = scaler is not None and device.type == "cuda"
 
-        # Forward pass
         with torch.autocast(device_type=device.type, enabled=use_amp):
             logits = model(images)
             loss = criterion(logits, labels)
 
-        # Backward pass
         if use_amp:
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -392,9 +359,7 @@ def _get_monitored_metric(metrics: dict[str, float]) -> tuple[float, bool]:
     )
 
 
-# =============================================================================
-# Training pipeline
-# =============================================================================
+# --- Training pipeline --------------------------------------------------------
 def train_model(
     model: nn.Module,
     train_loader: DataLoader,
@@ -402,10 +367,9 @@ def train_model(
     model_name: str,
 ) -> tuple[dict, dict]:
     """
-    Train a model end-to-end with early stopping.
+    Train end-to-end with early stopping, returning (history, timing).
 
-    Returns (history, timing): per-epoch curves for plotting, and a wall-clock
-    summary. Total time is confounded by when early stopping fired, so
+    Total time is confounded by when early stopping fired, so
     mean_epoch_seconds is the fair number to compare across architectures.
     """
     device = get_device()
@@ -441,7 +405,6 @@ def train_model(
     for epoch in range(1, config.NUM_EPOCHS + 1):
         t0 = time.perf_counter()
 
-        # Configure trainable layers
         current_stage = _apply_tuning_mode(model, epoch, backbone_params, head_params)
         trainable_params = _count_trainable_params(model)
         if current_stage != last_stage:
@@ -453,7 +416,6 @@ def train_model(
             )
             last_stage = current_stage
 
-        # Training + validation
         train_metrics = train_one_epoch(
             model,
             train_loader,
@@ -464,7 +426,6 @@ def train_model(
         )
         val_metrics = validate(model, val_loader, criterion, device)
 
-        # Update learning rate
         if scheduler is not None:
             scheduler.step()
 
@@ -483,7 +444,6 @@ def train_model(
             f"| lr={current_lr:.2e} | {elapsed:.1f}s"
         )
 
-        # Store history
         history["train_loss"].append(train_metrics["loss"])
         history["train_auroc"].append(train_metrics["auroc"])
         history["train_auprc"].append(train_metrics["auprc"])
@@ -493,7 +453,6 @@ def train_model(
         history["lr"].append(current_lr)
         history["epoch_seconds"].append(elapsed)
 
-        # Check improvement
         current_value, smaller_is_better = _get_monitored_metric(val_metrics)
         is_improved = (
             current_value < best_value if smaller_is_better else current_value > best_value
@@ -511,7 +470,6 @@ def train_model(
         else:
             patience_counter += 1
 
-        # Early stopping
         if patience_counter >= config.EARLY_STOPPING_PATIENCE:
             print(
                 f"  [train] Early stopping at epoch {epoch} "
@@ -521,7 +479,6 @@ def train_model(
 
     total_seconds = time.perf_counter() - train_start
 
-    # Load best model weights
     model.load_state_dict(
         torch.load(best_ckpt_path, map_location=device, weights_only=True)
     )
@@ -533,7 +490,7 @@ def train_model(
         "epochs_run": len(epoch_seconds),
         "mean_epoch_seconds": round(float(np.mean(epoch_seconds)), 2) if epoch_seconds else None,
         "best_epoch": best_epoch,
-        # Cost of reaching the weights that are actually used downstream
+        # Cost of reaching the weights actually used downstream.
         "seconds_to_best_epoch": round(float(np.sum(epoch_seconds[:best_epoch])), 2),
     }
     print(

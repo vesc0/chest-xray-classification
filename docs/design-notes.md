@@ -19,7 +19,11 @@ and threshold machinery does, and what the test suite pins. See the
 - [Confidence intervals](#confidence-intervals)
 - [Thresholds](#thresholds)
   - [Post-hoc analysis](#post-hoc-analysis)
+- [Subgroup analysis](#subgroup-analysis)
+  - [What the sweep found](#what-the-sweep-found)
 - [Ensembling](#ensembling)
+  - [Choosing the combination rule](#choosing-the-combination-rule)
+  - [Selecting for complementarity](#selecting-for-complementarity)
 - [Timing](#timing)
 
 ## Experimental protocol
@@ -318,7 +322,7 @@ restored around the run.
 pytest
 ```
 
-266 tests, no dataset required — everything is synthetic, so the suite
+373 tests, no dataset required — everything is synthetic, so the suite
 runs with the drive unmounted, no GPU, and no checkpoint on disk. Backbones are
 built with `pretrained=False`, so nothing downloads weights either. It covers
 the pure functions behind the reported numbers:
@@ -449,6 +453,73 @@ precisely measured — the distinction the rare classes turn on.
 
 Disable the saved arrays with `--no-save-predictions` if disk is a concern.
 
+## Subgroup analysis
+
+Macro AUROC hides who the errors land on. `bias_analysis.py` re-attaches the
+patient metadata behind every saved test prediction and asks the two questions
+separately:
+
+- **Stratified AUROC** — does the model *rank* worse for a group?
+- **Stratified FNR, and the share of abnormal studies where no class fires at
+  all** — does the group get *missed* more at the deployed threshold?
+
+```bash
+python bias_analysis.py --all
+```
+
+They can disagree, and that is the useful part: equal AUROC with unequal FNR
+puts the disparity in the operating point rather than the features.
+
+Thresholds stay global. Refitting them per subgroup would answer "could a
+group-aware model do better?", not "what does the single shipped threshold do
+to each group?" — and only the second question is about a deployable system.
+
+Every gap is reported against a reference group (the largest level on each axis)
+with a **patient-level bootstrap interval on the difference**, both levels scored
+inside the same resample. Two overlapping one-group intervals are not evidence of
+no difference; the paired interval is what settles it.
+
+One detail does most of the work. A macro taken over whichever classes happen to
+be scorable in each group compares different diseases and invents disparities
+that are not there: Hernia has a single positive among the 6,908 test images aged
+20-39, and that one case moves the band's 14-class macro AUROC by five points.
+Each pair is therefore restricted to the classes clearing ten positives **in both
+the group and the reference**, and the reported `cls` column says how many
+survived. Left uncorrected, this alone produced a spurious five-point deficit in
+the 20-39 band and a four-point one in the 80-100 band, both of which vanish
+under the shared class set.
+
+### What the sweep found
+
+Across all 22 saved runs the result is one-sided. **Sex is a bounded null**: the
+median AUROC gap is -0.0014 and no run's interval excludes zero, with a median
+half-width of +/-0.014 — enough to rule out sex gaps larger than about one and a
+half AUROC points, not enough to call any smaller one. **The youngest band is
+not**: patients aged 0-19 carry a median +0.072 FNR gap, resolved in 21 of 22
+runs, while their AUROC gap stays indistinguishable from zero. The model ranks
+these patients as well as anyone and still misses more of their findings, which
+places the disparity squarely in the shared operating point.
+
+Nothing in the sweep closes it. Overall AUROC and the 0-19 FNR gap correlate at
+r = 0.11 across the 22 runs: the best model here (the stacked ensemble, 0.827
+macro AUROC) still misses +0.056 [+0.016, +0.112] more, and twelve points of
+macro AUROC bought across architecture family, pretraining source, input
+resolution, training-set size and ensembling buy no measurable fairness. The
+80-100 band is reported but underpowered — 31 patients and nine comparable
+classes — and resolves nothing.
+
+The framing follows Seyyed-Kalantari et al. (2021), narrowed to the two
+attributes ChestX-ray14 actually carries — sex and age. Race and insurance,
+which carry their largest disparities, are not in this dataset. Two limits
+belong with any reading of these numbers:
+
+- The labels are NLP-mined from reports. This measures disparity against *noisy*
+  labels, and label noise that itself tracks age cannot be separated from model
+  behaviour with this data alone.
+- Subgroup prevalence differs, so a shared threshold produces different FNRs
+  partly through calibration. That is a property of deploying one threshold, not
+  an artefact — which is exactly why it is the thing worth measuring.
+
 ## Ensembling
 
 The same saved arrays make an ensemble free. Every run wrote the probability it
@@ -523,6 +594,84 @@ and report a margin of zero.
 
 The XAI stages do not apply: an ensemble has no single set of weights to
 Grad-CAM, so localization and the sanity checks stay per-architecture results.
+
+### Choosing the combination rule
+
+Fifteen combination rules were compared under one protocol: fit on validation,
+then score the half of validation the rule never saw (patient-grouped, 12
+splits). Test is reported afterwards and never used to choose. The holdout
+column is the one that decides:
+
+| rule | holdout AUROC | test AUROC | test AUPRC |
+|---|---|---|---|
+| mean (default) | 0.8299 | 0.8254 | 0.3008 |
+| logit mean / median / trimmed | 0.8284-0.8298 | 0.8237-0.8252 | 0.2953-0.3005 |
+| weights ∝ val AUROC | 0.8300 | 0.8256 | 0.3009 |
+| per-class AUROC weights | 0.8307 | 0.8258 | 0.3022 |
+| hill-climb with replacement | 0.8296 | *0.8269* | 0.3015 |
+| diversity-weighted | 0.8289-0.8298 | 0.8241-0.8254 | 0.3000-0.3010 |
+| **stacking (`--rule stack`)** | **0.8325** | **0.8269** | **0.3046** |
+| stacking, cross-class features | 0.8221 | 0.8150 | 0.2928 |
+
+Two rows are worth reading twice. **Hill-climbing** posts the joint-best test
+AUROC and is the *worst* weighted rule on holdout — its test number is luck, and
+this is the same overfitting the half-split exposed for member selection.
+**Cross-class stacking** (84 features per class instead of 6) has the second-best
+in-sample validation score in the whole table and the worst holdout and test
+scores: a textbook demonstration of why the fitted rules need a holdout at all.
+
+Stacking wins, and is the only rule that improves the operating point rather
+than just the ranking:
+
+| | mean | stack | delta |
+|---|---|---|---|
+| macro AUROC | 0.8254 | 0.8269 | +0.0015 |
+| macro AUPRC | 0.3008 | 0.3046 | +0.0038 |
+| macro F1 | 0.3293 | 0.3362 | +0.0069 |
+| **macro ECE** | 0.2837 | **0.0275** | **-0.2562** |
+| macro Brier | 0.1412 | 0.0590 | -0.0822 |
+
+The calibration result is the largest effect anywhere in this project, and it is
+free. The members are trained with asymmetric loss, which deliberately distorts
+predicted probabilities to cope with the long tail; averaging six such models
+preserves the distortion, so the mean ensemble ranks well and its "0.7" means
+nothing. The stacker refits a logistic model on the members' log-odds, which
+optimizes log-loss and therefore recovers calibration — ECE drops by roughly a
+factor of ten on every class fitted. On a task where a predicted probability is
+meant to inform a decision, that matters more than the 0.0015 of AUROC.
+
+Two implementation details are load-bearing. One combiner is fitted **per class**,
+because no single global weighting can say that Swin should dominate Emphysema
+while the medically-pretrained DenseNet carries Cardiomegaly — which is what the
+printed coefficients show it doing. And validation predictions are produced
+**out-of-fold** (5 patient-grouped folds), because a stacker's in-sample
+validation scores are better than it will ever achieve again; tuning thresholds
+against them calibrates to a performance the model does not have, and costs
+0.006 macro F1 on test, silently. Classes below 50 validation positives are left
+at the plain mean, so Hernia is never fitted from 14 examples.
+
+### Selecting for complementarity
+
+`--select diverse` grows the set by adding the candidate maximizing
+`val AUROC - w x error correlation with the members already chosen`, keeping it
+only if validation AUROC improves. Correlation is measured **within each true
+class**: correlating the raw residual `p - y` puts every pair above 0.9, because
+at this prevalence almost every row is a negative and two models agreeing the
+disease is rare tells you nothing. Every run also prints the resulting
+correlation and decision-disagreement matrices — mean 0.78 and 0.44 here, with
+the two Swin runs at 0.88/0.32 (near-duplicates) and the medically-pretrained
+DenseNet at 0.69-0.75/0.51-0.53 (the most complementary member).
+
+Both selection rules pick the same six members on these runs. The pool is saturated:
+enumerating every equal-weight subset at sizes 2-8 and keeping the best *by test
+score* — a cheat no honest method can match — reaches 0.8258 against the rules'
+0.8254, roughly a tenth of the bootstrap interval on the ensemble's own margin.
+Greedy hill-climbing with replacement appears to reach 0.8269 by picking the
+strongest run twice, but selecting on half of validation and scoring on the
+unseen half gives 0.8320 against the fixed rule's 0.8333, winning in 15% of
+splits — the gain is selection overfitting, which is why neither rule optimizes
+weights. Going further needs a member that fails differently (a different input
+representation, label policy, or objective), not another backbone.
 
 ## Timing
 

@@ -1,10 +1,7 @@
 """
-Localization geometry.
-
-These are the functions behind the numbers compared against Wang et al., and
-they are pure — no model, no dataset. The IoBB denominator in particular is a
-definition the literature disagrees about, so it is pinned here rather than
-left to whoever reads the code next.
+Localization geometry: the pure functions behind the numbers compared against
+Wang et al. The IoBB denominator is a definition the literature disagrees
+about, so it is pinned here rather than left to the next reader.
 """
 
 import numpy as np
@@ -32,7 +29,7 @@ class TestScaleBoxes:
         assert scaled[0] == pytest.approx([0.0, 0.0, config.IMAGE_SIZE, config.IMAGE_SIZE])
 
     def test_scales_from_the_files_real_size_not_a_hardcoded_1024(self):
-        # A 512-wide source must scale by 224/512, not 224/1024
+        # A 512-wide source must scale by 224/512, not 224/1024.
         boxes = np.array([[256.0, 0.0, 128.0, 512.0]])
         scaled = _scale_boxes(boxes, width=512, height=512)
         factor = config.IMAGE_SIZE / 512
@@ -53,19 +50,16 @@ class TestScaleBoxes:
 
 class TestEvalTransformGeometry:
     """
-    The probe that ties _scale_boxes to the transform the images actually go
-    through. Every localization number depends on those two agreeing, and if
-    they stop agreeing nothing else in the pipeline notices.
+    Ties _scale_boxes to the transform the images actually go through. Every
+    localization number depends on the two agreeing, and nothing else notices.
     """
 
     def test_the_real_eval_pipeline_passes(self):
         check_eval_transform_geometry()
 
     def test_a_centre_crop_is_rejected(self):
-        """
-        Resize-shorter-side plus a centre crop is the most likely thing for
-        someone to reach for, and it offsets every box while raising nothing.
-        """
+        """The most likely thing to reach for, and it offsets every box while
+        raising nothing."""
         cropping = transforms.Compose([
             transforms.Resize(256, interpolation=RESIZE_INTERPOLATION),
             transforms.CenterCrop(config.IMAGE_SIZE),
@@ -76,11 +70,8 @@ class TestEvalTransformGeometry:
             check_eval_transform_geometry(cropping)
 
     def test_an_aspect_preserving_resize_is_rejected(self):
-        """
-        Resize(224) on its own is square-in, square-out — which is why the probe
-        is not square. On a non-square image it letterboxes relative to what
-        _scale_boxes assumes.
-        """
+        """Resize(224) is square-in, square-out, which is why the probe is not
+        square: on non-square input it letterboxes."""
         aspect = transforms.Compose([
             transforms.Resize(config.IMAGE_SIZE, interpolation=RESIZE_INTERPOLATION),
             transforms.CenterCrop(config.IMAGE_SIZE),
@@ -92,10 +83,9 @@ class TestEvalTransformGeometry:
 
     def test_the_threshold_leaves_room_for_resampling_softness(self):
         """
-        Bicubic softens the probe rectangle's edges, so a correct pipeline
-        cannot score 1.0. The gap between what it does score and what a wrong
-        pipeline scores is the margin this threshold sits in; if it ever
-        narrows, the check starts either missing changes or failing spuriously.
+        Bicubic softens the probe's edges, so a correct pipeline cannot score
+        1.0. The gap to what a wrong pipeline scores is the margin this
+        threshold sits in.
         """
         assert 0.5 < TRANSFORM_PROBE_MIN_IOU < 0.97
 
@@ -110,10 +100,8 @@ class TestIsDegenerate:
         assert not _is_degenerate(heatmap)
 
     def test_a_constant_map_normalizes_to_zero_and_is_caught(self):
-        """
-        min-max on a constant map yields zeros, which is the form a signal-free
-        map actually reaches localization in — not a constant non-zero one.
-        """
+        """min-max on a constant map yields zeros, which is the form a
+        signal-free map actually reaches localization in."""
         from explainability import _normalize_per_sample
 
         constant = _normalize_per_sample(torch.full((1, 8, 8), 0.7)).numpy()[0]
@@ -143,9 +131,8 @@ class TestBoxMask:
 
 class TestPredictedBox:
     def test_returns_none_for_an_all_zero_heatmap(self):
-        # Grad-CAM's ReLU can zero a map entirely. Thresholding it would pass
-        # every pixel and report a whole-image detection, which scores at the
-        # random baseline instead of admitting nothing was found.
+        # Thresholding a zeroed map passes every pixel and reports a
+        # whole-image detection, scoring at the random baseline.
         assert _predicted_box(np.zeros((224, 224))) is None
 
     def test_bounds_a_single_blob(self):
@@ -160,8 +147,8 @@ class TestPredictedBox:
         assert _predicted_box(heatmap) == (100, 100, 150, 140)
 
     def test_threshold_is_relative_to_the_maps_own_maximum(self):
-        # Peak 0.4 with everything else at 0.1: at half the max (0.2) only the
-        # peak survives, even though no value reaches an absolute 0.5.
+        # At half the max (0.2) only the peak survives, though nothing reaches
+        # an absolute 0.5.
         heatmap = np.full((224, 224), 0.1)
         heatmap[100:110, 100:110] = 0.4
         assert _predicted_box(heatmap) == (100, 100, 110, 110)
@@ -180,12 +167,9 @@ class TestOverlapScores:
 
     def test_iobb_denominator_is_the_predicted_box_not_the_union(self):
         """
-        Wang et al.'s "intersection over the detected B-Box".
-
-        A detection wholly inside a larger ground-truth box scores IoBB 1.0
-        while IoU stays low. If this ever reports 0.25 for both, someone has
-        switched the denominator to the union and the localization numbers are
-        no longer comparable to the paper.
+        Wang et al.'s "intersection over the detected B-Box": a detection
+        wholly inside a larger box scores IoBB 1.0 while IoU stays low. Both
+        reporting 0.25 means someone switched the denominator to the union.
         """
         truth = _box_mask(np.array([[0.0, 0.0, 20.0, 20.0]]), size=224)
         iou, iobb = _overlap_scores((0, 0, 10, 10), truth)
